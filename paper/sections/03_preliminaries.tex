@@ -1,0 +1,34 @@
+\section{Preliminaries and Problem Formulation}
+\label{sec:problem-formulation}
+
+Let $\pi_{\theta_0}$ be a fixed base policy, $\mathcal{B}$ a source dataset with
+a verifier $r_{\mathcal{B}}(x,y)$, and $\mathcal{A}$ a target benchmark excluded
+from RLVR training.  Training method $q\in\{\mathrm{SFT},\mathrm{RSFT},
+\mathrm{RLVR}\}$ on $\mathcal{B}$ produces policy
+$\pi_{\theta_{q,\mathcal{B}}}$.  We define directed transfer as
+\begin{equation}
+    T^{q}_{\mathcal{B}\rightarrow\mathcal{A}}
+    = \operatorname{Score}(\pi_{\theta_{q,\mathcal{B}}},\mathcal{A})
+      - \operatorname{Score}(\pi_{\theta_0},\mathcal{A}).
+    \label{eq:directed-transfer}
+\end{equation}
+A positive value denotes positive transfer, a negative value denotes negative
+transfer, and uncertainty intervals that include zero are treated as
+inconclusive rather than evidence of transfer.
+
+\paragraph{Information-access protocol.}
+The deployable setting permits source prompts, source answers and rewards, and
+a disjoint unlabeled target development sample $\mathcal{A}^{u}$.  It prohibits
+target answers, target rewards, and target-test feedback during method design,
+data selection, hyperparameter tuning, and checkpoint selection.  Once target
+test results have influenced a design decision, that target is considered a
+development benchmark and cannot serve as a confirmatory test for the revised
+method.
+
+\paragraph{Research questions.}
+We ask (i) when RLVR transfers across benchmarks, (ii) whether directed
+reasoning coverage predicts this transfer beyond semantic similarity and task
+difficulty, (iii) whether observed gains reflect empirical support expansion
+or redistribution, and (iv) whether the predictive signal can improve
+fixed-budget RLVR data selection.
+

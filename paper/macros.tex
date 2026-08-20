@@ -1,0 +1,31 @@
+\newcommand{\method}{\textsc{StructTransfer}\xspace}
+\newcommand{\drc}{\textsc{DRC}\xspace}
+\newcommand{\drcselect}{\textsc{DRC-Select}\xspace}
+\newcommand{\rtg}{\textsc{RTG}\xspace}
+
+\newif\ifpaperdraft
+\paperdrafttrue
+
+\newcommand{\resultplaceholder}[1]{%
+  \ifpaperdraft
+    \textcolor{red!70!black}{\textbf{[#1]}}%
+  \else
+    #1%
+  \fi
+}
+
+% Usage: \figureorplaceholder{path/to/file.pdf}{\columnwidth}{42mm}
+% The document compiles before the final figure exists. At submission time,
+% every placeholder must be replaced by a real vector PDF or high-resolution
+% raster image.
+\newcommand{\figureorplaceholder}[3]{%
+  \IfFileExists{#1}{%
+    \includegraphics[width=#2]{#1}%
+  }{%
+    \fbox{\parbox[c][#3][c]{\dimexpr#2-2\fboxsep-2\fboxrule\relax}{%
+      \centering\small
+      Figure placeholder\\[2pt]
+      \texttt{\detokenize{#1}}%
+    }}%
+  }%
+}

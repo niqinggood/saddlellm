@@ -1,0 +1,37 @@
+project: saddlellm
+experiment: text-to-video-latent-flow
+
+# An upstream text encoder and causal video codec must create:
+#   video_latents: float32 [samples, channels, frames, height, width]
+#   conditions:    float32 [samples, text_condition_dim]
+stages: [video_generation]
+
+video_generation:
+  enabled: true
+  data_path: data/video_latents.npz
+  output_dir: video_flow
+  codec_name: external-causal-video-codec
+  condition_encoder: external-text-encoder
+  temporal_patch_size: 2
+  patch_size: 2
+  hidden_size: 512
+  num_layers: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  batch_size: 2
+  epochs: 10
+  max_steps: -1
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_accumulation_steps: 4
+  checkpoint_steps: 500
+  device: auto
+  mixed_precision: bf16
+
+logging:
+  output_dir: outputs/text-to-video
+  backend: local
+
+eval:
+  enabled: false

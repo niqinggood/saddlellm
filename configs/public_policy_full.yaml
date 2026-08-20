@@ -1,0 +1,45 @@
+# Full-scale RLVR experiment config for AASB public-policy datasets.
+# Targeted at Qwen3-0.6B on a single 24GB consumer GPU.
+model_name: Qwen/Qwen3-0.6B
+model_revision: c1899de289a04d12100db370d81485cdf75e47ca
+dataset_a: qyy752457002/AASB_Climate_Dataset
+dataset_a_revision: 4b99edfbc61fa6e1025e09803beb4d01e4bcce39
+dataset_b: qyy752457002/AASB_Topic_Modelling_Dataset
+dataset_b_revision: 06a00245e747794f10c609fe84df5350856782b6
+output_dir: outputs/public_policy_rlvr_qwen3_0_6b_full
+
+split_seed: 42
+train_fraction: 0.8
+validation_fraction: 0.1
+train_samples: 1024
+eval_samples_a: 374
+eval_samples_b: 374
+
+use_cot: false
+enable_qwen_thinking: false
+eval_k: 4
+eval_temperature: 0.7
+eval_top_p: 0.9
+eval_max_new_tokens: 96
+
+train_steps: 200
+num_generations: 4
+train_temperature: 1.0
+train_top_p: 0.95
+train_max_new_tokens: 96
+max_prompt_length: 1024
+max_sequence_length: 1152
+max_response_chars: 3000
+learning_rate: 0.00005
+beta: 0.02
+epsilon: 0.2
+per_device_batch_size: 1
+gradient_accumulation_steps: 2
+profile_source_prompts: true
+train_on_informative_only: true
+
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.0
+seed: 42
+save_adapter: true

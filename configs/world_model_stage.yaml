@@ -1,0 +1,36 @@
+project: saddlellm
+experiment: unified-rssm-world-model
+stages: [world_model]
+
+world_model:
+  enabled: true
+  backend: rssm
+  model:
+    action_type: continuous
+    embedding_size: 64
+    deterministic_size: 128
+    stochastic_size: 16
+    hidden_size: 128
+    kl_weight: 0.1
+    free_nats: 1.0
+  data:
+    train_path: data/world_model_example.jsonl
+    sequence_length: 6
+    stride: 3
+    validation_split: 0.25
+  training:
+    output_dir: world_model
+    num_epochs: 20
+    batch_size: 4
+    learning_rate: 0.0003
+    max_steps: -1
+    device: auto
+    mixed_precision: auto
+    checkpoint_steps: 25
+
+logging:
+  output_dir: outputs/unified-world-model
+  backend: local
+
+eval:
+  enabled: false

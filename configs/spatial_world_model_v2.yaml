@@ -1,0 +1,59 @@
+project: saddlellm
+experiment: spatial-sequence-v2
+backend: rssm
+
+model:
+  observation_shape: [11, 16, 16]
+  action_dim: 2
+  action_type: continuous
+  embedding_size: 96
+  deterministic_size: 128
+  stochastic_size: 24
+  hidden_size: 128
+  mlp_layers: 2
+  cnn_channels: [16, 32, 64]
+  activation: elu
+  min_std: 0.1
+  image_output_activation: sigmoid
+  reconstruction_weight: 0.5
+  reward_weight: 1.0
+  continuation_weight: 0.5
+  kl_weight: 0.1
+  kl_balance: 0.8
+  free_nats: 0.5
+  spatial_occupancy_channels: 3
+  spatial_occupancy_weight: 1.0
+  spatial_occupancy_class_weights: [1.0, 2.0, 1.0]
+  spatial_occupancy_kinematic_prior: true
+  spatial_occupancy_residual_scale: 3.0
+  spatial_occupancy_residual_unknown_only: true
+  spatial_ego_motion_dim: 3
+  spatial_ego_motion_weight: 1.0
+  spatial_collision_weight: 2.0
+  spatial_collision_positive_weight: 4.0
+
+data:
+  train_path: data/spatial_world_model_v2.jsonl
+  sequence_length: 20
+  stride: 10
+  validation_split: 0.2
+  validation_group_key: map_id
+  normalize_images: false
+  pad_short_trajectories: true
+
+training:
+  output_dir: outputs/spatial_world_model_v2_hybrid
+  num_epochs: 48
+  batch_size: 8
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  gradient_accumulation_steps: 1
+  max_grad_norm: 100.0
+  warmup_steps: 2
+  max_steps: -1
+  mixed_precision: auto
+  device: auto
+  num_workers: 0
+  log_steps: 1
+  checkpoint_steps: 100
+  seed: 42

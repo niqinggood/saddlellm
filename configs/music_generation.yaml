@@ -1,0 +1,39 @@
+project: saddlellm
+experiment: text-to-music-audio-codes
+
+# An upstream text encoder and residual audio codec must create:
+#   codes:          int64   [samples, codebooks, frames]
+#   conditions:     float32 [samples, text_condition_dim]
+#   attention_mask: optional int/bool [samples, frames]
+stages: [music_generation]
+
+music_generation:
+  enabled: true
+  data_path: data/music_codes.npz
+  output_dir: music_code_model
+  codec_name: external-residual-audio-codec
+  condition_encoder: external-text-encoder
+  num_codebooks: 4
+  codebook_size: 1024
+  max_sequence_length: 2048
+  hidden_size: 512
+  num_layers: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  batch_size: 4
+  epochs: 10
+  max_steps: -1
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 100
+  gradient_accumulation_steps: 4
+  checkpoint_steps: 500
+  device: auto
+  mixed_precision: bf16
+
+logging:
+  output_dir: outputs/text-to-music
+  backend: local
+
+eval:
+  enabled: false

@@ -1,0 +1,293 @@
+\section{Methodology}
+\label{sec:methodology}
+
+We introduce \textsc{StructTransfer}, a framework for predicting and improving the
+directed transfer induced by reinforcement learning with verifiable rewards
+(RLVR).  Given a base policy $\pi_{\theta_0}$, a candidate source pool
+$\mathcal{B}$ with verifiable rewards, and an unlabeled development sample
+$\mathcal{A}^{u}$ from a target task, our goal is to estimate whether RLVR on
+$\mathcal{B}$ will improve performance on the target and to select a
+fixed-budget subset of $\mathcal{B}$ that maximizes this transfer.  The target
+answers and rewards are unavailable during representation construction, data
+selection, RLVR training, hyperparameter selection, and checkpoint selection;
+the held-out target test set is used only for final evaluation.
+
+\textsc{StructTransfer} has four components.  First, it represents each problem
+as a \emph{Reasoning Transition Graph} (RTG), which preserves the operations,
+dependencies, and control flow of a candidate reasoning process
+(Section~\ref{sec:rtg}).  Second, it compares the learnable reasoning supply of
+the source with the unresolved reasoning demand of the target through
+\emph{Directed Reasoning Coverage} (DRC)
+(Section~\ref{sec:drc}).  Third, it uses DRC to predict transfer on previously
+unseen source--target pairs (Section~\ref{sec:transfer-prediction}).  Finally,
+\emph{DRC-Select} chooses a target-relevant and structurally diverse source
+subset without accessing target labels or rewards
+(Section~\ref{sec:drc-select}).  The representation and selection procedures
+are independent of the policy optimizer and can therefore be combined with
+GRPO, DAPO, or other RLVR objectives.
+
+\subsection{Reasoning Transition Graphs}
+\label{sec:rtg}
+
+\paragraph{Graph representation.}
+Let $x$ denote a problem prompt.  We represent a candidate solution process by
+a typed directed graph
+\begin{equation}
+    G_x = (V_x, E_x, o_x, \rho_x),
+\end{equation}
+where each node $v\in V_x$ is assigned a reasoning operation
+$o_x(v)\in\mathcal{O}$ and each edge $e\in E_x$ is assigned a relation type
+$\rho_x(e)\in\mathcal{R}$.  The operation vocabulary $\mathcal{O}$ includes
+problem interpretation, information retrieval, variable or state setup,
+decomposition, arithmetic computation, symbolic transformation, constraint
+propagation, case analysis, search, aggregation, and verification.  The edge
+vocabulary distinguishes temporal succession, data dependence, and control
+flow.  Consequently, two solutions with similar operation frequencies but
+different dependency structures need not receive similar representations.
+
+\paragraph{Label-free extraction.}
+For each source or target prompt, we sample $K_{\mathrm{trace}}$ candidate traces
+from the same frozen base policy $\pi_{\theta_0}$.  A fixed graph extractor
+$\mathcal{E}_{\psi}$ maps the prompt and each visible candidate trace to an RTG:
+\begin{equation}
+    G_x^{(k)} = \mathcal{E}_{\psi}\!\left(x,\tau_x^{(k)}\right),
+    \qquad \tau_x^{(k)}\sim\pi_{\theta_0}(\cdot\mid x).
+\end{equation}
+The same extraction channel is used for source and target examples so that
+representation differences cannot be attributed to using gold solutions on
+only one side.  Extraction does not condition on target correctness.  We cache
+the resulting graphs and validate a stratified sample against independent
+human annotations.  An oracle representation built from verified reference
+solutions is used only as a diagnostic upper bound and never by the deployable
+selector.
+
+\begin{figure}[t]
+    \centering
+    \figureorplaceholder{figures/fig2_rtg.pdf}{0.96\columnwidth}{48mm}
+    \caption{Illustrative Reasoning Transition Graphs.  Typed nodes encode
+    reasoning operations, while typed edges preserve temporal, dependency, and
+    control-flow relations that are lost in a bag-of-steps representation.}
+    \label{fig:rtg}
+\end{figure}
+
+\paragraph{Reasoning motifs.}
+We summarize an RTG by a vocabulary $\mathcal{M}$ of typed local subgraphs,
+called reasoning motifs.  A motif may encode, for example,
+\textsc{Setup}$\rightarrow$\textsc{Transform}$\rightarrow$\textsc{Verify} or a
+branching \textsc{CaseSplit} followed by independent derivations and an
+\textsc{Aggregate} operation.  The vocabulary and extraction radius are fixed
+using meta-training tasks before evaluating a held-out target domain.  Let
+$a_{x,m}\in[0,1]$ be the normalized frequency of motif $m$ across the candidate
+graphs for $x$.  The motif distribution of a dataset $\mathcal{D}$ is
+\begin{equation}
+    q_{\mathcal{D}}(m)
+    = \frac{1}{|\mathcal{D}|}\sum_{x\in\mathcal{D}} a_{x,m}.
+\end{equation}
+We measure motif compatibility with a bounded graph kernel
+\begin{equation}
+    \kappa(n,m)=\exp\!\left(-d_{\mathrm{graph}}(n,m)/\tau\right),
+\end{equation}
+where $d_{\mathrm{graph}}$ compares node types, typed edges, and structural
+attributes.  The temperature $\tau$ is calibrated only on meta-development
+tasks.
+
+\subsection{Directed Reasoning Coverage}
+\label{sec:drc}
+
+A symmetric similarity score cannot, by itself, explain why transfer from
+$\mathcal{B}$ to $\mathcal{A}$ may differ from transfer in the reverse
+direction.  DRC instead distinguishes \emph{source supply} from
+\emph{target demand} and conditions both on the base policy.
+
+\paragraph{Learnable source supply.}
+For a source example $x\in\mathcal{B}$, let $\hat p_x$ be the fraction of
+$K_{\mathrm{reward}}$ base-policy rollouts accepted by the source verifier.  We
+define its frontier learnability as
+\begin{equation}
+    \ell_x = 4\hat p_x(1-\hat p_x).
+\end{equation}
+This quantity is maximal near the empirical decision boundary and vanishes
+when all group samples receive the same binary reward, where group-relative
+RLVR supplies no within-group advantage signal.  Let
+$w_{\mathcal{B}}(x)$ be the prespecified fraction of the fixed RLVR exposure
+budget allocated to $x$, with $\sum_x w_{\mathcal{B}}(x)=1$.  The learnable
+supply of motif $n$ is
+\begin{equation}
+    s_{\mathcal{B}}(n)
+    = \sum_{x\in\mathcal{B}}
+      w_{\mathcal{B}}(x)a_{x,n}\ell_x.
+\end{equation}
+
+\paragraph{Unresolved target demand.}
+Target rewards are unavailable, so we estimate headroom from disagreement
+among base-policy answers.  Let $\widehat P_x(y)$ denote the empirical
+distribution of extracted final answers from $K_{\mathrm{target}}$ rollouts,
+including a distinguished extraction-failure symbol.  We define
+\begin{equation}
+    h_x
+    = \frac{-\sum_y \widehat P_x(y)\log \widehat P_x(y)}
+           {\log K_{\mathrm{target}}},
+\end{equation}
+with $h_x=0$ when all samples agree.  The unresolved target demand for motif
+$m$ is
+\begin{equation}
+    d_{\mathcal{A}}(m)
+    = \frac{1}{|\mathcal{A}^{u}|}
+      \sum_{x\in\mathcal{A}^{u}} a_{x,m}h_x.
+\end{equation}
+This proxy is deliberately label-free.  For analysis only, we also consider an
+oracle headroom estimate based on verified base accuracy to quantify the cost
+of replacing correctness with disagreement.
+
+\paragraph{Coverage.}
+The source coverage of a target motif $m$ is
+\begin{equation}
+    c_{\mathcal{B}}(m)
+    = 1-\exp\!\left(
+        -\eta\sum_{n\in\mathcal{M}}
+        \kappa(n,m)s_{\mathcal{B}}(n)
+      \right),
+\end{equation}
+where $\eta>0$ controls saturation and is fixed on meta-development tasks.
+DRC is the target-demand-weighted coverage
+\begin{equation}
+    \operatorname{DRC}(\mathcal{B}\!\rightarrow\!\mathcal{A})
+    =
+    \frac{
+      \sum_{m\in\mathcal{M}} d_{\mathcal{A}}(m)c_{\mathcal{B}}(m)
+    }{
+      \sum_{m\in\mathcal{M}} d_{\mathcal{A}}(m)+\epsilon
+    }.
+    \label{eq:drc}
+\end{equation}
+DRC is directional because the source contributes verifier-conditioned
+learnability while the target contributes label-free unresolved demand.
+Swapping the two datasets changes both quantities even when their marginal
+motif frequencies are identical.  It is also model-dependent: the same pair
+of tasks may have different transfer potential for base policies with
+different reasoning frontiers.
+
+\subsection{Prospective Transfer Prediction}
+\label{sec:transfer-prediction}
+
+We calibrate DRC on a collection of meta-training source--target pairs for
+which RLVR transfer has already been measured.  Let
+$T_{i\rightarrow j}$ be the transfer gain defined in
+Section~\ref{sec:problem-formulation}.  Our interpretable predictor is
+\begin{equation}
+    \widehat T_{i\rightarrow j}
+    = \beta_0
+      + \beta_1\operatorname{DRC}(\mathcal{B}_i\!\rightarrow\!\mathcal{A}_j)
+      + \boldsymbol{\beta}^{\top}\mathbf{z}_{ij}
+      + u_{\mathrm{model}}+u_i+u_j,
+    \label{eq:transfer-predictor}
+\end{equation}
+where $\mathbf{z}_{ij}$ contains prespecified controls such as semantic
+similarity, prompt-length difference, answer-format compatibility, and
+verifier type.  The random effects account for the model, source, and target
+when sufficient observations are available; a regularized linear model is
+used in smaller regimes.  Neither $T_{i\rightarrow j}$ nor any target outcome
+from the held-out domain is used when fitting or selecting the final predictor.
+This setup enables prospective leave-one-benchmark and leave-one-domain
+evaluation rather than post-hoc correlation on the same transfer matrix.
+
+\subsection{Cross-Benchmark Capability Flow}
+\label{sec:capability-flow}
+
+An increase in pass@1 may reflect either broader empirical support or a sharper
+distribution over solutions the base policy could already produce.  We
+therefore estimate item-level transitions between the base and RLVR policies.
+For each target item $x$, we draw $N$ independent completions from policy
+$j\in\{0,1\}$, where $j=0$ denotes the base policy and $j=1$ the RLVR policy.
+If $c_{j,x}$ completions pass the verifier, we use a Beta posterior
+\begin{equation}
+    p_{j,x}\mid c_{j,x}
+    \sim \operatorname{Beta}\!\left(
+        \alpha+c_{j,x},\,\beta+N-c_{j,x}
+    \right).
+\end{equation}
+For a sampling budget $k$, the probability of at least one success is
+\begin{equation}
+    b_k(p)=1-(1-p)^k.
+\end{equation}
+Using prespecified confidence and solvability thresholds, an item is classified
+as empirically solvable, empirically unsolvable, or uncertain under each
+policy.  We define \emph{acquisition} as an unsolvable-to-solvable transition,
+\emph{forgetting} as the reverse transition, and \emph{retention} as remaining
+solvable.  Among retained items, \emph{sharpening} denotes a posterior-supported
+increase in $p_{1,x}-p_{0,x}$.  The net empirical boundary expansion is
+\begin{equation}
+    \operatorname{NBE}@k
+    = \frac{1}{|\mathcal{A}|}
+      \sum_{x\in\mathcal{A}}
+      \left[
+        \mathbb{I}\{U_0(x)\wedge S_1(x)\}
+        -\mathbb{I}\{S_0(x)\wedge U_1(x)\}
+      \right].
+\end{equation}
+We report this decomposition together with the full pass@$k$ curve and output
+diversity.  We use the term \emph{empirical support expansion}, rather than
+absolute capability acquisition, because finite sampling cannot prove that a
+base policy assigns exactly zero probability to a correct solution.
+
+\subsection{Target-Label-Free Data Selection}
+\label{sec:drc-select}
+
+DRC-Select turns the structural transfer score into a training intervention.  Let
+$\mathcal{U}$ be a candidate source pool and let $C$ be a token budget.  Each
+candidate $x\in\mathcal{U}$ contributes motif-specific learnable supply
+$s_x(n)=a_{x,n}\ell_x$.  For a selected set $S$, we compute target coverage by
+replacing $s_{\mathcal{B}}(n)$ in Equation~\ref{eq:drc} with the budget-scaled
+accumulated supply
+$\sum_{x\in S}[\operatorname{cost}(x)/C]s_x(n)$.  At the full budget this uses
+the same exposure normalization as the dataset-level DRC definition.  This
+yields a set-valued coverage objective
+$F_{\mathrm{cov}}(S;\mathcal{A}^{u})$ with diminishing returns: once a target
+motif is well covered, additional near-duplicate source examples provide
+little gain.
+
+To prevent the selector from concentrating on a single reasoning template, we
+combine target coverage with a target-weighted graph-space facility-location
+term.  We first define the structural relevance of candidate $x$ as
+\begin{equation}
+    r_{\mathcal{A}}(x)
+    = \sum_{m,n\in\mathcal{M}}
+      d_{\mathcal{A}}(m)\kappa(n,m)a_{x,n}\ell_x.
+\end{equation}
+The diversity term is then
+\begin{equation}
+    F_{\mathrm{div}}(S;\mathcal{A}^{u})
+    = \frac{1}{\sum_{x\in\mathcal{U}}r_{\mathcal{A}}(x)+\epsilon}
+      \sum_{x\in\mathcal{U}}
+      r_{\mathcal{A}}(x)
+      \max_{y\in S}\operatorname{sim}_{\mathrm{RTG}}(x,y).
+\end{equation}
+The final objective is
+\begin{equation}
+    S^* = \arg\max_{S\subseteq\mathcal{U}}
+      F_{\mathrm{cov}}(S;\mathcal{A}^{u})
+      + \lambda F_{\mathrm{div}}(S;\mathcal{A}^{u})
+    \quad\text{s.t.}\quad
+      \sum_{x\in S}\operatorname{cost}(x)\leq C,
+    \label{eq:drc-select}
+\end{equation}
+where $\operatorname{cost}(x)$ is the estimated training-token cost.  We use a
+cost-aware greedy procedure that repeatedly adds the example with the largest
+marginal objective gain per token.  The selected example identifiers are
+frozen in an immutable manifest before RLVR begins.  All selection baselines
+and DRC-Select subsequently use the same policy optimizer, rollout budget, and
+checkpoint rule.  At inference time, the resulting policy requires neither a
+retriever nor access to target examples.
+
+\subsection{Computation and Reproducibility}
+\label{sec:method-computation}
+
+RTG extraction and motif construction are offline and cached.  With a fixed
+motif vocabulary, computing DRC requires a sparse motif-kernel multiplication;
+DRC-Select reuses these cached contributions during greedy selection.  The
+method changes only the source data distribution and introduces no additional
+inference-time computation.  We record the graph-extractor revision, motif
+vocabulary, base-policy revision, decoding configuration, dataset hashes, and
+selected-example manifest for every run.  All thresholds and calibration
+parameters in this section are fixed on meta-development tasks before final
+evaluation on a held-out target domain.

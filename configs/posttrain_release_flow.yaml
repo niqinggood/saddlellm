@@ -1,0 +1,47 @@
+# 完整后训练发布闭环示例；正式训练前请替换模型、数据、阈值和输出目录。
+name: qwen-domain-release-v1
+model: Qwen/Qwen3-4B
+flow: full
+
+data:
+  sft: data/posttrain_sft_example.jsonl
+  preference: data/posttrain_preference_example.jsonl
+
+train:
+  qlora: true
+  epochs: 2
+  batch_size: 1
+  max_sequence_length: 2048
+
+dpo:
+  beta: 0.1
+  learning_rate: 0.000005
+
+evaluation:
+  enabled: true
+  suite: [perplexity]
+  dataset: data/posttrain_sft_example.jsonl
+  max_samples: 100
+  fail_on_error: true
+  gate:
+    enabled: true
+    rules:
+      perplexity:
+        max: 30.0
+    require_all: true
+    fail_on_rejection: true
+
+export:
+  output_dir: outputs/qwen-domain-release-v1/release
+  format: hf
+  merge_lora: true
+  safe_serialization: true
+  require_gate: true
+  hash_weights: false
+  overwrite: false
+
+advanced:
+  gradient_accumulation_steps: 4
+  trust_remote_code: false
+
+output: outputs/qwen-domain-release-v1

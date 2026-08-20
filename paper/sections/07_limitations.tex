@@ -1,0 +1,15 @@
+\section{Limitations}
+\label{sec:limitations}
+
+Our framework depends on an automatically extracted reasoning representation,
+whose taxonomy may omit relevant operations and whose errors may vary across
+domains.  The label-free target-headroom estimate uses answer disagreement and
+may underestimate confidently incorrect behavior.  Finite-sample capability
+flow establishes empirical support expansion, not proof that the base policy
+assigned exactly zero probability to a correct solution.  Our claims are also
+limited by the evaluated model scales, RLVR optimizers, verifiable task
+families, and available compute.  Finally, deduplication and temporal controls
+can reduce but cannot completely rule out contamination from opaque
+pretraining corpora.  We report these factors explicitly and restrict each
+claim to the settings covered by the confirmatory experiments.
+

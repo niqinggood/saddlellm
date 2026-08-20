@@ -1,0 +1,127 @@
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{sec:experimental-setup}
+
+\paragraph{Datasets and models.}
+\resultplaceholder{Insert the frozen source/target matrix, model revisions,
+licenses, decontamination policy, and target-access protocol.}
+
+\begin{table}[t]
+    \centering
+    \small
+    \caption{Source datasets and held-out target benchmarks.  Replace every
+    placeholder with the frozen dataset revision and example count.}
+    \label{tab:data}
+    \begin{tabular}{lll}
+        \toprule
+        Role & Family & Dataset / benchmark \\
+        \midrule
+        Source & Arithmetic & \resultplaceholder{name, revision} \\
+        Source & Algebra & \resultplaceholder{name, revision} \\
+        Source & Logic/Code & \resultplaceholder{name, revision} \\
+        Target & In-domain & \resultplaceholder{name, revision} \\
+        Target & Cross-domain & \resultplaceholder{name, revision} \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\paragraph{Training and matched controls.}
+\resultplaceholder{Specify Base, SFT, RSFT, and RLVR; rollout-token and
+optimization budgets; seeds; checkpoint rule; and decoding configuration.}
+
+\paragraph{Metrics and statistics.}
+\resultplaceholder{Specify accuracy/pass@1, pass@k, directed transfer,
+prediction error and rank correlation, capability flow, paired bootstrap, and
+multiple-comparison correction.}
+
+\subsection{Cross-Benchmark Transfer Landscape}
+\label{sec:transfer-landscape}
+
+\begin{figure*}[t]
+    \centering
+    \figureorplaceholder{figures/fig3_transfer_heatmap.pdf}{0.94\textwidth}{58mm}
+    \caption{Directed transfer matrix across source datasets and target
+    benchmarks.  Cells should report transfer with uncertainty; visual marks
+    should distinguish positive, negative, and inconclusive effects.}
+    \label{fig:transfer-heatmap}
+\end{figure*}
+
+\resultplaceholder{Answer RQ1. Report heterogeneous and asymmetric transfer,
+then compare RLVR with matched SFT and RSFT rather than only with the base
+policy.}
+
+\subsection{Predicting Transfer with Directed Reasoning Coverage}
+\label{sec:drc-results}
+
+\begin{figure}[t]
+    \centering
+    \figureorplaceholder{figures/fig4_drc_prediction.pdf}{0.96\columnwidth}{48mm}
+    \caption{Prospective DRC predictions versus measured transfer on held-out
+    source--target pairs.  Separate meta-training from held-out domains and
+    include confidence intervals.}
+    \label{fig:drc-prediction}
+\end{figure}
+
+\resultplaceholder{Answer RQ2. Compare DRC with semantic similarity, coarse
+reasoning histograms, difficulty, domain labels, and gradient alignment under
+leave-one-benchmark and leave-one-domain evaluation.}
+
+\subsection{Causal Role of Reasoning Structure}
+\label{sec:causal-structure}
+
+\resultplaceholder{Report the semantic-similarity $\times$ structural-
+similarity factorial experiment, controls, main effects, interactions, and
+counterfactual examples.}
+
+\subsection{Capability Expansion or Redistribution?}
+\label{sec:capability-results}
+
+\begin{figure*}[t]
+    \centering
+    \figureorplaceholder{figures/fig5_capability_flow.pdf}{0.94\textwidth}{58mm}
+    \caption{Cross-benchmark capability flow and pass@$k$ behavior.  Show
+    acquisition, sharpening, retention, and forgetting with posterior
+    uncertainty rather than classifying items from a single sample.}
+    \label{fig:capability-flow}
+\end{figure*}
+
+\resultplaceholder{Answer RQ3. State whether pass@1 gains coincide with net
+empirical boundary expansion, or instead with sharpening and high-$k$
+degradation.}
+
+\subsection{Target-Label-Free Data Selection}
+\label{sec:drc-select-results}
+
+\begin{table*}[t]
+    \centering
+    \small
+    \caption{Target-label-free data-selection results under matched token and
+    optimization budgets. Report mean transfer, worst-target transfer,
+    negative-transfer rate, and pass@$k$.}
+    \label{tab:drc-select}
+    \begin{tabular}{lcccccc}
+        \toprule
+        Selector & Target labels & Mean $T$ & Worst $T$ & Neg. rate & Pass@1 & Pass@$K$ \\
+        \midrule
+        Random & No & -- & -- & -- & -- & -- \\
+        Semantic & No & -- & -- & -- & -- & -- \\
+        Difficulty & Source only & -- & -- & -- & -- & -- \\
+        Gradient alignment & Source only & -- & -- & -- & -- & -- \\
+        \drcselect & No & -- & -- & -- & -- & -- \\
+        \bottomrule
+    \end{tabular}
+\end{table*}
+
+\resultplaceholder{Answer RQ4. Compare DRC-Select against the strongest
+available baseline, not only random selection, and report failures as well as
+average gains.}
+
+\subsection{Ablations and Robustness}
+\label{sec:ablations}
+
+\resultplaceholder{Ablate graph edges, directionality, learnability, headroom,
+and diversity. Test model family, optimizer, KL strength, training duration,
+verifier perturbations, and random seeds.}
+

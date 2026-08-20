@@ -1,0 +1,48 @@
+project: saddlellm
+experiment: rssm-world-model-example
+backend: rssm
+
+# observation_shape and action_dim are checked against the loaded data.  They
+# may be omitted to infer them automatically.
+model:
+  observation_shape: [4]
+  action_dim: 2
+  action_type: continuous
+  embedding_size: 64
+  deterministic_size: 128
+  stochastic_size: 16
+  hidden_size: 128
+  mlp_layers: 2
+  activation: elu
+  min_std: 0.1
+  reconstruction_weight: 1.0
+  reward_weight: 1.0
+  continuation_weight: 1.0
+  kl_weight: 0.1
+  kl_balance: 0.8
+  free_nats: 1.0
+
+data:
+  train_path: data/world_model_example.jsonl
+  sequence_length: 6
+  stride: 3
+  validation_split: 0.25
+  normalize_images: true
+  pad_short_trajectories: true
+
+training:
+  output_dir: outputs/world_model_example
+  num_epochs: 20
+  batch_size: 4
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  gradient_accumulation_steps: 1
+  max_grad_norm: 100.0
+  warmup_steps: 2
+  max_steps: -1
+  mixed_precision: auto
+  device: auto
+  num_workers: 0
+  log_steps: 1
+  checkpoint_steps: 25
+  seed: 42

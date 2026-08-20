@@ -1,0 +1,47 @@
+project: saddlellm
+experiment: spatial-rssm-example
+backend: rssm
+
+# This contract matches SpatialObservationEncoder and WorldModelRouteScorer.
+model:
+  observation_shape: [16]
+  action_dim: 2
+  action_type: continuous
+  embedding_size: 64
+  deterministic_size: 96
+  stochastic_size: 16
+  hidden_size: 96
+  mlp_layers: 2
+  activation: elu
+  min_std: 0.1
+  reconstruction_weight: 1.0
+  reward_weight: 1.0
+  continuation_weight: 1.0
+  kl_weight: 0.1
+  kl_balance: 0.8
+  free_nats: 0.5
+
+data:
+  train_path: data/spatial_world_model_example.jsonl
+  sequence_length: 24
+  stride: 12
+  validation_split: 0.15
+  normalize_images: false
+  pad_short_trajectories: true
+
+training:
+  output_dir: outputs/spatial_world_model_example
+  num_epochs: 12
+  batch_size: 8
+  learning_rate: 0.0005
+  weight_decay: 0.00001
+  gradient_accumulation_steps: 1
+  max_grad_norm: 100.0
+  warmup_steps: 2
+  max_steps: -1
+  mixed_precision: auto
+  device: auto
+  num_workers: 0
+  log_steps: 1
+  checkpoint_steps: 100
+  seed: 42

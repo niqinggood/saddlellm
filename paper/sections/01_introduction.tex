@@ -1,0 +1,59 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Reinforcement learning with verifiable rewards (RLVR) has become a standard
+approach for improving language-model reasoning on tasks with automatically
+checkable outcomes.  Yet a gain on the source task does not imply a gain on an
+unseen target benchmark.  Depending on the source--target pair, post-training
+may transfer positively, have no measurable effect, or degrade target
+performance.  This uncertainty makes it difficult to choose RLVR data and
+weakens claims that higher source-benchmark accuracy reflects broadly improved
+reasoning.
+
+Existing evaluations largely characterize transfer after training and often
+describe task relatedness using broad domain labels or symmetric similarity.
+These views do not directly answer the prospective question faced by a
+practitioner: given a base policy, a source pool, and an unlabeled target task,
+which source data is likely to transfer?  They also leave open whether a pass@1
+gain expands the set of target problems the model can empirically solve or
+merely concentrates probability on already accessible solutions.
+
+\begin{figure*}[t]
+    \centering
+    \figureorplaceholder{figures/fig1_overview.pdf}{0.96\textwidth}{60mm}
+    \caption{Problem setting and overview of \method.  A source dataset
+    provides verifiable RLVR feedback, whereas the target contributes only
+    unlabeled development prompts.  Reasoning Transition Graphs yield a
+    directed source-to-target coverage score, which is used for prospective
+    transfer prediction and fixed-budget source-data selection.}
+    \label{fig:overview}
+\end{figure*}
+
+We formulate cross-benchmark RLVR generalization as a directed,
+target-label-free transfer problem.  Our key hypothesis is that transfer
+depends not only on semantic similarity, but on whether the source supplies
+learnable reasoning structures demanded by the unresolved portion of the
+target.  To test this hypothesis, we introduce \method, which represents
+problems using Reasoning Transition Graphs and measures source-to-target
+coverage with Directed Reasoning Coverage.  The score is explicitly
+directional and conditioned on the base policy's source learnability and
+target uncertainty.
+
+We use this score in two ways.  First, we evaluate whether it predicts transfer
+on held-out benchmarks and domains.  Second, \drcselect greedily chooses a
+target-relevant and structurally diverse source subset under a fixed token
+budget.  We additionally introduce a Bayesian capability-flow analysis that
+separates empirical support expansion, sharpening, retention, and forgetting.
+
+Our contributions are:
+\begin{itemize}
+    \item We formalize prospective, directed, target-label-free transfer for
+    cross-benchmark RLVR and construct a matched-control transfer atlas.
+    \item We propose Reasoning Transition Graphs and Directed Reasoning
+    Coverage for predicting source-to-target transfer.
+    \item We introduce a capability-flow analysis that distinguishes empirical
+    support expansion from probability sharpening and forgetting.
+    \item We propose \drcselect, a fixed-budget source-data selection method
+    that uses no target answers or rewards.
+\end{itemize}
+

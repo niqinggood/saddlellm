@@ -1,0 +1,60 @@
+project: saddlellm
+experiment: native-sft-dpo
+
+model:
+  backend: saddle
+  # A complete native checkpoint containing model and tokenizer artifacts.
+  name_or_path: outputs/pretrain/final_model
+
+stages: [sft, preference, eval, export]
+
+training:
+  max_steps: 1000
+  warmup_steps: 0
+  dataloader_num_workers: 0
+
+distributed:
+  strategy: single
+  bf16: true
+  fp16: false
+
+sft:
+  enabled: true
+  data_path: data/posttrain_sft_example.jsonl
+  use_lora: false
+  use_qlora: false
+  learning_rate: 0.00002
+  per_device_batch_size: 2
+  gradient_accumulation_steps: 8
+  max_seq_length: 2048
+  warmup_steps: 100
+
+preference:
+  enabled: true
+  method: dpo
+  data_path: data/posttrain_preference_example.jsonl
+  use_lora: false
+  use_qlora: false
+  beta: 0.1
+  learning_rate: 0.000005
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_length: 2048
+  max_prompt_length: 1024
+  warmup_steps: 100
+
+eval:
+  enabled: true
+  dataset: data/posttrain_sft_example.jsonl
+  tasks: [perplexity]
+  max_samples: 100
+
+export:
+  enabled: true
+  format: saddle
+  merge_lora: false
+  output_dir: outputs/native-sft-dpo/release
+
+logging:
+  output_dir: outputs/native-sft-dpo
+  backend: local

@@ -1,0 +1,85 @@
+# SaddleLLM native modular decoder example.
+# The `layers` list is authoritative: repeat values expand to four independent
+# decoder layers even though a model registry preset is also supplied.
+project: saddlellm
+experiment: modular-llm-example
+stages: [pretrain]
+pretrain_mode: scratch
+
+# Add `eval` and `export` to stages when desired. Native releases use:
+# export:
+#   enabled: true
+#   format: saddle
+#   merge_lora: false
+
+model:
+  backend: saddle
+  config: qwen-tiny-160m       # optional defaults; blueprint values override it
+  tokenizer: Qwen/Qwen2.5-0.5B
+  blueprint:
+    name: saddle-hybrid-demo
+    family: saddle
+    hidden_size: 512
+    vocab_size: 32000
+    max_position_embeddings: 4096
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 8
+      num_kv_heads: 2
+    ffn:
+      kind: swiglu
+      intermediate_size: 1536
+    residual:
+      topology: serial
+      attention_scale: 1.0
+      ffn_scale: 1.0
+      learnable: false
+      dropout: 0.0
+      initialization: depth_scaled
+    layers:
+      - name: dense-stem
+        repeat: 2
+      - name: parallel-dense
+        repeat: 1
+        attention:
+          kind: mqa
+        residual:
+          topology: parallel
+      - name: sparse-tail
+        repeat: 1
+        attention:
+          kind: mla
+          q_lora_rank: 64
+          kv_lora_rank: 32
+          mla_cache_mode: latent
+        ffn:
+          kind: moe
+          num_experts: 8
+          experts_per_token: 2
+          expert_intermediate_size: 768
+          shared_expert: true
+        residual:
+          learnable: true
+          attention_scale: 0.5
+          ffn_scale: 0.5
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+# Replace this path with real pretraining JSONL/text data before running.
+data:
+  sources:
+    - type: local
+      path: data/pretrain.jsonl
+      text_column: text
+  max_seq_length: 1024
+
+training:
+  max_steps: 1000
+  per_device_batch_size: 2
+  global_batch_size: 32
+  learning_rate: 0.0003
+
+logging:
+  output_dir: outputs/modular-llm

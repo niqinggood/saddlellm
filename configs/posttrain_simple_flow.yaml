@@ -1,0 +1,28 @@
+# 可执行的配置与数据格式示例；正式训练前请替换模型、数据和输出目录。
+name: qwen-domain-v1
+model: Qwen/Qwen3-4B
+flow: sft+dpo
+
+data:
+  sft: data/posttrain_sft_example.jsonl
+  preference: data/posttrain_preference_example.jsonl
+
+train:
+  qlora: true
+  epochs: 2
+  batch_size: 1
+  max_sequence_length: 2048
+
+dpo:
+  beta: 0.1
+  learning_rate: 0.000005
+
+evaluation:
+  enabled: true
+  suite: standard
+
+advanced:
+  gradient_accumulation_steps: 4
+  trust_remote_code: false
+
+output: outputs/qwen-domain-v1

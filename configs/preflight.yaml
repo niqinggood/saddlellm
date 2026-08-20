@@ -1,0 +1,25 @@
+project: saddlellm
+experiment: preflight-check
+stage: sft
+model:
+  name_or_path: Qwen/Qwen2.5-7B-Instruct
+  tokenizer: Qwen/Qwen2.5-7B-Instruct
+  backend: hf
+  pretrain_mode: continue
+method:
+  type: lora
+data:
+  sources:
+    - type: local
+      path: data/posttrain_sft_example.jsonl
+      format: jsonl
+  max_seq_length: 1024
+training:
+  preflight_only: true
+  dry_run: true
+  per_device_batch_size: 1
+  global_batch_size: 8
+  max_steps: 100
+logging:
+  output_dir: outputs/preflight
+  backend: local

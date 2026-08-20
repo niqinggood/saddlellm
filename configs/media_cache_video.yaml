@@ -1,0 +1,15 @@
+cache:
+  input_path: ../data/video_generation_manifest.jsonl
+  output_dir: ../data/cache/video_baseline
+  modality: video
+  codec_name: baseline-frame-video
+  codec_config:
+    frames: 8
+    height: 32
+    width: 32
+  text_encoder: hash
+  text_encoder_config:
+    dimension: 256
+  shard_size: 64
+  strict: true
+  resume: true

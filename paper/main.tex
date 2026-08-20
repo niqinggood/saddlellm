@@ -1,0 +1,50 @@
+\documentclass[10pt,twocolumn]{article}
+
+% Draft-only page geometry. Replace the document class and remove geometry
+% when the official venue template is selected.
+\usepackage[letterpaper,margin=0.75in,columnsep=0.25in]{geometry}
+\input{preamble}
+\input{macros}
+
+\title{When Does RLVR Transfer?\\
+Predicting and Improving Cross-Benchmark Generalization\\
+via Directed Reasoning Coverage}
+
+\author{Anonymous Authors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Reinforcement learning with verifiable rewards (RLVR) can substantially improve
+language-model performance on the tasks used for post-training, but its gains
+do not transfer uniformly to unseen benchmarks.  We study the prospective,
+directed transfer problem: given a source dataset and an unlabeled target task,
+can we predict whether RLVR will transfer before training, and can that signal
+be used to select better source data?  We introduce \method, a framework based
+on Reasoning Transition Graphs, Directed Reasoning Coverage, and target-label-
+free data selection.  We further introduce a capability-flow analysis that
+separates empirical support expansion from probability sharpening and
+forgetting.  Across \resultplaceholder{N source--target pairs},
+\resultplaceholder{M model families}, and matched SFT, RSFT, and RLVR controls,
+\resultplaceholder{insert the frozen headline findings and uncertainty here}.
+\end{abstract}
+
+\input{sections/01_introduction}
+\input{sections/02_related_work}
+\input{sections/03_preliminaries}
+\input{sections/04_methodology}
+\input{sections/05_experiments}
+\input{sections/06_discussion}
+\input{sections/07_limitations}
+\input{sections/08_conclusion}
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\appendix
+\input{sections/appendix}
+
+\end{document}
+

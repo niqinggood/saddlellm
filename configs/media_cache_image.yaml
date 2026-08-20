@@ -1,0 +1,16 @@
+cache:
+  input_path: ../data/image_generation_manifest.jsonl
+  output_dir: ../data/cache/image_baseline
+  modality: image
+  codec_name: baseline-rgb-image
+  codec_config:
+    height: 32
+    width: 32
+  text_encoder: hash
+  text_encoder_config:
+    dimension: 256
+    ngram: 3
+    seed: 0
+  shard_size: 256
+  strict: true
+  resume: true

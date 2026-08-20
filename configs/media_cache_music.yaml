@@ -1,0 +1,17 @@
+cache:
+  input_path: ../data/music_generation_manifest.jsonl
+  output_dir: ../data/cache/music_baseline
+  modality: audio
+  codec_name: baseline-wav-rvq
+  codec_config:
+    sample_rate: 16000
+    frame_size: 320
+    max_frames: 256
+    num_codebooks: 4
+    codebook_size: 256
+  text_encoder: hash
+  text_encoder_config:
+    dimension: 256
+  shard_size: 256
+  strict: true
+  resume: true

@@ -1,0 +1,27 @@
+# SaddleLLM WorldAgent: analyze -> plan -> simulate -> feedback
+workspace: ../outputs/world_agent
+qwen_model: null                 # e.g. Qwen/Qwen3-VL-4B-Instruct
+world_model_checkpoint: null     # e.g. ../outputs/spatial_world_model_example
+device: auto
+allow_perspective: false
+max_upload_mb: 25
+max_image_pixels: 40000000
+
+map:
+  free_threshold: 0.72
+  free_is_bright: true
+  uncertainty_band: 0.0
+  obstacle_dilation: 1
+  max_dimension: 512
+  block_border: true
+  resolution: 1.0
+
+planner:
+  diagonal: true
+  allow_unknown: false
+  unknown_cost: 4.0
+  clearance_weight: 0.25
+  route_count: 3
+  diversity_weight: 2.0
+  diversity_radius: 2
+  max_detour_ratio: 2.5

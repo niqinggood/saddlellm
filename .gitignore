@@ -1,0 +1,87 @@
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+/config/
+
+# Python caches, environments, packaging, and test output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+.venv-*/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# JavaScript dependencies and generated metadata
+node_modules/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Training runs, model artifacts, and experiment tracking
+outputs/
+checkpoints/
+**/checkpoints/
+runs/
+wandb/
+tensorboard/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.gguf
+
+# Local research/reference checkouts and archives
+external_research/
+reference/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Large generated datasets; keep the small examples in data/
+data/spatial_world_model_v2.jsonl
+
+# Logs, temporary files, editors, and operating systems
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+~$*
+docs/*.docx
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# LaTeX build output
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
