@@ -1,0 +1,103 @@
+project: saddlellm-control
+experiment: prosthetic-eye-categorical-rssm
+stages: [world_model, eye_control]
+
+pipeline:
+  dependencies:
+    world_model: []
+    eye_control: [world_model]
+  resume: false
+  rerun: []
+  state_path: pipeline_state.json
+
+# Observation vector in the example data:
+# [yaw, pitch, yaw_velocity, pitch_velocity,
+#  target_yaw_error, target_pitch_error, target_visible,
+#  yaw_current, pitch_current]
+# Action vector:
+# [normalized_yaw_velocity_command, normalized_pitch_velocity_command]
+world_model:
+  enabled: true
+  backend: categorical_rssm
+  model:
+    action_type: continuous
+    embedding_size: 64
+    deterministic_size: 128
+    stochastic_size: 16
+    stochastic_classes: 16
+    hidden_size: 128
+    recurrent_blocks: 8
+    reward_bins: 63
+    symlog_observations: true
+    reconstruction_weight: 1.0
+    reward_weight: 1.0
+    continuation_weight: 1.0
+    dynamics_kl_weight: 1.0
+    representation_kl_weight: 0.1
+    free_nats: 1.0
+  data:
+    train_path: data/prosthetic_eye_example.jsonl
+    sequence_length: 6
+    stride: 3
+    validation_split: 0.25
+  training:
+    output_dir: world_model
+    num_epochs: 20
+    batch_size: 4
+    learning_rate: 0.0003
+    max_steps: -1
+    device: auto
+    mixed_precision: auto
+    checkpoint_steps: 25
+    seed: 42
+
+# Runs only in the software plant. A device-specific driver must implement
+# EyeHardwareAdapter before a safety-filtered command can reach hardware.
+eye_control:
+  enabled: true
+  require_world_model: true
+  output_path: eye_control/evaluation.json
+  episodes: 2
+  steps: 40
+  device: auto
+  include_traces: false
+  safety:
+    yaw_limits: [-0.65, 0.65]
+    pitch_limits: [-0.45, 0.45]
+    max_velocity: [1.8, 1.4]
+    max_acceleration: [10.0, 8.0]
+    max_current: [1.5, 1.5]
+    max_temperature_c: 55.0
+    soft_limit_margin: [0.08, 0.06]
+    neutral_position: [0.0, 0.0]
+    fallback_max_velocity: [0.45, 0.35]
+    target_timeout_seconds: 0.25
+  pid:
+    kp: [3.0, 3.0]
+    ki: [0.15, 0.15]
+    kd: [0.18, 0.18]
+  plant:
+    dt: 0.02
+    sensor_noise_std: 0.001
+  planner:
+    horizon: 6
+    num_candidates: 48
+    iterations: 2
+    elite_fraction: 0.125
+    discount: 0.99
+    action_low: [-1.0, -1.0]
+    action_high: [1.0, 1.0]
+    seed: 42
+
+distributed:
+  strategy: single
+  bf16: false
+  fp16: false
+
+eval:
+  enabled: false
+
+logging:
+  output_dir: outputs/prosthetic-eye-control
+  backend: local
+

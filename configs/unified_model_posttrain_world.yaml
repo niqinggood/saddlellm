@@ -1,0 +1,100 @@
+project: saddlellm
+experiment: unified-model-posttrain-world
+
+model:
+  backend: hf
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+
+# The declaration order is only a deterministic tie-breaker. The explicit
+# dependencies below are the authoritative execution graph.
+stages: [sft, world_model, preference, eval, export]
+pipeline:
+  dependencies:
+    sft: []
+    world_model: []
+    preference: [sft]
+    eval: [preference, world_model]
+    export: [eval]
+  resume: false
+  rerun: []
+  state_path: pipeline_state.json
+
+training:
+  max_steps: 1
+  warmup_steps: 0
+  dataloader_num_workers: 0
+
+distributed:
+  strategy: single
+  bf16: false
+  fp16: false
+
+sft:
+  enabled: true
+  data_path: data/posttrain_sft_example.jsonl
+  use_lora: true
+  use_qlora: false
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_seq_length: 128
+
+preference:
+  enabled: true
+  method: dpo
+  data_path: data/posttrain_preference_example.jsonl
+  use_lora: true
+  use_qlora: false
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_length: 128
+  max_prompt_length: 64
+
+world_model:
+  enabled: true
+  backend: categorical_rssm
+  model:
+    action_type: continuous
+    embedding_size: 32
+    deterministic_size: 32
+    stochastic_size: 8
+    stochastic_classes: 8
+    hidden_size: 32
+    recurrent_blocks: 4
+    reward_bins: 31
+  data:
+    train_path: data/world_model_example.jsonl
+    sequence_length: 6
+    validation_split: 0.25
+  training:
+    output_dir: world_model
+    num_epochs: 1
+    batch_size: 2
+    max_steps: 1
+    device: cpu
+    mixed_precision: "no"
+    checkpoint_steps: 0
+
+eval:
+  enabled: true
+  dataset: data/posttrain_sft_example.jsonl
+  tasks: [perplexity]
+  max_samples: 4
+  gate:
+    enabled: true
+    rules:
+      perplexity:
+        max: 1000.0
+    require_all: true
+    fail_on_rejection: true
+
+export:
+  enabled: true
+  format: hf
+  merge_lora: true
+  require_gate: true
+  output_dir: outputs/unified-model-posttrain-world/release
+
+logging:
+  output_dir: outputs/unified-model-posttrain-world
+  backend: local
+

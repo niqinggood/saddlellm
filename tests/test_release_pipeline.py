@@ -6,11 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from saddlellm.ModelExporter import ModelExportRequest, ModelExporter
-from saddlellm.PostTrainingCompatibility import post_training_runtime_report
-from saddlellm.ReleaseGate import EvaluationReleaseGate
-from saddlellm.SimpleFlow import SimpleFlowCompiler
-from saddlellm.TrainingConfigValidator import TrainingConfigValidator
+from saddlellm.runtime.ModelExporter import ModelExportRequest, ModelExporter
+from saddlellm.training.PostTrainingCompatibility import post_training_runtime_report
+from saddlellm.evaluation.ReleaseGate import EvaluationReleaseGate
+from saddlellm.training.TrainingConfigValidator import TrainingConfigValidator
 
 
 def test_release_gate_accepts_nested_scores_and_rejects_missing_required_metric():
@@ -45,39 +44,41 @@ def test_release_gate_rejects_invalid_rules():
     assert not result.accepted
 
 
-def test_full_simple_flow_adds_gate_then_export():
-    compiled = SimpleFlowCompiler.compile(
-        {
-            "model": "local/tiny-model",
-            "flow": "full",
-            "data": {"sft": "sft.jsonl", "preference": "preference.jsonl"},
-            "evaluation": {
-                "dataset": "eval.jsonl",
-                "gate": {
-                    "enabled": True,
-                    "rules": {"perplexity": {"max": 30}},
-                },
+def test_plain_config_can_run_gate_before_export():
+    config = {
+        "model": {"name_or_path": "local/tiny-model"},
+        "stages": ["sft", "preference", "eval", "export"],
+        "sft": {"enabled": True, "data_path": "sft.jsonl"},
+        "preference": {
+            "enabled": True,
+            "method": "dpo",
+            "data_path": "preference.jsonl",
+        },
+        "eval": {
+            "enabled": True,
+            "dataset": "eval.jsonl",
+            "gate": {
+                "enabled": True,
+                "rules": {"perplexity": {"max": 30}},
             },
-            "output": "outputs/full",
-        }
-    )
-    assert compiled["stages"] == ["sft", "preference", "eval", "export"]
-    assert compiled["eval"]["gate"]["rules"]["perplexity"]["max"] == 30
-    assert compiled["export"]["enabled"] is True
-    assert compiled["export"]["require_gate"] is True
+        },
+        "export": {"enabled": True, "require_gate": True},
+        "distributed": {"bf16": False, "fp16": False},
+    }
+    report = TrainingConfigValidator.validate(config, inspect_data=False)
+    assert report.valid, report.issues
 
 
-def test_export_only_simple_flow_does_not_require_training_data():
-    compiled = SimpleFlowCompiler.compile(
-        {
-            "model": "local/tiny-model",
-            "flow": "export",
-            "evaluation": {"enabled": False},
-            "output": "outputs/export-only",
-        }
-    )
-    assert compiled["stages"] == ["export"]
-    assert compiled["export"]["output_dir"].endswith("release")
+def test_export_only_config_does_not_require_training_data():
+    config = {
+        "model": {"name_or_path": "local/tiny-model"},
+        "stages": ["export"],
+        "eval": {"enabled": False},
+        "export": {"enabled": True, "output_dir": "outputs/export-only"},
+        "distributed": {"bf16": False, "fp16": False},
+    }
+    report = TrainingConfigValidator.validate(config, inspect_data=False)
+    assert report.valid, report.issues
 
 
 def test_validator_enforces_gate_order_and_rules():
@@ -140,7 +141,7 @@ def test_generic_tokenizers_backend_has_a_fast_tokenizer_fallback(tmp_path):
     from tokenizers.models import WordLevel
     from tokenizers.pre_tokenizers import Whitespace
 
-    from saddlellm.TokenizerLoader import load_tokenizer_compatible
+    from saddlellm.models.TokenizerLoader import load_tokenizer_compatible
 
     tokenizer = tokenizers.Tokenizer(WordLevel({"<unk>": 0, "hello": 1}, unk_token="<unk>"))
     tokenizer.pre_tokenizer = Whitespace()
@@ -178,7 +179,7 @@ def test_lora_adapter_export_merges_to_a_loadable_full_model(tmp_path):
         PreTrainedTokenizerFast,
     )
 
-    from saddlellm.PostTrainingCompatibility import stabilize_peft_optional_backends
+    from saddlellm.training.PostTrainingCompatibility import stabilize_peft_optional_backends
 
     base = tmp_path / "base"
     GPT2LMHeadModel(
@@ -242,8 +243,8 @@ def test_lora_adapter_export_merges_to_a_loadable_full_model(tmp_path):
 
 
 def test_orchestrator_gate_failure_writes_summary(monkeypatch, tmp_path):
-    from saddlellm.LLModelEvalute import Evaluator
-    from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+    from saddlellm.evaluation.LLModelEvalute import Evaluator
+    from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
     monkeypatch.setattr(
         Evaluator,
@@ -313,7 +314,7 @@ def test_openai_compatible_api_health_auth_and_token_slicing():
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
-    from saddlellm.InferenceServer import InferenceServerSettings, create_inference_app
+    from saddlellm.runtime.InferenceServer import InferenceServerSettings, create_inference_app
 
     app = create_inference_app(
         InferenceServerSettings(

@@ -40,7 +40,7 @@ SaddleLLM 当前定位是：
 - 成本估算：参数量、active 参数、KV cache、训练 FLOPs
 - SFT 数据统一
 - DPO/ORPO/KTO 数据统一
-- SFT/Preference recipe 生成
+- SFT/Preference 配置生成
 - backend parallel plan
 - 训练报告和模型指标
 
@@ -80,7 +80,7 @@ SaddleLLM 当前定位是：
 WORKLOG.md
 → SADDLE_LLM_CODE_GUIDE.md
 → saddle_llm/TrainingFactory.py
-→ saddle_llm/TrainingRecipe.py
+→ saddlellm/training/TrainingOrchestrator.py
 → saddle_llm/TrainingOrchestrator.py
 → saddle_llm/ModelBlueprint.py
 → saddle_llm/SaddleModeling.py
@@ -97,10 +97,9 @@ WORKLOG.md
 阅读逻辑：
 
 1. 先看 `TrainingFactory.py`，理解最高层用户入口。
-2. 再看 `TrainingRecipe.py`，理解用户配置如何转成执行配置。
-3. 再看 `TrainingOrchestrator.py`，理解 stage 如何执行。
-4. 再看 `ModelBlueprint.py` 和 `SaddleModeling.py`，理解模型结构。
-5. 最后看数据、后训练、后端、监控等辅助模块。
+2. 再看 `TrainingOrchestrator.py`，理解统一配置和 stage 如何执行。
+3. 再看 `ModelBlueprint.py` 和 `SaddleModeling.py`，理解模型结构。
+4. 最后看数据、后训练、后端、监控等辅助模块。
 
 ## 4. 安装与环境
 
@@ -109,19 +108,19 @@ WORKLOG.md
 在仓库根目录执行：
 
 ```powershell
-pip install -e .
+pip install -e ".[posttrain]"
 ```
 
 检查版本：
 
 ```powershell
-python setup.py --version
+python tools/check_release_consistency.py
 ```
 
 当前应返回：
 
 ```text
-2.30.0
+2.33
 ```
 
 ### 4.2 基础导入检查
@@ -163,9 +162,10 @@ build/                         构建输出
 dist/                          打包输出
 external_research/             外部框架调研代码
 outputs/                       训练/实验输出
-saddle_llm/                    核心 Python 包
-saddle_llm.egg-info/           包元数据
-setup.py                       打包配置
+saddlellm/                     核心 Python 包
+saddle_llm/                    旧包名兼容层
+pyproject.toml                 发布元数据与依赖分组
+setup.py                       构建前端发现兼容层
 WORKLOG.md                     开发日志
 SADDLE_LLM_CODE_GUIDE.md       代码学习指南
 SADDLE_LLM_FULL_DOCUMENTATION.md 当前完整文档
@@ -193,17 +193,17 @@ saddle_llm/TrainingFactory.py
 - post-training plan
 - report
 
-### 6.2 Recipe
+### 6.2 统一配置
 
-Recipe 是用户友好的训练任务描述。
+训练入口只接受一份普通 YAML/JSON。顶层 `stages` 是非空列表，公共参数和各阶段参数直接写在同一份配置中。
 
 对应文件：
 
 ```text
-saddle_llm/TrainingRecipe.py
+saddlellm/training/TrainingOrchestrator.py
 ```
 
-Recipe 会被编译成 `TrainingOrchestrator` 可执行的配置。
+CLI 读取并校验后，直接交给 `TrainingOrchestrator`，不经过格式转换器。
 
 ### 6.3 Orchestrator
 
@@ -354,8 +354,7 @@ plan = factory.create_post_training_plan(
 experiments/post_training_sft/
   sft_normalized.jsonl
   sft_normalized.jsonl.report.json
-  sft_recipe.yaml
-  orchestrator_config.json
+  config.json
   post_training_plan.json
 ```
 
@@ -400,8 +399,7 @@ experiments/model_architectures/
   runs/
     000-xxx/
       blueprint.json
-      recipe.yaml
-      orchestrator_config.json
+      config.json
       backend_plan.json
 ```
 
@@ -416,7 +414,7 @@ bundle = factory.create_pretrain_experiments(
 )
 ```
 
-### 7.7 执行 orchestrator config
+### 7.7 执行训练配置
 
 ```python
 from saddle_llm import TrainingOrchestrator
@@ -760,7 +758,7 @@ tokens = model.generate(input_ids, max_new_tokens=32)
 ### 12.1 SFT
 
 ```python
-from saddle_llm.PeftSFTTrainer import SFTTrainConfig, train_sft
+from saddlellm.training.PeftSFTTrainer import SFTTrainConfig, train_sft
 
 train_sft(SFTTrainConfig(
     model_path="Qwen/Qwen2.5-7B-Instruct",
@@ -843,7 +841,7 @@ plan = factory.backend_plan(
 from saddle_llm import BackendAdapterRegistry
 
 plan = BackendAdapterRegistry.create_launch_plan(
-    config_path="./configs/orchestrator_config.json",
+    config_path="./configs/config.json",
     backend="deepspeed_zero2",
     num_gpus=8,
 )
@@ -939,8 +937,7 @@ from saddle_llm import TrainingMonitor
 | 文件 | 作用 |
 |---|---|
 | `TrainingFactory.py` | 最高层训练工厂入口 |
-| `TrainingRecipe.py` | 统一 recipe schema |
-| `TrainingOrchestrator.py` | 按 stage 执行训练 |
+| `TrainingOrchestrator.py` | 读取统一配置并按 stage 执行训练 |
 | `cli.py` | 命令行入口 |
 | `easy.py` | 简易 API |
 | `DomainBuilder.py` | 领域模型训练方案 |
@@ -1085,7 +1082,7 @@ from saddle_llm import TrainingMonitor
 1. FSDP adapter
 2. DeepSpeed ZeRO-2/3 adapter
 3. Megatron-style config export
-4. TorchTitan/Nanotron 风格 recipe 对照
+4. TorchTitan/Nanotron 风格配置对照
 
 ### 19.3 数据和报告
 
@@ -1103,8 +1100,7 @@ SaddleLLM 当前最有价值的方向不是做一个新的 DeepSpeed 或 Megatro
 ```text
 模型结构可实验
 数据流程可治理
-训练 recipe 可复现
+训练配置可复现
 后端执行可适配
 领域模型可工厂化生产
 ```
-

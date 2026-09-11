@@ -1,34 +1,42 @@
 project: saddlellm
 experiment: mopd-sft
-stage: [mopd, sft, eval]
+stages: [mopd, sft, eval]
+
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
   tokenizer: Qwen/Qwen2.5-7B-Instruct
   backend: hf
-  pretrain_mode: continue
-method:
-  type: lora
-data:
-  sources:
-    - type: local
-      path: data/prompts.jsonl
-      format: jsonl
-  max_seq_length: 2048
+pretrain_mode: continue
+
 mopd:
   enabled: true
   prompts_path: data/prompts.jsonl
-  dry_run: true
+  output_dir: outputs/mopd_sft/mopd
   teachers:
     - name: placeholder_teacher
       domain: general
       weight: 1.0
-training:
-  preflight_only: false
-  per_device_batch_size: 1
-  global_batch_size: 8
-  learning_rate: 0.0002
+  dry_run: true
+
+sft:
+  enabled: true
+  data_path: ""
+  use_lora: true
+  use_qlora: false
   epochs: 1
+  learning_rate: 0.0002
+  per_device_batch_size: 1
+  max_seq_length: 2048
+
+eval:
+  enabled: true
+
+training:
   max_steps: 1000
+
+distributed:
+  strategy: single
+
 logging:
   output_dir: outputs/mopd_sft
   backend: local

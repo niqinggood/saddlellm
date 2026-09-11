@@ -1,14 +1,14 @@
 import numpy as np
 import torch
 
-from saddlellm.MusicCodeModel import MusicCodeConfig
-from saddlellm.MusicCodeTrainer import (
+from saddlellm.multimodal.MusicCodeModel import MusicCodeConfig
+from saddlellm.multimodal.MusicCodeTrainer import (
     CachedMusicCodeDataset,
     MusicCodeTrainingConfig,
     load_music_code_checkpoint,
     train_music_code,
 )
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 def test_music_code_training_checkpoint_and_reload(tmp_path):

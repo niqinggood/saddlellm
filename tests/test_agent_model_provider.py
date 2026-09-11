@@ -1,9 +1,10 @@
+import http.client
 import json
 
 import pytest
 
-import saddle_llm.AgentModelProvider as provider_module
-from saddle_llm.AgentModelProvider import ModelProviderError, endpoint
+import saddlellm.agents.AgentModelProvider as provider_module
+from saddlellm.agents.AgentModelProvider import ModelProviderError, endpoint
 
 
 def test_endpoint_builds_openai_compatible_chat_path():
@@ -94,3 +95,80 @@ def test_minimax_request_splits_reasoning_out_of_display_content(monkeypatch):
     assert "private reasoning" not in message["content"]
     assert message["reasoning_details"][0]["text"] == "private reasoning"
     assert message["_finish_reason"] == "stop"
+
+
+def test_transient_remote_disconnect_is_retried_once(monkeypatch):
+    attempts = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "Recovered"},
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+
+    def open_request(_request, timeout):
+        attempts.append(timeout)
+        if len(attempts) == 1:
+            raise http.client.RemoteDisconnected("remote closed without response")
+        return Response()
+
+    sleeps = []
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-only-key")
+    monkeypatch.setattr(provider_module, "_validate_provider_host", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(provider_module, "_open_provider_request", open_request)
+    monkeypatch.setattr(provider_module.time, "sleep", sleeps.append)
+
+    message = provider_module.chat_completion(
+        {
+            "baseUrl": "https://api.minimaxi.com/v1",
+            "model": "MiniMax-M3",
+            "credentialEnv": "MINIMAX_API_KEY",
+            "timeoutSeconds": 9,
+        },
+        {"model": "MiniMax-M3", "temperature": 0.1, "maxTokens": 128},
+        [{"role": "user", "content": "test"}],
+    )
+
+    assert attempts == [9, 9]
+    assert sleeps == [provider_module.PROVIDER_RETRY_DELAY_SECONDS]
+    assert message["content"] == "Recovered"
+
+
+def test_transient_retry_can_be_disabled(monkeypatch):
+    attempts = []
+
+    def open_request(_request, timeout):
+        del timeout
+        attempts.append(1)
+        raise ConnectionResetError("connection reset")
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-only-key")
+    monkeypatch.setattr(provider_module, "_validate_provider_host", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(provider_module, "_open_provider_request", open_request)
+
+    with pytest.raises(ModelProviderError, match="connection reset"):
+        provider_module.chat_completion(
+            {
+                "baseUrl": "https://api.minimaxi.com/v1",
+                "model": "MiniMax-M3",
+                "credentialEnv": "MINIMAX_API_KEY",
+                "maxRetries": 0,
+            },
+            {"model": "MiniMax-M3"},
+            [{"role": "user", "content": "test"}],
+        )
+
+    assert attempts == [1]

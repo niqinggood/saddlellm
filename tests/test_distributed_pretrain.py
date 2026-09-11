@@ -11,12 +11,12 @@ import torch
 from torch.nn.parallel import DistributedDataParallel
 from torch.multiprocessing import start_processes
 
-from saddlellm.BackendAdapters import BackendAdapterRegistry
-from saddlellm.DistributedConfig import DistributedConfig
-from saddlellm.DistributedRuntime import DistributedRuntimeInfo
-from saddlellm.FactoryBackendPlanner import FactoryBackendPlanner
-from saddlellm.ModelBlueprint import AttentionBlueprint, FFNBlueprint, ModelBlueprint
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.factory.BackendAdapters import BackendAdapterRegistry
+from saddlellm.training.DistributedConfig import DistributedConfig
+from saddlellm.training.DistributedRuntime import DistributedRuntimeInfo
+from saddlellm.factory.FactoryBackendPlanner import FactoryBackendPlanner
+from saddlellm.models.ModelBlueprint import AttentionBlueprint, FFNBlueprint, ModelBlueprint
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 _SEED = 917
@@ -180,7 +180,7 @@ def test_rank_zero_checkpoint_manifest_contract(tmp_path, monkeypatch):
     non_main_output = tmp_path / "rank1-output"
     parsed = TrainingOrchestrator._parse_config(
         {
-            "stages": [],
+            "stages": ["pretrain"],
             "distributed": {"strategy": "ddp", "num_gpus": 2, "bf16": False},
             "logging": {"output_dir": str(non_main_output)},
         }

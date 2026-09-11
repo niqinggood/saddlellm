@@ -6,16 +6,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from saddlellm import WorldModel, WorldModelConfig, WorldModelRuntime
-from saddlellm.SpatialPerception import SpatialAnalysis
-from saddlellm.WorldAgent import (
+from saddlellm.spatial.SpatialPerception import SpatialAnalysis
+from saddlellm.spatial.WorldAgent import (
     WORLD_PLAN_SCHEMA,
     WORLD_STATE_SCHEMA,
     WorldAgentError,
     WorldAgentRuntime,
     WorldAgentSettings,
 )
-from saddlellm.WorldAgentAPI import create_world_agent_app
-from saddlellm.WorldModelData import load_world_model_trajectories
+from saddlellm.spatial.WorldAgentAPI import create_world_agent_app
+from saddlellm.world_models.WorldModelData import load_world_model_trajectories
 from saddlellm.cli import main as cli_main
 
 

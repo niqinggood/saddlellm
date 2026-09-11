@@ -1,0 +1,19 @@
+# Reproducible CPU test environment used by CI.
+# Install the CPU/CUDA build of torch separately before this file.
+-r requirements-posttrain.txt
+
+pytest>=8,<9
+ruff>=0.12,<1
+httpx>=0.27,<1
+fastapi>=0.115,<1
+python-multipart>=0.0.20,<1
+pydantic>=2.10,<3
+psutil>=6,<8
+nvidia-ml-py>=12,<14
+prometheus-client>=0.21,<1
+prometheus-fastapi-instrumentator>=7,<8
+evaluate>=0.4,<1
+numpy>=1.26,<3
+Pillow>=10,<13
+tqdm>=4.66,<5
+PyYAML>=6,<7

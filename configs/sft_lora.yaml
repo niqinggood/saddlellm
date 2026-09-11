@@ -1,36 +1,41 @@
 project: saddlellm
 experiment: sft-lora
-stage: sft
+stages: [sft, eval]
+
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
   tokenizer: Qwen/Qwen2.5-7B-Instruct
   backend: hf
-  pretrain_mode: continue
-method:
-  type: lora
-  lora_r: 16
-  lora_alpha: 32
-  lora_dropout: 0.05
-  target_modules: [q_proj, k_proj, v_proj, o_proj]
-data:
-  sources:
-    - type: local
-      path: data/posttrain_sft_example.jsonl
-      format: jsonl
-  max_seq_length: 2048
-training:
-  per_device_batch_size: 1
-  global_batch_size: 16
-  learning_rate: 0.0002
+pretrain_mode: continue
+
+sft:
+  enabled: true
+  data_path: data/posttrain_sft_example.jsonl
+  use_lora: true
+  use_qlora: false
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
   epochs: 3
+  learning_rate: 0.0002
+  per_device_batch_size: 1
+  max_seq_length: 2048
+  gradient_accumulation_steps: 4
+
+eval:
+  enabled: true
+
+training:
   max_steps: 1000
   warmup_steps: 100
   save_every_steps: 200
-  eval_every_steps: 0
-backend:
-  strategy: auto
+
+distributed:
+  strategy: single
   num_gpus: 1
-  gpu_memory_gb: 24
+
 logging:
   output_dir: outputs/sft_lora
   backend: local

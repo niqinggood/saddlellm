@@ -5,19 +5,19 @@ import json
 import pytest
 import torch
 
-from saddlellm.ModelBlueprint import (
+from saddlellm.models.ModelBlueprint import (
     AttentionBlueprint,
     FFNBlueprint,
     ModelBlueprint,
 )
-from saddlellm.ModelExporter import ModelExportRequest, ModelExporter
-from saddlellm.ModelLoader import (
+from saddlellm.runtime.ModelExporter import ModelExportRequest, ModelExporter
+from saddlellm.models.ModelLoader import (
     is_saddle_checkpoint,
     load_causal_lm,
     load_model_and_tokenizer,
 )
-from saddlellm.SaddleModeling import SaddleForCausalLM
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.models.SaddleModeling import SaddleForCausalLM
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 def _tiny_saddle_model() -> SaddleForCausalLM:
@@ -170,8 +170,8 @@ def test_native_generate_accepts_standard_generation_arguments():
 def test_evaluator_loads_native_checkpoint_and_computes_perplexity(
     native_checkpoint, tmp_path, monkeypatch
 ):
-    from saddlellm.LLModelEvalute import Evaluator
-    import saddlellm.ModelLoader as model_loader
+    from saddlellm.evaluation.LLModelEvalute import Evaluator
+    import saddlellm.models.ModelLoader as model_loader
 
     path, _, _ = native_checkpoint
     dataset = tmp_path / "eval.jsonl"
@@ -204,13 +204,13 @@ def test_evaluator_loads_native_checkpoint_and_computes_perplexity(
 
 
 def test_inference_loader_and_engine_run_native_checkpoint(native_checkpoint, monkeypatch):
-    from saddlellm.InferenceServer import (
+    from saddlellm.runtime.InferenceServer import (
         CompletionRequest,
         InferenceServerSettings,
         LocalGenerationEngine,
         load_inference_model,
     )
-    import saddlellm.ModelLoader as model_loader
+    import saddlellm.models.ModelLoader as model_loader
 
     path, _, _ = native_checkpoint
     calls = []
@@ -284,7 +284,7 @@ def test_native_export_is_reloadable_and_rejects_hf_conversion(native_checkpoint
 
 
 def test_native_export_rejects_checkpoint_without_tokenizer(tmp_path):
-    from saddlellm.SaddleModeling import SaddleForCausalLM, SaddleModelConfig
+    from saddlellm.models.SaddleModeling import SaddleForCausalLM, SaddleModelConfig
 
     source = tmp_path / "weights-only-native"
     SaddleForCausalLM(
@@ -321,7 +321,7 @@ def test_native_export_rejects_checkpoint_without_tokenizer(tmp_path):
         )
 
 
-def _orchestrator_config(tmp_path, *, stages, model_path=None, pretrain_mode="scratch"):
+def _training_config(tmp_path, *, stages, model_path=None, pretrain_mode="scratch"):
     data = {
         "model": {
             "config": "qwen-tiny-160m",
@@ -356,19 +356,19 @@ def _orchestrator_config(tmp_path, *, stages, model_path=None, pretrain_mode="sc
 
 
 def test_saddle_stage_guard_allows_full_parameter_sft_and_dpo(tmp_path):
-    allowed = _orchestrator_config(
+    allowed = _training_config(
         tmp_path,
         stages=["tokenizer", "pretrain", "sft", "preference", "eval", "export"],
     )
     orchestrator = TrainingOrchestrator.from_dict(allowed)
     orchestrator._close_logging_handlers()
 
-    lora = _orchestrator_config(tmp_path, stages=["sft"])
+    lora = _training_config(tmp_path, stages=["sft"])
     lora["sft"]["use_lora"] = True
     with pytest.raises(ValueError, match=r"does not support LoRA for sft"):
         TrainingOrchestrator.from_dict(lora)
 
-    orpo = _orchestrator_config(tmp_path, stages=["preference"])
+    orpo = _training_config(tmp_path, stages=["preference"])
     orpo["preference"]["method"] = "orpo"
     with pytest.raises(ValueError, match=r"supported methods: dpo"):
         TrainingOrchestrator.from_dict(orpo)
@@ -457,7 +457,7 @@ def test_saddle_continue_preflight_requires_complete_local_checkpoint(
     native_checkpoint, tmp_path
 ):
     checkpoint, _, _ = native_checkpoint
-    no_path = _orchestrator_config(
+    no_path = _training_config(
         tmp_path,
         stages=["pretrain"],
         pretrain_mode="continue",
@@ -465,7 +465,7 @@ def test_saddle_continue_preflight_requires_complete_local_checkpoint(
     with pytest.raises(ValueError, match=r"continue.*requires model\.name_or_path"):
         TrainingOrchestrator.from_dict(no_path)
 
-    valid = _orchestrator_config(
+    valid = _training_config(
         tmp_path,
         stages=["pretrain"],
         model_path=checkpoint,
@@ -474,7 +474,7 @@ def test_saddle_continue_preflight_requires_complete_local_checkpoint(
     orchestrator = TrainingOrchestrator.from_dict(valid)
     orchestrator._close_logging_handlers()
 
-    missing = _orchestrator_config(
+    missing = _training_config(
         tmp_path,
         stages=["pretrain"],
         model_path=tmp_path / "does-not-exist",
@@ -488,7 +488,7 @@ def test_saddle_continue_preflight_requires_complete_local_checkpoint(
     incomplete = tmp_path / "incomplete-continue"
     incomplete.mkdir()
     (incomplete / "saddle_config.json").write_text("{}\n", encoding="utf-8")
-    invalid = _orchestrator_config(
+    invalid = _training_config(
         tmp_path,
         stages=["pretrain"],
         model_path=incomplete,
@@ -502,8 +502,8 @@ def test_saddle_continue_preflight_requires_complete_local_checkpoint(
 def test_saddle_trainer_checkpoint_is_native_and_base_resume_can_restore(tmp_path):
     from transformers import TrainingArguments
 
-    from saddlellm.NativeTrainer import SaddleTrainer
-    from saddlellm.SaddleModeling import SaddleForCausalLM, SaddleModelConfig
+    from saddlellm.training.NativeTrainer import SaddleTrainer
+    from saddlellm.models.SaddleModeling import SaddleForCausalLM, SaddleModelConfig
 
     model = SaddleForCausalLM(
         SaddleModelConfig(
@@ -548,7 +548,7 @@ def test_saddle_trainer_checkpoint_is_native_and_base_resume_can_restore(tmp_pat
 
 
 def test_resume_config_is_normalized_and_native_export_defaults_are_safe(tmp_path):
-    base = _orchestrator_config(tmp_path, stages=["pretrain"])
+    base = _training_config(tmp_path, stages=["pretrain"])
     base["training"] = {"resume_from_checkpoint": "false"}
     parsed = TrainingOrchestrator._parse_config(base)
     assert parsed.training.resume_from_checkpoint is False
@@ -561,7 +561,7 @@ def test_resume_config_is_normalized_and_native_export_defaults_are_safe(tmp_pat
     with pytest.raises(TypeError, match="boolean or checkpoint path"):
         TrainingOrchestrator._parse_config(base)
 
-    export = _orchestrator_config(tmp_path, stages=["export"])
+    export = _training_config(tmp_path, stages=["export"])
     export["export"].pop("format")
     parsed = TrainingOrchestrator._parse_config(export)
     assert parsed.export.format == "saddle"

@@ -21,14 +21,21 @@ saddlellm 简易接口 — 一行代码完成最常见操作
     # 一键提升
     llm.improve(model)
 """
-import os
+
+import glob
 import logging
+import os
+from typing import TYPE_CHECKING
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedModel
 
 # ============================================================
 # 1. 创建模型 — 一行代码
 # ============================================================
+
 
 def create(
     size: str = "300m",
@@ -48,11 +55,12 @@ def create(
         model = llm.create("1b")                # 1B Llama
         model = llm.create("moe-1b")            # MoE 架构
     """
-    from .ModelRegistry import ModelRegistry, MODEL_SPECS
+    from .models.ModelRegistry import ModelRegistry, MODEL_SPECS
 
     # 名称映射
     size_map = {
-        "100m": "gpt2-small-124m", "124m": "gpt2-small-124m",
+        "100m": "gpt2-small-124m",
+        "124m": "gpt2-small-124m",
         "150m": "llama-tiny-150m",
         "300m": "llama-300m",
         "350m": "gpt-neox-350m",
@@ -66,35 +74,49 @@ def create(
         "deepseek": "deepseek-v3-style",
     }
 
-    spec_name = size_map.get(size.lower(), size)
+    normalized_size = str(size).strip().lower()
+    normalized_architecture = str(architecture).strip().lower()
+    spec_name = size_map.get(normalized_size, normalized_size)
     if spec_name in MODEL_SPECS:
         spec = MODEL_SPECS[spec_name]
         model = ModelRegistry.create_model(spec, vocab_size_override=vocab_size)
+        _mark_scratch_model(model, spec_name)
         print(f"创建模型: {spec.name} ({spec.human_params()})")
         return model
-    else:
-        # 尝试当作自定义大小: "1.2b" → 1.2e9
-        try:
-            if size.endswith("b"):
-                params = float(size[:-1]) * 1e9
-            elif size.endswith("m"):
-                params = float(size[:-1]) * 1e6
-            else:
-                raise ValueError(size)
 
-            # 根据参数量找最接近的预设
-            closest = min(MODEL_SPECS.values(),
-                          key=lambda s: abs(s.estimated_params - params))
-            model = ModelRegistry.create_model(closest, vocab_size_override=vocab_size)
-            print(f"创建模型: {closest.name} (最接近 {size})")
-            return model
-        except Exception:
-            raise ValueError(f"未知模型大小: {size}. 可用: {list(size_map.keys())}")
+    # 尝试当作自定义大小: "1.2b" → 1.2e9
+    try:
+        if normalized_size.endswith("b"):
+            params = float(normalized_size[:-1]) * 1e9
+        elif normalized_size.endswith("m"):
+            params = float(normalized_size[:-1]) * 1e6
+        else:
+            raise ValueError(normalized_size)
+    except (TypeError, ValueError) as exc:
+        choices = ", ".join(size_map)
+        raise ValueError(f"未知模型大小: {size!r}. 可用快捷名称: {choices}") from exc
+
+    architectures = sorted({spec.architecture for spec in MODEL_SPECS.values()})
+    candidates = [
+        spec
+        for spec in MODEL_SPECS.values()
+        if spec.architecture == normalized_architecture
+    ]
+    if not candidates:
+        raise ValueError(
+            f"未知模型架构: {architecture!r}. 可用: {', '.join(architectures)}"
+        )
+    closest = min(candidates, key=lambda spec: abs(spec.estimated_params - params))
+    model = ModelRegistry.create_model(closest, vocab_size_override=vocab_size)
+    _mark_scratch_model(model, closest.name)
+    print(f"创建模型: {closest.name} ({normalized_architecture} 中最接近 {size})")
+    return model
 
 
 # ============================================================
 # 2. 训练模型 — 一行代码
 # ============================================================
+
 
 def train(
     model,
@@ -125,33 +147,36 @@ def train(
         # 指定语言
         llm.train(model, data="auto", data_lang="zh", steps=20000)
     """
-    import torch
-    from transformers import AutoTokenizer
-
     # 1. Tokenizer
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
-        print("使用默认 GPT-2 tokenizer (建议训练自己的: llm.train_tokenizer())")
+    tokenizer = _resolve_tokenizer(model, tokenizer)
 
     # 2. 数据
     if data is None or data == "auto":
         print(f"自动选择数据 (语言: {data_lang})...")
-        from .DataCatalog import DataCatalog
+        from .data.DataCatalog import DataCatalog
+
         dataset = DataCatalog.small_model_pack(lang=data_lang, streaming=True)
     elif isinstance(data, str):
         # 判断是文件路径还是数据集名
-        if os.path.exists(data) or "*" in data or "." in os.path.splitext(data)[1]:
+        if _looks_like_local_data(data):
             # 文件路径
+            if not os.path.exists(data) and not glob.glob(data):
+                raise FileNotFoundError(
+                    f"训练数据不存在: {data}. 请检查路径；远程数据集请使用 `组织名/数据集名`。"
+                )
             dataset = _load_data(data, tokenizer)
         else:
             # 尝试作为数据集名
             try:
-                from .DataCatalog import DataCatalog
+                from .data.DataCatalog import DataCatalog
+
                 dataset = DataCatalog.fetch(data, streaming=True)
                 print(f"加载数据集: {data} (streaming)")
-            except Exception:
-                dataset = _load_data(data, tokenizer)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"无法加载远程数据集 {data!r}. 请检查数据集名称和网络连接；"
+                    "本地数据请传入明确的文件路径。"
+                ) from exc
     else:
         dataset = data
 
@@ -168,7 +193,11 @@ def train(
             learning_rate = 1e-4
 
     # 5. 训练
-    from .DensePretrainer import DensePretrainer, DensePretrainConfig, init_weights_llama_style
+    from .training.DensePretrainer import (
+        DensePretrainer,
+        DensePretrainConfig,
+        init_weights_llama_style,
+    )
 
     config = DensePretrainConfig(
         max_steps=steps,
@@ -185,7 +214,8 @@ def train(
     # EMA
     ema_callback = None
     if use_ema:
-        from .AdvancedTechniques import EMACallback
+        from .alignment.AdvancedTechniques import EMACallback
+
         ema_callback = EMACallback(model, decay=0.999)
 
     trainer.train()
@@ -205,13 +235,15 @@ def train(
 # 3. 训练分词器
 # ============================================================
 
+
 def train_tokenizer(
     data_path: str,
     vocab_size: int = 32000,
     output_dir: str = "./my_tokenizer",
 ):
     """训练 BPE 分词器。"""
-    from .TokenizerTrainer import TokenizerTrainer
+    from .models.TokenizerTrainer import TokenizerTrainer
+
     trainer = TokenizerTrainer(vocab_size=vocab_size)
     trainer.fit(data_path)
     trainer.save(output_dir)
@@ -223,6 +255,7 @@ def train_tokenizer(
 # ============================================================
 # 4. 蒸馏能力 — 一行代码
 # ============================================================
+
 
 def distill(
     model,
@@ -248,12 +281,9 @@ def distill(
         # 自动生成 prompts
         llm.distill(model, teacher="claude", examples=1000)
     """
-    from transformers import AutoTokenizer
-    from .UniversalDistiller import TeacherInterface, AutoDistiller
+    from .distillation.UniversalDistiller import TeacherInterface, AutoDistiller
 
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _resolve_tokenizer(model, tokenizer)
 
     # 创建教师
     teacher_map = {
@@ -261,9 +291,13 @@ def distill(
         "gpt-4": lambda: TeacherInterface.from_openai("gpt-4", api_key),
         "gpt-3.5": lambda: TeacherInterface.from_openai("gpt-3.5-turbo", api_key),
         "claude": lambda: TeacherInterface.from_anthropic("claude-sonnet-4-6", api_key),
-        "claude-sonnet": lambda: TeacherInterface.from_anthropic("claude-sonnet-4-6", api_key),
+        "claude-sonnet": lambda: TeacherInterface.from_anthropic(
+            "claude-sonnet-4-6", api_key
+        ),
         "deepseek": lambda: TeacherInterface.from_deepseek("deepseek-chat", api_key),
-        "deepseek-chat": lambda: TeacherInterface.from_deepseek("deepseek-chat", api_key),
+        "deepseek-chat": lambda: TeacherInterface.from_deepseek(
+            "deepseek-chat", api_key
+        ),
     }
 
     if teacher in teacher_map:
@@ -271,6 +305,7 @@ def distill(
     elif os.path.exists(teacher):
         # 本地模型
         from transformers import AutoModelForCausalLM, AutoTokenizer as AT
+
         local_model = AutoModelForCausalLM.from_pretrained(teacher, torch_dtype="auto")
         local_tok = AT.from_pretrained(teacher)
         teacher_obj = TeacherInterface.from_local(local_model, local_tok)
@@ -279,8 +314,11 @@ def distill(
 
     # Prompts
     if prompts is None:
-        prompts = [f"详细解释 #{i}: {topic}" for i in range(examples)
-                   for topic in ["机器学习", "Python编程", "世界历史", "物理学", "哲学思想"]]
+        prompts = [
+            f"详细解释 #{i}: {topic}"
+            for i in range(examples)
+            for topic in ["机器学习", "Python编程", "世界历史", "物理学", "哲学思想"]
+        ]
         prompts = prompts[:examples]
 
     # 蒸馏
@@ -300,6 +338,7 @@ def distill(
 # 5. 对话
 # ============================================================
 
+
 def chat(
     model,
     prompt: str,
@@ -317,31 +356,31 @@ def chat(
         answer = llm.chat(model, "你好, 解释一下深度学习")
         answer = llm.chat(model, "1+2*3=?", use_cot=True)  # 带推理
     """
-    import torch
-    from transformers import AutoTokenizer
-
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _resolve_tokenizer(model, tokenizer)
 
     full_prompt = ""
     if system_prompt:
         full_prompt += f"系统: {system_prompt}\n\n"
-    if use_cot and use_self_consistency:
-        from .AdvancedTechniques import SelfConsistency
-        sc = SelfConsistency(model, tokenizer)
-        result = sc.solve(prompt)
-        return result["answer"]
-    elif use_cot:
+    if use_cot:
         full_prompt += f"问题: {prompt}\n\n让我们一步步思考。\n\n"
     else:
         full_prompt += f"{prompt}\n\n"
 
+    if use_self_consistency:
+        from .alignment.AdvancedTechniques import SelfConsistency
+
+        sc = SelfConsistency(model, tokenizer, temperature=temperature)
+        result = sc.solve(
+            full_prompt, cot_prompt="" if use_cot else "让我们一步步思考。"
+        )
+        return result["answer"]
+
     # 使用安全生成 (防骂人 + 防车轱辘话)
-    from .SafeGenerate import SafeGenerate
+    from .alignment.SafeGenerate import SafeGenerate
+
     sg = SafeGenerate(model, tokenizer)
     result = sg.generate(
-        full_prompt if use_cot else f"{prompt}\n\n",
+        full_prompt,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         enable_safety=True,
@@ -353,6 +392,7 @@ def chat(
 # ============================================================
 # 6. 一键提升
 # ============================================================
+
 
 def improve(
     model,
@@ -366,11 +406,7 @@ def improve(
 
     自动: EMA + Model Soup + Self-Consistency + 数据增强
     """
-    from transformers import AutoTokenizer
-
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _resolve_tokenizer(model, tokenizer)
 
     print("=== 一键提升: 应用所有效果技术 ===")
 
@@ -378,31 +414,41 @@ def improve(
     if data:
         print("1/3: 数据增强 (Evol-Instruct)...")
         try:
-            from .AdvancedTechniques import EvolInstruct
+            from .alignment.AdvancedTechniques import EvolInstruct
+
             evolver = EvolInstruct(model, tokenizer)
             enhanced = evolver.evolve_batch(
                 data if isinstance(data, list) else [data], rounds=1
             )
-            print(f"  数据: {len(data) if isinstance(data, list) else 1} → {len(enhanced)} 条")
+            print(
+                f"  数据: {len(data) if isinstance(data, list) else 1} → {len(enhanced)} 条"
+            )
         except Exception as e:
             print(f"  跳过: {e}")
             enhanced = data
 
         # 2. 继续训练 + EMA
         print("2/3: 训练 + EMA...")
-        trainer = train(model, tokenizer, data=enhanced, steps=steps,
-                        output_dir=output_dir, use_ema=True)
+        train(
+            model,
+            tokenizer,
+            data=enhanced,
+            steps=steps,
+            output_dir=output_dir,
+            use_ema=True,
+        )
     else:
         print("2/3: 跳过 (无新数据)")
 
     # 3. 自检
     print("3/3: Self-Consistency 验证...")
-    from .AdvancedTechniques import SelfConsistency
+    from .alignment.AdvancedTechniques import SelfConsistency
+
     sc = SelfConsistency(model, tokenizer, num_samples=5)
     test = sc.solve("1+1=?")
     print(f"  自检: answer={test['answer']}, confidence={test['confidence']}")
 
-    print(f"=== 提升完成! ===")
+    print("=== 提升完成! ===")
     return model
 
 
@@ -410,18 +456,19 @@ def improve(
 # 7. 评估
 # ============================================================
 
+
 def evaluate(model, tokenizer=None, tasks=None):
     """快速评估模型。"""
-    from transformers import AutoTokenizer
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = _resolve_tokenizer(model, tokenizer)
 
     tasks = tasks or ["perplexity"]
 
-    from .BenchmarkRunner import BenchmarkRunner
+    from .evaluation.BenchmarkRunner import BenchmarkRunner
+
     runner = BenchmarkRunner(
-        model_path=None, tasks=tasks, max_samples=200,
+        model_path=None,
+        tasks=tasks,
+        max_samples=200,
     )
     runner._model = model
     runner._tokenizer = tokenizer
@@ -436,9 +483,11 @@ def evaluate(model, tokenizer=None, tasks=None):
 # 8. 列出可用模型
 # ============================================================
 
+
 def list_models():
     """列出所有可用的模型架构。"""
-    from .ModelRegistry import ModelRegistry
+    from .models.ModelRegistry import ModelRegistry
+
     print(ModelRegistry.compare_specs())
 
 
@@ -450,25 +499,37 @@ def list_models():
 # 0. 环境自检 (最先调用)
 # ============================================================
 
+
 def check():
     """运行环境自检。"""
-    from .TrainerUtils import check_environment
+    from .utils.TrainerUtils import check_environment
+
     return check_environment()
+
 
 # ============================================================
 # 0b. 一键最佳模型
 # ============================================================
 
-def auto(model_size: str = "300m", lang: str = "zh", output_dir: str = "./my_model",
-         use_api: bool = False):
+
+def auto(
+    model_size: str = "300m",
+    lang: str = "zh",
+    output_dir: str = "./my_model",
+    use_api: bool = False,
+):
     """一键训练最佳小模型。"""
-    from .TrainerUtils import auto_train_best_small_model
-    return auto_train_best_small_model(model_size, output_dir=output_dir, lang=lang,
-                                        use_api_teacher=use_api)
+    from .utils.TrainerUtils import auto_train_best_small_model
+
+    return auto_train_best_small_model(
+        model_size, output_dir=output_dir, lang=lang, use_api_teacher=use_api
+    )
+
 
 # ============================================================
 # 9. 自动配置 — 根据硬件推荐最佳设置
 # ============================================================
+
 
 def auto_config(model=None, model_size: str = None):
     """
@@ -488,11 +549,36 @@ def auto_config(model=None, model_size: str = None):
     gpu_mem = 0
     if gpu_count > 0:
         gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-        gpu_tflops = {"A100": 312, "H100": 990, "H800": 990, "A800": 312, "V100": 125,
-                       "RTX 4090": 165, "RTX 3090": 71, "T4": 65}.get(
-                           next((k for k in ["A100", "H100", "H800", "A800", "V100", "RTX 4090", "RTX 3090", "T4"] if k in gpu_name), ""), 100
-                       )
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        gpu_tflops = {
+            "A100": 312,
+            "H100": 990,
+            "H800": 990,
+            "A800": 312,
+            "V100": 125,
+            "RTX 4090": 165,
+            "RTX 3090": 71,
+            "T4": 65,
+        }.get(
+            next(
+                (
+                    k
+                    for k in [
+                        "A100",
+                        "H100",
+                        "H800",
+                        "A800",
+                        "V100",
+                        "RTX 4090",
+                        "RTX 3090",
+                        "T4",
+                    ]
+                    if k in gpu_name
+                ),
+                "",
+            ),
+            100,
+        )
     else:
         gpu_tflops = 0
         print("未检测到 GPU, 使用 CPU 训练 (只适合 100M 以下模型)")
@@ -502,9 +588,16 @@ def auto_config(model=None, model_size: str = None):
     if model is not None:
         total_params = sum(p.numel() for p in model.parameters())
     elif model_size:
-        from .ModelRegistry import ModelRegistry, MODEL_SPECS
-        size_map = {"100m": "gpt2-small-124m", "300m": "llama-300m", "1b": "llama-1b",
-                     "3b": "llama-3b", "7b": "llama-7b", "moe-1b": "moe-1b-8e"}
+        from .models.ModelRegistry import MODEL_SPECS
+
+        size_map = {
+            "100m": "gpt2-small-124m",
+            "300m": "llama-300m",
+            "1b": "llama-1b",
+            "3b": "llama-3b",
+            "7b": "llama-7b",
+            "moe-1b": "moe-1b-8e",
+        }
         spec_name = size_map.get(model_size, model_size)
         if spec_name in MODEL_SPECS:
             total_params = MODEL_SPECS[spec_name].estimated_params
@@ -557,31 +650,37 @@ def auto_config(model=None, model_size: str = None):
         "learning_rate": lr,
         "max_seq_length": seq_len,
         "model_params": total_params,
-        "model_params_human": f"{total_params/1e9:.1f}B" if total_params >= 1e9 else f"{total_params/1e6:.0f}M",
-        "estimated_peak_vram_gb": round(total_params * 2 / (1024**3) * 4, 1),  # 模型+优化器+激活 ≈ 4x
+        "model_params_human": f"{total_params / 1e9:.1f}B"
+        if total_params >= 1e9
+        else f"{total_params / 1e6:.0f}M",
+        "estimated_peak_vram_gb": round(
+            total_params * 2 / (1024**3) * 4, 1
+        ),  # 模型+优化器+激活 ≈ 4x
         "recommendation": (
-            "完美, 可以直接训练!" if gpu_count > 0 and total_params < 3e9
-            else "建议减小 model size 或增加 GPU" if gpu_count > 0
+            "完美, 可以直接训练!"
+            if gpu_count > 0 and total_params < 3e9
+            else "建议减小 model size 或增加 GPU"
+            if gpu_count > 0
             else "需要 GPU 才能训练 > 100M 模型"
         ),
     }
 
     print(f"""自动配置:
   GPU: {gpu_count}x {gpu_name} ({gpu_mem:.0f}GB, {gpu_tflops}TFLOPS)
-  模型: {config['model_params_human']}
+  模型: {config["model_params_human"]}
   策略: {strategy}
-  Batch: {batch_size}/device × {grad_accum} grad_accum = {config['global_batch_tokens']:,} tokens/step
+  Batch: {batch_size}/device × {grad_accum} grad_accum = {config["global_batch_tokens"]:,} tokens/step
   学习率: {lr}
   序列长度: {seq_len}
-  预估显存: {config['estimated_peak_vram_gb']}GB (可用 {gpu_mem:.0f}GB)
-  → {config['recommendation']}""")
+  预估显存: {config["estimated_peak_vram_gb"]}GB (可用 {gpu_mem:.0f}GB)
+  → {config["recommendation"]}""")
 
     return config
 
 
 def _load_data(data_path: str, tokenizer):
     """加载和预处理数据。"""
-    from .DataPipeline import DataPipeline, PipelineConfig
+    from .data.pipeline import DataPipeline, PipelineConfig
 
     config = PipelineConfig(
         sources=[{"type": "local", "path": data_path}],
@@ -591,3 +690,81 @@ def _load_data(data_path: str, tokenizer):
     pipeline.collect().clean().deduplicate().filter_quality()
     pipeline.tokenize_and_pack(tokenizer)
     return pipeline.to_iterable_dataset()
+
+
+def _mark_scratch_model(model, spec_name: str) -> None:
+    """Remember that tokenizer embeddings may safely be resized before training."""
+    setattr(model, "_saddlellm_scratch_model", True)
+    setattr(model, "_saddlellm_spec_name", spec_name)
+
+
+def _resolve_tokenizer(model, tokenizer=None):
+    """Select a matching tokenizer and fail early on unsafe vocabulary mismatches."""
+    loaded_default = tokenizer is None
+    tokenizer_source = None
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+
+        config = getattr(model, "config", None)
+        configured_source = str(getattr(config, "_name_or_path", "") or "").strip()
+        if configured_source and not getattr(model, "_saddlellm_scratch_model", False):
+            tokenizer_source = configured_source
+        else:
+            tokenizer_source = "gpt2"
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+        except Exception as exc:
+            raise RuntimeError(
+                f"无法自动加载 tokenizer {tokenizer_source!r}. "
+                "请显式传入 tokenizer，或先用 llm.train_tokenizer(...) 创建一个。"
+            ) from exc
+
+    if getattr(tokenizer, "pad_token", None) is None:
+        if getattr(tokenizer, "eos_token", None) is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif getattr(tokenizer, "unk_token", None) is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+
+    try:
+        tokenizer_vocab = len(tokenizer)
+    except (TypeError, AttributeError):
+        tokenizer_vocab = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    embeddings = (
+        model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
+    )
+    model_vocab = int(
+        getattr(embeddings, "num_embeddings", 0)
+        or getattr(getattr(model, "config", None), "vocab_size", 0)
+        or 0
+    )
+    if tokenizer_vocab > model_vocab > 0:
+        if getattr(model, "_saddlellm_scratch_model", False) and hasattr(
+            model, "resize_token_embeddings"
+        ):
+            model.resize_token_embeddings(tokenizer_vocab)
+            print(
+                f"已将从零创建模型的词表从 {model_vocab} 扩展到 {tokenizer_vocab}，"
+                "与 tokenizer 保持一致。"
+            )
+        else:
+            raise ValueError(
+                f"tokenizer 词表大小为 {tokenizer_vocab}，但模型仅支持 {model_vocab}. "
+                "请传入与模型匹配的 tokenizer，避免推理或训练时出现越界。"
+            )
+    if loaded_default:
+        print(f"使用 tokenizer: {tokenizer_source}")
+    return tokenizer
+
+
+def _looks_like_local_data(value: str) -> bool:
+    if os.path.exists(value) or glob.has_magic(value):
+        return True
+    extension = os.path.splitext(value)[1].lower()
+    return extension in {
+        ".json",
+        ".jsonl",
+        ".csv",
+        ".txt",
+        ".parquet",
+        ".arrow",
+    }

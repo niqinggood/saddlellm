@@ -1,7 +1,7 @@
 import pytest
 
-from saddlellm.GRPOTrainer import GRPOConfig
-from saddlellm.PublicPolicyRLVR import (
+from saddlellm.alignment.GRPOTrainer import GRPOConfig
+from saddlellm.alignment.PublicPolicyRLVR import (
     A_LABELS,
     PolicyExample,
     build_user_prompt,

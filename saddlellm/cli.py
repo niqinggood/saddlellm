@@ -7,16 +7,57 @@ from typing import Optional
 
 
 def main(argv: Optional[list] = None) -> int:
-    parser = argparse.ArgumentParser(prog="saddle-llm", description="SaddleLLM training factory CLI")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="saddle-llm",
+        description="SaddleLLM training factory CLI",
+        epilog="New here? Run: saddle-llm quickstart",
+    )
+    sub = parser.add_subparsers(dest="command")
 
-    init_p = sub.add_parser("init", help="Create a training-factory workspace and recipe template")
-    init_p.add_argument("--domain", default="research")
-    init_p.add_argument("--root-dir", default=None)
-    init_p.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
-    init_p.add_argument("--stage", default="sft")
-    init_p.add_argument("--num-gpus", type=int, default=1)
-    init_p.add_argument("--gpu-memory-gb", type=float, default=24.0)
+    quickstart_p = sub.add_parser(
+        "quickstart",
+        help="Create a beginner-friendly post-training project with sample data",
+    )
+    quickstart_p.add_argument("directory", nargs="?", default="./saddlellm-quickstart")
+    quickstart_p.add_argument(
+        "--stages",
+        default="sft",
+        help="Comma-separated stages to prepare (sft or sft,preference)",
+    )
+    quickstart_p.add_argument(
+        "--preference-method",
+        default="dpo",
+        choices=["dpo", "kto"],
+        help="Method used when preference is listed in --stages",
+    )
+    quickstart_p.add_argument(
+        "--model",
+        default="Qwen/Qwen2.5-0.5B-Instruct",
+        help="Local model path or Hugging Face model id",
+    )
+    quickstart_p.add_argument(
+        "--data",
+        "--sft-data",
+        dest="sft_data",
+        default=None,
+        help="Existing SFT JSONL/JSON/CSV file; otherwise sample data is created",
+    )
+    quickstart_p.add_argument(
+        "--preference-data",
+        default=None,
+        help="Existing DPO/KTO data file; otherwise sample data is created",
+    )
+    quickstart_p.add_argument(
+        "--qlora",
+        action="store_true",
+        help="Enable QLoRA (requires CUDA and bitsandbytes); defaults to portable LoRA",
+    )
+    quickstart_p.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace only quickstart-owned files that already exist",
+    )
+    quickstart_p.add_argument("--output", default=None, help="Optional JSON result path")
 
     import_p = sub.add_parser("import-data", help="Import a dataset manifest or LLaMA-Factory dataset_info.json")
     import_p.add_argument("manifest")
@@ -25,25 +66,29 @@ def main(argv: Optional[list] = None) -> int:
     import_p.add_argument("--selected", default=None, help="Comma-separated dataset names")
     import_p.add_argument("--role", default=None)
 
-    plan_p = sub.add_parser("plan", help="Compile a recipe and generate backend launch artifacts")
-    plan_p.add_argument("recipe")
-    plan_p.add_argument("--output", default=None)
+    plan_p = sub.add_parser("plan", help="Generate launch artifacts from a training config")
+    plan_p.add_argument("config")
     plan_p.add_argument("--launch-script", default=None)
     plan_p.add_argument("--launch-plan", default=None)
 
-    train_p = sub.add_parser("train", help="Run a recipe or compiled orchestrator config")
+    train_p = sub.add_parser("train", help="Run a training config")
     train_p.add_argument("config")
     train_p.add_argument("--dry-run", action="store_true")
-    train_p.add_argument("--compiled-output", default=None)
     train_p.add_argument("--debug", action="store_true", help="Show full traceback instead of a structured error")
 
-    validate_p = sub.add_parser("validate-config", help="Validate a recipe or compiled training config")
+    validate_p = sub.add_parser("validate-config", help="Validate a training config")
     validate_p.add_argument("config")
     validate_p.add_argument("--output", default=None)
     validate_p.add_argument("--skip-data-inspection", action="store_true")
 
     doctor_p = sub.add_parser("doctor", help="Check local training environment and dependencies")
     doctor_p.add_argument("--output", default=None)
+
+    plugins_p = sub.add_parser(
+        "plugins",
+        help="List built-in and discovered training stages without loading them",
+    )
+    plugins_p.add_argument("--output", default=None)
 
     smoke_p = sub.add_parser("smoke-test", help="Run local tiny-model smoke tests for SFT/VLA/preference training")
     smoke_p.add_argument("--work-dir", default="build/smoke_e2e_auto")
@@ -113,6 +158,34 @@ def main(argv: Optional[list] = None) -> int:
     world_model_infer_p.add_argument("request", help="Inference request JSON or YAML")
     world_model_infer_p.add_argument("--device", default="auto")
     world_model_infer_p.add_argument("--output", default=None)
+
+    eye_data_p = sub.add_parser(
+        "build-eye-control-data",
+        help="Generate safety-filtered two-axis eye-control trajectories",
+    )
+    eye_data_p.add_argument(
+        "--output", default="data/prosthetic_eye_trajectories.jsonl"
+    )
+    eye_data_p.add_argument("--config", default=None, help="Optional eye runtime YAML/JSON")
+    eye_data_p.add_argument("--episodes", type=int, default=128)
+    eye_data_p.add_argument("--steps", type=int, default=100)
+    eye_data_p.add_argument("--seed", type=int, default=42)
+    eye_data_p.add_argument("--moving-target-ratio", type=float, default=0.5)
+    eye_data_p.add_argument("--target-dropout-probability", type=float, default=0.03)
+    eye_data_p.add_argument("--result-output", default=None)
+
+    eye_sim_p = sub.add_parser(
+        "simulate-eye-control",
+        help="Evaluate PID or RSSM+CEM eye control in the safe simulator",
+    )
+    eye_sim_p.add_argument("--checkpoint", default=None)
+    eye_sim_p.add_argument("--config", default=None, help="Optional eye runtime YAML/JSON")
+    eye_sim_p.add_argument("--episodes", type=int, default=8)
+    eye_sim_p.add_argument("--steps", type=int, default=150)
+    eye_sim_p.add_argument("--seed", type=int, default=42)
+    eye_sim_p.add_argument("--device", default="auto")
+    eye_sim_p.add_argument("--include-traces", action="store_true")
+    eye_sim_p.add_argument("--output", default=None)
 
     spatial_data_p = sub.add_parser(
         "build-spatial-world-data",
@@ -244,15 +317,6 @@ def main(argv: Optional[list] = None) -> int:
     preflight_p.add_argument("--output-dir", default=None)
     preflight_p.add_argument("--no-save", action="store_true")
 
-    recipe_p = sub.add_parser("create-recipe", help="Create a standalone recipe template")
-    recipe_p.add_argument("--stage", default="sft")
-    recipe_p.add_argument("--domain", default="research")
-    recipe_p.add_argument("--output", required=True)
-    recipe_p.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
-    recipe_p.add_argument("--data-path", default=None)
-    recipe_p.add_argument("--method", default="lora")
-    recipe_p.add_argument("--preflight-only", action="store_true")
-
     report_p = sub.add_parser("report", help="Generate a pretrain report for an output directory")
     report_p.add_argument("output_dir")
     report_p.add_argument("--root-dir", default=None)
@@ -298,88 +362,116 @@ def main(argv: Optional[list] = None) -> int:
     )
 
     args = parser.parse_args(argv)
-    if args.command == "init":
-        return _cmd_init(args)
-    if args.command == "import-data":
-        return _cmd_import_data(args)
-    if args.command == "plan":
-        return _cmd_plan(args)
-    if args.command == "train":
-        return _cmd_train(args)
-    if args.command == "validate-config":
-        return _cmd_validate_config(args)
-    if args.command == "doctor":
-        return _cmd_doctor(args)
-    if args.command == "smoke-test":
-        return _cmd_smoke_test(args)
-    if args.command == "build-media-cache":
-        return _cmd_build_media_cache(args)
-    if args.command == "media-codecs":
-        return _cmd_media_codecs(args)
-    if args.command == "inspect-data":
-        return _cmd_inspect_data(args)
-    if args.command == "inspect-vla":
-        return _cmd_inspect_vla(args)
-    if args.command == "train-world-model":
-        return _cmd_train_world_model(args)
-    if args.command == "world-model-backends":
-        return _cmd_world_model_backends(args)
-    if args.command == "infer-world-model":
-        return _cmd_infer_world_model(args)
-    if args.command == "build-spatial-world-data":
-        return _cmd_build_spatial_world_data(args)
-    if args.command == "evaluate-spatial-world-model":
-        return _cmd_evaluate_spatial_world_model(args)
-    if args.command == "plan-spatial-route":
-        return _cmd_plan_spatial_route(args)
-    if args.command == "spatial-studio":
-        return _cmd_spatial_studio(args)
-    if args.command == "world-agent-run":
-        return _cmd_world_agent_run(args)
-    if args.command == "world-agent-api":
-        return _cmd_world_agent_api(args)
-    if args.command == "preflight":
-        return _cmd_preflight(args)
-    if args.command == "create-recipe":
-        return _cmd_create_recipe(args)
-    if args.command == "report":
-        return _cmd_report(args)
-    if args.command == "export-model":
-        return _cmd_export_model(args)
-    if args.command == "serve-model":
-        return _cmd_serve_model(args)
-    return 2
+    if args.command is None:
+        print(_getting_started_text())
+        return 0
+
+    handlers = {
+        "quickstart": _cmd_quickstart,
+        "import-data": _cmd_import_data,
+        "plan": _cmd_plan,
+        "train": _cmd_train,
+        "validate-config": _cmd_validate_config,
+        "doctor": _cmd_doctor,
+        "plugins": _cmd_plugins,
+        "smoke-test": _cmd_smoke_test,
+        "build-media-cache": _cmd_build_media_cache,
+        "media-codecs": _cmd_media_codecs,
+        "inspect-data": _cmd_inspect_data,
+        "inspect-vla": _cmd_inspect_vla,
+        "train-world-model": _cmd_train_world_model,
+        "world-model-backends": _cmd_world_model_backends,
+        "infer-world-model": _cmd_infer_world_model,
+        "build-eye-control-data": _cmd_build_eye_control_data,
+        "simulate-eye-control": _cmd_simulate_eye_control,
+        "build-spatial-world-data": _cmd_build_spatial_world_data,
+        "evaluate-spatial-world-model": _cmd_evaluate_spatial_world_model,
+        "plan-spatial-route": _cmd_plan_spatial_route,
+        "spatial-studio": _cmd_spatial_studio,
+        "world-agent-run": _cmd_world_agent_run,
+        "world-agent-api": _cmd_world_agent_api,
+        "preflight": _cmd_preflight,
+        "report": _cmd_report,
+        "export-model": _cmd_export_model,
+        "serve-model": _cmd_serve_model,
+    }
+    try:
+        return handlers[args.command](args)
+    except KeyboardInterrupt:
+        _emit_json({"ok": False, "command": args.command, "error": "Interrupted by user."})
+        return 130
+    except Exception as exc:
+        if getattr(args, "debug", False):
+            raise
+        _emit_json(
+            {
+                "ok": False,
+                "command": args.command,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "hint": "Use --help for command options; use --debug on train for a traceback.",
+            }
+        )
+        return 1
 
 
-def _cmd_init(args) -> int:
-    from .TrainingFactory import FactoryConfig, LLMTrainingFactory
-    from .TrainingRecipe import TrainingRecipe
+def _getting_started_text() -> str:
+    return """SaddleLLM — 从一个可检查的小项目开始
 
-    root_dir = args.root_dir or f"./llm_factory_{args.domain}"
-    factory = LLMTrainingFactory(FactoryConfig(
-        root_dir=root_dir,
-        domain=args.domain,
-        base_model=args.base_model,
-        num_gpus=args.num_gpus,
-        gpu_memory_gb=args.gpu_memory_gb,
-    ))
-    factory.create_workspace()
-    recipe = TrainingRecipe.template(
-        stage=args.stage,
-        domain=args.domain,
-        output_dir=os.path.join(root_dir, "outputs", args.stage),
-        base_model=args.base_model,
+  saddle-llm quickstart
+  cd saddlellm-quickstart
+  saddle-llm validate-config config.yaml
+  saddle-llm train config.yaml --dry-run
+
+查看全部命令：saddle-llm --help
+已有配置：    saddle-llm validate-config <配置文件>"""
+
+
+def _cmd_quickstart(args) -> int:
+    from .factory.Quickstart import create_quickstart
+
+    result = create_quickstart(
+        args.directory,
+        stages=args.stages,
+        preference_method=args.preference_method,
+        model=args.model,
+        sft_data=args.sft_data,
+        preference_data=args.preference_data,
+        qlora=args.qlora,
+        overwrite=args.force,
     )
-    recipe.backend.num_gpus = args.num_gpus
-    recipe.backend.gpu_memory_gb = args.gpu_memory_gb
-    recipe_path = os.path.join(root_dir, "configs", f"{args.stage}_recipe.yaml")
-    recipe.save(recipe_path)
-    print(json.dumps({"workspace": root_dir, "recipe": recipe_path}, ensure_ascii=False, indent=2))
+    _emit_json(result.to_dict(), args.output)
+    return 0
+
+
+def _cmd_plugins(args) -> int:
+    from .framework import STAGE_ENTRY_POINT_GROUP, get_stage_registry
+
+    def _items(registry):
+        return [
+            {
+                "name": item.name,
+                "source": item.source,
+                "loaded": item.loaded,
+                "entry_point": item.entry_point,
+            }
+            for item in registry.info()
+        ]
+
+    stage_registry = get_stage_registry()
+    payload = {
+        "stages": {
+            "entry_point_group": STAGE_ENTRY_POINT_GROUP,
+            "plugins": _items(stage_registry),
+        },
+        "discovery_errors": list(stage_registry.discovery_errors),
+    }
+    _emit_json(payload, args.output)
     return 0
 
 
 def _cmd_import_data(args) -> int:
-    from .TrainingFactory import FactoryConfig, LLMTrainingFactory
+    from .factory.TrainingFactory import FactoryConfig, LLMTrainingFactory
 
     selected = [item.strip() for item in args.selected.split(",") if item.strip()] if args.selected else None
     factory = LLMTrainingFactory(FactoryConfig(root_dir=args.root_dir))
@@ -398,35 +490,24 @@ def _cmd_import_data(args) -> int:
 
 
 def _cmd_plan(args) -> int:
-    from .BackendAdapters import BackendAdapterRegistry
-    from .SimpleFlow import SimpleFlowCompiler
-    from .TrainingRecipe import TrainingRecipe
+    from .factory.BackendAdapters import BackendAdapterRegistry
 
-    output = args.output or os.path.join(os.path.dirname(args.recipe) or ".", "compiled_orchestrator.yaml")
-    raw = _load_config(args.recipe)
-    if SimpleFlowCompiler.is_simple_flow(raw):
-        compiled = SimpleFlowCompiler.compile(
-            raw, base_dir=os.path.dirname(os.path.abspath(args.recipe)) or "."
-        )
-        _save_config(output, compiled)
-    else:
-        recipe = TrainingRecipe.from_dict(raw)
-        recipe.save_compiled(output, base_dir=os.path.dirname(os.path.abspath(args.recipe)) or ".", save_backend_plan=True)
-    compiled = _load_config(output)
-    backend_plan_path = compiled.get("distributed", {}).get("backend_plan_path")
+    config = _load_training_config(args.config)
+    backend_plan_path = config.get("distributed", {}).get("backend_plan_path")
     plan = BackendAdapterRegistry.create_launch_plan(
-        output,
-        backend=compiled.get("distributed", {}).get("strategy", "single"),
-        num_gpus=compiled.get("distributed", {}).get("num_gpus", 1),
-        num_nodes=compiled.get("distributed", {}).get("num_nodes", 1),
+        args.config,
+        backend=config.get("distributed", {}).get("strategy", "single"),
+        num_gpus=config.get("distributed", {}).get("num_gpus", 1),
+        num_nodes=config.get("distributed", {}).get("num_nodes", 1),
         backend_plan_path=backend_plan_path,
     )
-    launch_plan_path = args.launch_plan or os.path.join(os.path.dirname(output) or ".", "launch_plan.json")
-    launch_script_path = args.launch_script or os.path.join(os.path.dirname(output) or ".", "launch.ps1")
+    output_dir = os.path.dirname(args.config) or "."
+    launch_plan_path = args.launch_plan or os.path.join(output_dir, "launch_plan.json")
+    launch_script_path = args.launch_script or os.path.join(output_dir, "launch.ps1")
     BackendAdapterRegistry.save_launch_plan(plan, launch_plan_path)
     BackendAdapterRegistry.save_launch_script(plan, launch_script_path)
     print(json.dumps({
-        "compiled_config": output,
+        "config": args.config,
         "launch_plan": launch_plan_path,
         "launch_script": launch_script_path,
         "backend": plan.backend,
@@ -436,36 +517,36 @@ def _cmd_plan(args) -> int:
 
 
 def _cmd_train(args) -> int:
-    from .TrainingOrchestrator import TrainingOrchestrator
-    from .SimpleFlow import SimpleFlowCompiler
-    from .TrainingRecipe import TrainingRecipe
+    from .training.TrainingOrchestrator import TrainingOrchestrator
 
     config_path = args.config
     try:
-        config = _load_config(config_path)
-        if SimpleFlowCompiler.is_simple_flow(config):
-            config = SimpleFlowCompiler.compile(
-                config, base_dir=os.path.dirname(os.path.abspath(config_path)) or "."
-            )
-            compiled_output = args.compiled_output or os.path.join(
-                os.path.dirname(config_path) or ".",
-                "compiled_orchestrator.yaml",
-            )
-            _save_config(compiled_output, config)
-            config_path = compiled_output
-        elif "stage" in config or "method" in config or "backend" in config:
-            recipe = TrainingRecipe.from_dict(config)
-            compiled_output = args.compiled_output or os.path.join(
-                os.path.dirname(config_path) or ".",
-                "compiled_orchestrator.yaml",
-            )
-            recipe.save_compiled(compiled_output, base_dir=os.path.dirname(os.path.abspath(config_path)) or ".")
-            config = _load_config(compiled_output)
-            config_path = compiled_output
+        config = _load_training_config(config_path)
         if args.dry_run:
+            from .framework import PipelinePlan, get_stage_registry
+
+            pipeline_config = config.get("pipeline", {})
+            dependencies = None
+            if isinstance(pipeline_config, dict):
+                dependencies = pipeline_config.get(
+                    "dependencies", pipeline_config.get("depends_on")
+                )
+            stage_names = config.get("stages", [])
+            stage_registry = get_stage_registry()
+            capabilities = {
+                stage: stage_registry.create(stage).capabilities
+                for stage in stage_names
+                if stage_registry.contains(stage)
+            }
+            pipeline_plan = PipelinePlan.compile(
+                stage_names,
+                dependencies=dependencies,
+                capabilities=capabilities,
+            )
             print(json.dumps({
-                "compiled_config": config_path,
-                "stages": config.get("stages", []),
+                "config": config_path,
+                "stages": list(pipeline_plan.stages),
+                "pipeline_plan": pipeline_plan.to_dict(),
                 "distributed": config.get("distributed", {}),
                 "data_sources": len(config.get("data", {}).get("sources", [])),
             }, ensure_ascii=False, indent=2))
@@ -494,30 +575,22 @@ def _cmd_train(args) -> int:
 
 
 def _cmd_validate_config(args) -> int:
-    from .SimpleFlow import SimpleFlowCompiler
-    from .TrainingConfigValidator import TrainingConfigValidator
-    from .TrainingRecipe import TrainingRecipe
+    from .training.TrainingConfigValidator import TrainingConfigValidator
 
     config_path = args.config
     if not os.path.exists(config_path):
         _emit_json({"valid": False, "issues": [f"Config file not found: {config_path}"]}, args.output)
         return 1
-    config = _load_config(config_path)
-    compiled_from_recipe = False
-    compiled_from_simple_flow = False
-    if SimpleFlowCompiler.is_simple_flow(config):
-        config = SimpleFlowCompiler.compile(
-            config, base_dir=os.path.dirname(os.path.abspath(config_path)) or "."
+    try:
+        config = _load_training_config(config_path)
+    except (TypeError, ValueError) as exc:
+        _emit_json(
+            {"valid": False, "issues": [str(exc)], "config_path": config_path},
+            args.output,
         )
-        compiled_from_simple_flow = True
-    elif "stage" in config or "method" in config or "backend" in config:
-        recipe = TrainingRecipe.from_dict(config)
-        config = recipe.compile(base_dir=os.path.dirname(os.path.abspath(config_path)) or ".", save_backend_plan=False)
-        compiled_from_recipe = True
+        return 1
     report = TrainingConfigValidator.validate(config, inspect_data=not args.skip_data_inspection).to_dict()
     report["config_path"] = config_path
-    report["compiled_from_recipe"] = compiled_from_recipe
-    report["compiled_from_simple_flow"] = compiled_from_simple_flow
     _emit_json(report, args.output)
     return 0 if report.get("valid", False) else 1
 
@@ -581,7 +654,7 @@ def _cmd_doctor(args) -> int:
         approx_params_b = gpu_total_memory_gb * 0.7 / 2
         recommendations.append(f"Single GPU: roughly {approx_params_b:.1f}B bf16 parameters are practical before optimizer/activation overhead.")
 
-    from .PostTrainingCompatibility import (
+    from .training.PostTrainingCompatibility import (
         post_training_runtime_report,
         stabilize_peft_optional_backends,
     )
@@ -622,7 +695,7 @@ def _cmd_doctor(args) -> int:
 
 
 def _cmd_smoke_test(args) -> int:
-    from .SmokeTestRunner import run_smoke_tests
+    from .evaluation.SmokeTestRunner import run_smoke_tests
 
     result = run_smoke_tests(
         work_dir=args.work_dir,
@@ -637,7 +710,7 @@ def _cmd_smoke_test(args) -> int:
 
 
 def _cmd_inspect_data(args) -> int:
-    from .TrainingDataInspector import inspect_training_data
+    from .data.TrainingDataInspector import inspect_training_data
 
     result = inspect_training_data(args.data_path, task=args.task, max_records=args.max_records)
     _emit_json(result, args.output)
@@ -645,8 +718,8 @@ def _cmd_inspect_data(args) -> int:
 
 
 def _cmd_inspect_vla(args) -> int:
-    from .VLA import VLAActionSpace
-    from .VLADataInspector import inspect_vla_data
+    from .multimodal.VLA import VLAActionSpace
+    from .multimodal.VLADataInspector import inspect_vla_data
 
     action_space = VLAActionSpace(
         action_dim=args.action_dim,
@@ -667,7 +740,7 @@ def _cmd_inspect_vla(args) -> int:
 
 
 def _cmd_train_world_model(args) -> int:
-    from ._WorldModelTrainer import train_world_model_from_config
+    from .world_models._WorldModelTrainer import train_world_model_from_config
 
     result = train_world_model_from_config(args.config, dry_run=args.dry_run)
     _emit_json(result, args.output)
@@ -675,7 +748,7 @@ def _cmd_train_world_model(args) -> int:
 
 
 def _cmd_build_media_cache(args) -> int:
-    from .MediaCache import MediaCacheBuildConfig, build_media_cache
+    from .multimodal.MediaCache import MediaCacheBuildConfig, build_media_cache
 
     payload = _load_config(args.config)
     if not isinstance(payload, dict):
@@ -700,8 +773,8 @@ def _cmd_build_media_cache(args) -> int:
 def _cmd_media_codecs(args) -> int:
     from dataclasses import asdict
 
-    from .BuiltinMediaCodecs import register_builtin_media_codecs
-    from .ModalityCodec import ModalityCodecRegistry
+    from .multimodal.BuiltinMediaCodecs import register_builtin_media_codecs
+    from .multimodal.ModalityCodec import ModalityCodecRegistry
 
     register_builtin_media_codecs()
     result = {
@@ -714,7 +787,7 @@ def _cmd_media_codecs(args) -> int:
 
 
 def _cmd_world_model_backends(args) -> int:
-    from .WorldModelBackends import list_world_model_backends
+    from .world_models.WorldModelBackends import list_world_model_backends
 
     result = {"backends": list_world_model_backends()}
     _emit_json(result, args.output)
@@ -722,7 +795,7 @@ def _cmd_world_model_backends(args) -> int:
 
 
 def _cmd_infer_world_model(args) -> int:
-    from .WorldModelInference import run_world_model_inference
+    from .world_models.WorldModelInference import run_world_model_inference
 
     request = _load_config(args.request)
     result = run_world_model_inference(
@@ -734,10 +807,69 @@ def _cmd_infer_world_model(args) -> int:
     return 0
 
 
+def _eye_runtime_config(path):
+    from .spatial.prosthetic_eye_control import EyePIDConfig, EyePlantConfig, EyeSafetyConfig
+
+    payload = _load_config(path) if path else {}
+    if not isinstance(payload, dict):
+        raise ValueError("Eye runtime config root must be a mapping")
+    if "eye_control" in payload:
+        payload = payload["eye_control"]
+    if not isinstance(payload, dict):
+        raise ValueError("eye_control must be a mapping")
+    allowed = {"safety", "pid", "plant", "planner"}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError("Unknown eye runtime config fields: " + ", ".join(unknown))
+    planner = payload.get("planner")
+    if planner is not None and not isinstance(planner, dict):
+        raise ValueError("eye_control.planner must be a mapping")
+    return {
+        "safety_config": EyeSafetyConfig.from_dict(payload.get("safety")),
+        "pid_config": EyePIDConfig.from_dict(payload.get("pid")),
+        "plant_config": EyePlantConfig.from_dict(payload.get("plant")),
+        "planner_config": dict(planner or {}),
+    }
+
+
+def _cmd_build_eye_control_data(args) -> int:
+    from .spatial.prosthetic_eye_control import generate_prosthetic_eye_dataset
+
+    runtime = _eye_runtime_config(args.config)
+    runtime.pop("planner_config", None)
+    result = generate_prosthetic_eye_dataset(
+        args.output,
+        episodes=args.episodes,
+        steps=args.steps,
+        seed=args.seed,
+        moving_target_ratio=args.moving_target_ratio,
+        target_dropout_probability=args.target_dropout_probability,
+        **runtime,
+    )
+    _emit_json(result, args.result_output)
+    return 0
+
+
+def _cmd_simulate_eye_control(args) -> int:
+    from .spatial.prosthetic_eye_control import simulate_prosthetic_eye_control
+
+    result = simulate_prosthetic_eye_control(
+        checkpoint=args.checkpoint,
+        episodes=args.episodes,
+        steps=args.steps,
+        seed=args.seed,
+        device=args.device,
+        include_traces=args.include_traces,
+        **_eye_runtime_config(args.config),
+    )
+    _emit_json(result, args.output)
+    return 0
+
+
 def _cmd_build_spatial_world_data(args) -> int:
-    from .SpatialPerception import MapExtractionConfig
-    from .SpatialPlanner import SpatialPlannerConfig
-    from .SpatialWorldModelData import (
+    from .spatial.SpatialPerception import MapExtractionConfig
+    from .spatial.SpatialPlanner import SpatialPlannerConfig
+    from .spatial.SpatialWorldModelData import (
         SpatialSequenceConfig,
         SpatialTrajectoryConfig,
         generate_spatial_sequence_dataset,
@@ -798,7 +930,7 @@ def _cmd_build_spatial_world_data(args) -> int:
 
 
 def _cmd_evaluate_spatial_world_model(args) -> int:
-    from .SpatialWorldModelEvaluation import evaluate_spatial_world_model
+    from .spatial.SpatialWorldModelEvaluation import evaluate_spatial_world_model
 
     result = evaluate_spatial_world_model(
         args.checkpoint,
@@ -814,18 +946,18 @@ def _cmd_evaluate_spatial_world_model(args) -> int:
 
 
 def _cmd_plan_spatial_route(args) -> int:
-    from .SpatialPerception import (
+    from .spatial.SpatialPerception import (
         MapExtractionConfig,
         QwenVLSpatialAnalyzer,
         TopDownMapExtractor,
     )
-    from .SpatialPlanner import GridPathPlanner, SpatialPlannerConfig
-    from .SpatialVisualization import (
+    from .spatial.SpatialPlanner import GridPathPlanner, SpatialPlannerConfig
+    from .spatial.SpatialVisualization import (
         render_spatial_plan_html,
         render_spatial_plan_png,
         save_spatial_plan_json,
     )
-    from .SpatialWorldModel import SpatialWorldModelCoordinator
+    from .spatial.SpatialWorldModel import SpatialWorldModelCoordinator
 
     analyzer = (
         QwenVLSpatialAnalyzer.from_pretrained(
@@ -895,7 +1027,7 @@ def _cmd_spatial_studio(args) -> int:
         import uvicorn
     except ImportError as error:
         raise ImportError("uvicorn is required to run the spatial studio") from error
-    from .SpatialAPI import (
+    from .spatial.SpatialAPI import (
         SpatialStudioSettings,
         create_spatial_studio_app,
     )
@@ -914,7 +1046,7 @@ def _cmd_spatial_studio(args) -> int:
 
 
 def _world_agent_settings(args):
-    from .WorldAgent import WorldAgentSettings
+    from .spatial.WorldAgent import WorldAgentSettings
 
     settings = (
         WorldAgentSettings.from_file(args.config)
@@ -934,7 +1066,7 @@ def _world_agent_settings(args):
 
 
 def _cmd_world_agent_run(args) -> int:
-    from .WorldAgent import WorldAgentRuntime
+    from .spatial.WorldAgent import WorldAgentRuntime
 
     settings = _world_agent_settings(args)
     runtime = WorldAgentRuntime(settings)
@@ -957,7 +1089,7 @@ def _cmd_world_agent_api(args) -> int:
         import uvicorn
     except ImportError as error:
         raise ImportError("uvicorn is required to run the WorldAgent API") from error
-    from .WorldAgentAPI import create_world_agent_app
+    from .spatial.WorldAgentAPI import create_world_agent_app
 
     settings = _world_agent_settings(args)
     app = create_world_agent_app(settings)
@@ -966,7 +1098,7 @@ def _cmd_world_agent_api(args) -> int:
 
 
 def _cmd_preflight(args) -> int:
-    from .TrainingFactory import FactoryConfig, LLMTrainingFactory
+    from .factory.TrainingFactory import FactoryConfig, LLMTrainingFactory
 
     stage = args.stage
     preference_method = args.preference_method
@@ -990,7 +1122,7 @@ def _cmd_preflight(args) -> int:
         "stage": result.get("stage"),
         "method": result.get("method"),
         "plan_path": result.get("plan_path"),
-        "orchestrator_config_path": result.get("orchestrator_config_path"),
+        "config_path": result.get("config_path"),
         "blocking_errors": result.get("blocking_errors", []),
         "recommendations": result.get("recommendations", []),
         "training_estimate": result.get("training_estimate", {}),
@@ -998,26 +1130,8 @@ def _cmd_preflight(args) -> int:
     return 0 if result.get("ready", False) else 1
 
 
-def _cmd_create_recipe(args) -> int:
-    from .TrainingRecipe import TrainingRecipe
-
-    recipe = TrainingRecipe.template(
-        stage=args.stage,
-        domain=args.domain,
-        output_dir=os.path.dirname(os.path.abspath(args.output)) or ".",
-        base_model=args.base_model,
-    )
-    recipe.method.type = args.method
-    recipe.training.preflight_only = bool(args.preflight_only)
-    if args.data_path:
-        recipe.data.sources = [{"type": "local", "path": args.data_path, "format": "jsonl"}]
-    recipe.save(args.output)
-    print(json.dumps({"recipe": args.output, "stage": recipe.stages()}, ensure_ascii=False, indent=2))
-    return 0
-
-
 def _cmd_report(args) -> int:
-    from .TrainingFactory import FactoryConfig, LLMTrainingFactory
+    from .factory.TrainingFactory import FactoryConfig, LLMTrainingFactory
 
     root = args.root_dir or args.output_dir
     result = LLMTrainingFactory(FactoryConfig(root_dir=root)).report(args.output_dir)
@@ -1026,7 +1140,7 @@ def _cmd_report(args) -> int:
 
 
 def _cmd_export_model(args) -> int:
-    from .ModelExporter import ModelExportRequest, ModelExporter
+    from .runtime.ModelExporter import ModelExportRequest, ModelExporter
 
     gate = None
     if args.gate_result:
@@ -1076,7 +1190,7 @@ def _cmd_serve_model(args) -> int:
         import uvicorn
     except ImportError as exc:
         raise ImportError("uvicorn is required to serve a model.") from exc
-    from .InferenceServer import InferenceServerSettings, create_inference_app
+    from .runtime.InferenceServer import InferenceServerSettings, create_inference_app
 
     api_key = None
     if args.api_key_env:
@@ -1139,17 +1253,27 @@ def _load_config(path: str) -> dict:
         return json.load(f)
 
 
-def _save_config(path: str, payload: dict) -> str:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        if path.lower().endswith((".yaml", ".yml")):
-            import yaml
+def _load_training_config(path: str) -> dict:
+    config = _load_config(path)
+    if not isinstance(config, dict):
+        raise TypeError("Training config must be a YAML/JSON object.")
 
-            yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
-        else:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    return path
+    old_fields = [name for name in ("flow", "stage", "apiVersion", "kind", "spec") if name in config]
+    if old_fields:
+        raise ValueError(
+            "Unsupported old config fields: "
+            + ", ".join(old_fields)
+            + ". Use one plain config with a top-level `stages` list."
+        )
+
+    stages = config.get("stages")
+    if not isinstance(stages, list) or not stages:
+        raise ValueError("Training config requires a non-empty top-level `stages` list.")
+    if any(not isinstance(stage, str) or not stage.strip() for stage in stages):
+        raise ValueError("Every item in `stages` must be a non-empty string.")
+    if len(stages) != len(set(stages)):
+        raise ValueError("`stages` must not contain duplicates.")
+    return config
 
 
 if __name__ == "__main__":

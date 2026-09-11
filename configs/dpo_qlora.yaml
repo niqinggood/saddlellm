@@ -1,36 +1,43 @@
 project: saddlellm
 experiment: dpo-qlora
-stage: preference
+stages: [preference, eval]
+
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
   tokenizer: Qwen/Qwen2.5-7B-Instruct
   backend: hf
-  pretrain_mode: continue
-method:
-  type: qlora
-  preference_method: dpo
+pretrain_mode: continue
+
+preference:
+  enabled: true
+  method: dpo
+  data_path: data/posttrain_preference_example.jsonl
   beta: 0.1
-  lora_r: 16
-  lora_alpha: 32
-  lora_dropout: 0.05
-data:
-  sources:
-    - type: local
-      path: data/posttrain_preference_example.jsonl
-      format: jsonl
-  max_seq_length: 2048
-training:
-  per_device_batch_size: 1
-  global_batch_size: 8
   learning_rate: 0.000005
   epochs: 1
+  per_device_batch_size: 1
+  max_length: 2048
+  max_prompt_length: 1024
+  use_lora: true
+  use_qlora: true
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+  gradient_accumulation_steps: 4
+
+eval:
+  enabled: true
+
+training:
   max_steps: 1000
   warmup_steps: 100
   save_every_steps: 200
-backend:
-  strategy: auto
+
+distributed:
+  strategy: single
   num_gpus: 1
-  gpu_memory_gb: 24
+
 logging:
   output_dir: outputs/dpo_qlora
   backend: local

@@ -1,17 +1,17 @@
 import numpy as np
 import torch
 
-from saddlellm.VideoLatentFlowModel import (
+from saddlellm.multimodal.VideoLatentFlowModel import (
     ConditionalVideoLatentFlowTransformer,
     VideoLatentFlowConfig,
 )
-from saddlellm.VideoLatentFlowTrainer import (
+from saddlellm.multimodal.VideoLatentFlowTrainer import (
     CachedVideoLatentDataset,
     VideoLatentFlowTrainingConfig,
     load_video_latent_flow_checkpoint,
     train_video_latent_flow,
 )
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 def _config():

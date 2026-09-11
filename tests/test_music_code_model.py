@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from saddlellm.MusicCodeModel import (
+from saddlellm.multimodal.MusicCodeModel import (
     ConditionalMusicCodeTransformer,
     MusicCodeConfig,
 )

@@ -470,14 +470,28 @@ def test_spatial_rollout_evaluator_reports_prediction_and_calibration_metrics(tm
         str(checkpoint),
         str(data_path),
         device="cpu",
-        sequence_length=4,
+        sequence_length=20,
         max_windows=1,
     )
 
+    expected_steps = min(len(episode["actions"]), 20)
     assert metrics["valid_transitions"] > 0
     assert 0.0 <= metrics["occupancy"]["mean_iou"] <= 1.0
     assert metrics["ego_motion"]["rmse"] >= 0.0
     assert 0.0 <= metrics["collision"]["ece"] <= 1.0
+    assert metrics["termination"]["count"] == metrics["valid_transitions"]
+    assert metrics["termination"]["positive_count"] == 1
+    assert [item["step"] for item in metrics["horizon_curve"]] == list(
+        range(1, expected_steps + 1)
+    )
+    assert all(
+        item["valid_transitions"] == 1 for item in metrics["horizon_curve"]
+    )
+    assert metrics["rollout_drift"]["first_step"] == 1
+    assert metrics["rollout_drift"]["last_step"] == expected_steps
+    assert (
+        metrics["horizon_curve"][-1]["termination"]["positive_count"] == 1
+    )
 
 
 def test_generate_spatial_dataset_is_directly_trainable(tmp_path):

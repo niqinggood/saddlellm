@@ -1,0 +1,65 @@
+"""Stage, pipeline, artifact, and plugin contracts."""
+
+from .artifacts import ArtifactError, ArtifactRef, ArtifactRegistry
+from .pipeline import (
+    PIPELINE_STATE_API_VERSION,
+    PipelineNode,
+    PipelinePlan,
+    PipelinePlanError,
+    PipelineStateError,
+    PipelineStateStore,
+    normalized_run_fingerprint,
+)
+from .registry import (
+    DuplicatePluginError,
+    PluginInfo,
+    PluginLoadError,
+    PluginNotFoundError,
+    PluginRegistry,
+    PluginRegistryError,
+)
+from .stages import (
+    BUILTIN_STAGE_NAMES,
+    BaseStage,
+    FunctionStage,
+    STAGE_ENTRY_POINT_GROUP,
+    StageCapabilities,
+    StageContext,
+    StagePlugin,
+    StageRegistry,
+    create_stage_registry,
+    get_stage_registry,
+    list_stages,
+    register_stage,
+)
+
+__all__ = [
+    "ArtifactError",
+    "ArtifactRef",
+    "ArtifactRegistry",
+    "BUILTIN_STAGE_NAMES",
+    "BaseStage",
+    "DuplicatePluginError",
+    "FunctionStage",
+    "PluginInfo",
+    "PluginLoadError",
+    "PluginNotFoundError",
+    "PluginRegistry",
+    "PluginRegistryError",
+    "PIPELINE_STATE_API_VERSION",
+    "PipelineNode",
+    "PipelinePlan",
+    "PipelinePlanError",
+    "PipelineStateError",
+    "PipelineStateStore",
+    "STAGE_ENTRY_POINT_GROUP",
+    "StageCapabilities",
+    "StageContext",
+    "StagePlugin",
+    "StageRegistry",
+    "create_stage_registry",
+    "get_stage_registry",
+    "list_stages",
+    "normalized_run_fingerprint",
+    "register_stage",
+]

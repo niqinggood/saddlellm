@@ -1,907 +1,1009 @@
 # SaddleLLM
 
-SaddleLLM 是一个面向本地研究与工程实验的大语言模型训练工具包，覆盖数据检查、训练规划、SFT、偏好优化、RL/GRPO、评估、蒸馏、量化和部署等流程。
+当前版本：`2.35`
 
-> A modular toolkit for LLM training, fine-tuning, alignment, multimodal learning, world models, evaluation, and deployment.
+SaddleLLM 是一个以配置驱动的模型训练与运行工具箱。用户准备数据、模型和一份训练配置，系统负责检查输入、安排训练阶段、调用对应训练器，并保存 checkpoint、评测结果和运行状态。
 
-当前版本：`2.32`
+本文只讲当前实现，按三个问题展开：
 
-> 建议先运行环境检查、数据检查和 dry-run，再启动真实训练。仓库包含稳定主线和实验性模块，并非所有功能都适合直接用于大规模生产训练。
+1. 这个系统是什么。
+2. 怎么使用，命令会返回什么。
+3. 代码和训练过程为什么这样运行。
 
-## 主要能力
+## 1. 这个系统是什么
 
-- 训练工厂：领域工作区、Recipe、Orchestrator 和实验产物管理
-- 数据处理：SFT、DPO、ORPO、KTO、RL/GRPO 和 VLA 数据检查与规范化
-- 后训练：Full Fine-tuning、LoRA、QLoRA、SFT 和 preference optimization
-- 强化学习：native GRPO、可验证奖励和 source-frontier profiling
-- 模型实验：Dense、GQA、MoE、MLA、MTP 和 Long Context blueprint
-- 模型积木：同一份 Blueprint 可由 YAML 配置生成，也可用 Python Builder 逐层组合；支持异构 Attention/FFN 和可配置残差初始化
-- 评估与诊断：Benchmark、训练报告、环境检查和 smoke test
-- 模型工程：蒸馏、量化、剪枝、部署和安全生成
-- 多模态/VLA：提供实验性的数据、模型和训练入口
-- 世界模型：提供原生 Gaussian/Categorical RSSM、离线轨迹训练、开放环 rollout、动作评分和轻量规划
-- 空间世界模型：俯视图占用建图、Qwen-VL 可选语义、多路线规划、空间 RSSM 重评分和响应式 Web 工作台
+### 1.1 系统定位
 
-## 环境要求
+SaddleLLM 不是一个单独的模型，也不是重新实现 PyTorch、Transformers、PEFT 或 TRL。它位于这些训练库的上层，把一次模型实验需要的内容组织起来：
 
-- Python `>=3.10`
-- PyTorch
-- Transformers
-- Datasets
-- PEFT
-- TRL
-- NVIDIA GPU（真实模型训练建议使用）
+```text
+数据 + 基础模型 + 训练参数 + 执行阶段
+                    ↓
+              SaddleLLM
+                    ↓
+训练计划 + checkpoint + 评测 + 发布文件 + 运行记录
+```
 
-部分后端能力还需要 DeepSpeed、bitsandbytes、xFormers、flash-attn 或其他可选依赖。
+它主要解决五件事：
 
-## 安装
+1. 用一份 YAML/JSON 明确本次运行要做哪些阶段。
+2. 在加载大模型前检查配置、数据和运行环境。
+3. 按顺序调用预训练、SFT、偏好训练、评测和导出等实现。
+4. 把前一个阶段产生的模型或数据交给后一个阶段。
+5. 保存计划、状态和结果，让失败可定位、运行可恢复、产物可追踪。
 
-建议在独立虚拟环境中使用：
+### 1.2 输入、处理和输出
+
+| 类型 | 具体内容 |
+|---|---|
+| 输入 | YAML/JSON 配置、文本或多模态数据、基础模型或 checkpoint |
+| 处理 | 数据检查、模型加载、阶段排序、训练、评测、导出 |
+| 输出 | 阶段计划、训练 checkpoint、最终模型、指标、发布门禁、运行摘要 |
+
+用于 `train`、`validate-config` 和 `plan` 的训练配置只有一种结构：顶层必须有非空的 `stages` 列表。
+
+例如：
+
+```yaml
+stages: [sft, preference, eval]
+```
+
+这表示依次执行：
+
+```text
+监督微调 → 偏好训练 → 评测
+```
+
+每个阶段的参数放在同名配置块里：
+
+```yaml
+stages: [sft, preference]
+
+sft:
+  enabled: true
+  data_path: data/sft.jsonl
+
+preference:
+  enabled: true
+  method: dpo
+  data_path: data/preference.jsonl
+```
+
+### 1.3 当前支持的能力
+
+| 领域 | 阶段或入口 | 当前实际行为 |
+|---|---|---|
+| Tokenizer | `tokenizer` | 训练新 tokenizer；未提供训练参数时加载已有 tokenizer |
+| 从零预训练 | `pretrain` + `pretrain_mode: scratch` | 创建模型、处理语料、执行 causal LM 训练并保存最终模型 |
+| 继续预训练 | `pretrain` + `pretrain_mode: continue` | 加载已有权重，用新训练任务继续优化 |
+| 监督微调 | `sft` | 执行全参数、LoRA 或 QLoRA SFT |
+| 偏好训练 | `preference` | 执行 DPO、ORPO 或 KTO |
+| RLHF | `rlhf` | DPO 可执行；PPO 目前只返回未接入状态 |
+| 多教师蒸馏 | `mopd` | 生成计划，或调用教师收集 on-policy 数据供后续 SFT |
+| VLA | `vla_sft` | 检查并规范化机器人轨迹；`vla.train: true` 时执行行为克隆训练 |
+| 通用图文训练 | `mllm_sft`、`vision_alignment` | 当前负责数据规范化和训练计划，还没有执行通用 VLM 参数优化 |
+| 图像生成 | `media_cache` + `image_generation` | 编码图像与文本条件，训练潜变量生成模型 |
+| 音乐生成 | `media_cache` + `music_generation` | 编码音频码本与文本条件，训练多码本自回归模型 |
+| 视频生成 | `media_cache` + `video_generation` | 编码视频潜变量与文本条件，训练时空生成模型 |
+| 世界模型 | `world_model` | 用离线轨迹训练 RSSM 或 categorical RSSM |
+| 眼动控制 | `eye_control` | 在安全软件仿真器中评估 PID 或世界模型规划控制 |
+| 评测 | `eval` | 计算指标，并可按规则生成发布门禁结果 |
+| 导出 | `export` | 打包 HF 或 Saddle 模型；可要求评测门禁先通过 |
+| 外部算子 | `operator` | 调用已配置的 agent/大模型算子并登记产物 |
+
+### 1.4 两种模型后端
+
+`model.backend` 决定文本模型由哪套实现负责：
+
+| 后端 | 用途 | 当前边界 |
+|---|---|---|
+| `hf` | Hugging Face 模型加载、SFT、LoRA、QLoRA、DPO、ORPO、KTO | 最适合已有开源模型的后训练 |
+| `saddle` | 项目原生模块化语言模型、原生 checkpoint、预训练和 DPO | 不支持 LoRA/QLoRA；偏好方法当前只支持 DPO |
+
+非单进程的 DDP、FSDP 和 DeepSpeed 路径，目前只对 `model.backend: saddle` 的 `pretrain` 阶段声明为可执行。其他内置阶段使用 `distributed.strategy: single`。
+
+### 1.5 代码目录
+
+| 路径 | 作用 |
+|---|---|
+| `saddlellm/cli.py` | 命令行参数和命令分发 |
+| `saddlellm/training/TrainingOrchestrator.py` | 解析配置、校验并执行阶段 |
+| `saddlellm/framework/stages.py` | 阶段注册表和阶段能力声明 |
+| `saddlellm/training/` | 预训练、SFT、偏好训练和分布式运行 |
+| `saddlellm/data/` | 数据采集、清洗、规范化和检查 |
+| `saddlellm/models/` | 模型结构、构建、加载和 tokenizer |
+| `saddlellm/multimodal/` | 图像、音频、视频、VLM 和 VLA |
+| `saddlellm/world_models/` | RSSM 数据、模型、训练和推理 |
+| `saddlellm/spatial/` | 空间感知、路径规划、眼动控制和 WorldAgent |
+| `saddlellm/evaluation/` | 评测、冒烟测试和发布门禁 |
+| `saddlellm/runtime/` | 模型导出、服务和部署 |
+| `configs/` | 可以直接参考的配置文件 |
+| `tests/` | 行为和接口测试 |
+
+## 2. 怎么使用、命令做什么、返回什么
+
+### 2.1 安装
+
+建议使用独立虚拟环境：
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -e ".[posttrain,dev]"
 ```
 
-后训练建议使用仓库已验证的固定依赖栈，避免 Transformers、TRL 与 PEFT 的接口错配：
+按功能安装可选依赖：
+
+| 需求 | 安装命令 |
+|---|---|
+| 通用训练 | `python -m pip install -e ".[train]"` |
+| SFT、PEFT、TRL | `python -m pip install -e ".[posttrain]"` |
+| QLoRA | `python -m pip install -e ".[posttrain,qlora]"` |
+| 推理 API | `python -m pip install -e ".[serve]"` |
+| 空间智能与眼动控制 | `python -m pip install -e ".[spatial]"` |
+| 开发和测试 | `python -m pip install -e ".[dev]"` |
+
+如果要严格使用仓库验证过的后训练版本：
 
 ```powershell
-python -m venv .venv-posttrain
-.venv-posttrain\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-# 先按机器的 CUDA/CPU 环境安装合适的 PyTorch
 python -m pip install -r requirements-posttrain.txt
-python -m pip install -e .
-saddle-llm doctor
 ```
 
-`doctor` 的 `post_training.compatible` 为 `true` 后，再启动 SFT/DPO/KTO。QLoRA 还要求可用的 CUDA 与 bitsandbytes；普通 LoRA 可设置 `qlora: false`、`lora: true`。
-
-验证安装：
+安装完成后确认命令可见：
 
 ```powershell
-python -c "import saddle_llm; print(saddle_llm.__version__)"
 saddle-llm --help
 ```
 
-如果不安装 console script，也可以使用：
+也可以不用 console script：
 
 ```powershell
-python -m saddle_llm.cli --help
+python -m saddlellm.cli --help
 ```
 
-## 最短上手流程
+### 2.2 第一次运行
 
-### 1. 检查环境
+创建一个 10 步 LoRA SFT 小项目：
+
+```powershell
+saddle-llm quickstart ".\my-training"
+```
+
+生成的目录：
+
+```text
+my-training/
+├─ config.yaml
+├─ README.md
+└─ data/
+   └─ sft.jsonl
+```
+
+命令返回 JSON，主要字段如下：
+
+```json
+{
+  "workspace": "绝对路径/my-training",
+  "config": "绝对路径/my-training/config.yaml",
+  "stages": ["sft"],
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "data_files": {"sft": "绝对路径/my-training/data/sft.jsonl"},
+  "created_files": ["..."],
+  "next_steps": ["..."],
+  "note": "..."
+}
+```
+
+进入目录后依次执行：
+
+```powershell
+Set-Location ".\my-training"
+saddle-llm doctor
+saddle-llm inspect-data data/sft.jsonl --task sft
+saddle-llm validate-config config.yaml
+saddle-llm train config.yaml --dry-run
+saddle-llm train config.yaml
+```
+
+创建“SFT 后接 DPO”的项目：
+
+```powershell
+saddle-llm quickstart ".\my-training" --stages sft,preference --preference-method dpo
+```
+
+使用自己的数据和模型：
+
+```powershell
+saddle-llm quickstart ".\my-training" --model "D:\models\my-model" --data "D:\datasets\sft.jsonl"
+```
+
+`quickstart` 不会下载模型，也不会开始训练。它只创建配置、示例数据和下一步命令。目标文件已存在时默认拒绝覆盖；`--force` 只覆盖它负责生成的文件。
+
+### 2.3 训练配置怎么写
+
+一个可直接运行的 SFT 配置：
+
+```yaml
+project: saddlellm
+experiment: my-sft
+stages: [sft]
+
+model:
+  name_or_path: Qwen/Qwen2.5-0.5B-Instruct
+  tokenizer: Qwen/Qwen2.5-0.5B-Instruct
+  backend: hf
+
+sft:
+  enabled: true
+  data_path: data/sft.jsonl
+  use_lora: true
+  use_qlora: false
+  epochs: 1
+  learning_rate: 0.0002
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_seq_length: 1024
+  warmup_steps: 0
+  save_steps: 50
+
+training:
+  max_steps: 100
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  bf16: false
+  fp16: false
+
+logging:
+  output_dir: outputs/my-sft
+  backend: local
+```
+
+顶层字段的职责：
+
+| 字段 | 作用 |
+|---|---|
+| `project` | 项目名，用于记录 |
+| `experiment` | 本次实验名 |
+| `stages` | 要执行的阶段；必须是非空、无重复的字符串列表 |
+| `model` | 模型路径、tokenizer 和后端 |
+| `data` | 预训练使用的数据源和清洗参数 |
+| `training` | 全局步数、预训练超参数、checkpoint、恢复和 dry-run 设置 |
+| `distributed` | 单机或分布式策略、GPU 数和精度 |
+| `logging` | 总输出目录和日志后端 |
+| `pipeline` | 可选的依赖关系和阶段级恢复设置 |
+| 与阶段同名的块 | 该阶段自己的数据、方法和超参数 |
+
+推荐显式写出阶段开关：
+
+```yaml
+stages: [sft, preference, eval]
+
+sft:
+  enabled: true
+
+preference:
+  enabled: true
+  method: dpo
+
+eval:
+  enabled: true
+```
+
+`stages` 决定系统是否调度该阶段；对带 `enabled` 开关的阶段，该开关决定收到调度后是否工作。最不容易出错的写法是：把 `sft`、`preference`、`eval` 等列入 `stages` 时，其配置块同时写 `enabled: true`。
+
+文本后训练方法：
+
+| 方式 | 配置 |
+|---|---|
+| 全参数训练 | `use_lora: false`，`use_qlora: false` |
+| LoRA | `use_lora: true`，`use_qlora: false` |
+| QLoRA | `use_lora: true`，`use_qlora: true` |
+
+`training.max_steps` 的含义：
+
+- 大于 0：最多运行指定步数。
+- 等于 `-1`：由阶段自己的 `epochs` 决定训练长度。
+- 等于 0 或小于 `-1`：配置无效。
+
+对于 `train` 使用的训练配置，相对路径按运行命令时的当前目录解释。为了避免路径错误，建议在仓库根目录运行仓库内的示例，或在 quickstart 目录内运行生成的配置。
+
+### 2.4 推荐的使用顺序
+
+#### 第一步：检查环境
 
 ```powershell
 saddle-llm doctor
-saddle-llm doctor --output build\doctor_report.json
 ```
 
-### 2. 运行内置 smoke test
+检查 Python、PyTorch、Transformers、Datasets、Accelerate、PEFT、TRL、CUDA、GPU、内存和磁盘。
+
+主要返回：
+
+```json
+{
+  "ready": true,
+  "python_version": "...",
+  "cuda_available": true,
+  "gpu_count": 1,
+  "gpu_memory_gb": 20.0,
+  "packages": {},
+  "issues": [],
+  "recommendations": []
+}
+```
+
+`ready: false` 时看 `issues`。没有 GPU 会被标记为问题，但极小的 CPU 测试仍可能运行。
+
+#### 第二步：检查数据
+
+SFT：
 
 ```powershell
-saddle-llm smoke-test --in-process --skip-doctor `
-  --work-dir build\smoke_e2e_fast
+saddle-llm inspect-data data/sft.jsonl --task sft
 ```
 
-该命令会创建本地 tiny 模型并真实执行一小步 SFT、VLA、DPO、ORPO 和 KTO；不是只做导入检查。
-
-只检查 fixture、数据和配置，不执行训练：
+DPO/ORPO：
 
 ```powershell
-saddle-llm smoke-test --skip-training
+saddle-llm inspect-data data/preference.jsonl --task dpo
 ```
 
-### 3. 检查训练数据
+KTO：
 
 ```powershell
-saddle-llm inspect-data data\posttrain_sft_example.jsonl --task sft
-saddle-llm inspect-data data\posttrain_preference_example.jsonl --task dpo
-saddle-llm inspect-data data\posttrain_kto_example.jsonl --task kto
+saddle-llm inspect-data data/kto.jsonl --task kto
 ```
 
-### 4. 检查并编译配置
+返回 `ready`、样本数、字段格式、文本长度、重复样本和阻断问题。数据不合格时退出码为 1。
 
-仓库提供了以下模板：
+#### 第三步：检查配置
 
-- `configs/sft_lora.yaml`
-- `configs/dpo_qlora.yaml`
-- `configs/preflight.yaml`
-- `configs/vla_sft.yaml`
-- `configs/mopd_sft.yaml`
-- `configs/posttrain_simple_flow.yaml`
-- `configs/posttrain_release_flow.yaml`
-- `configs/world_model.yaml`
-- `configs/world_model_categorical.yaml`
+```powershell
+saddle-llm validate-config config.yaml
+```
 
-### 极简后训练流程配置
+返回：
 
-SaddleLLM 已支持“极简主配置 + 可选覆盖”。普通后训练不需要手动填写阶段 ID、依赖关系和启用开关，只需选择流程并提供对应数据：
+```json
+{
+  "valid": true,
+  "stages": ["sft"],
+  "issues": [],
+  "warnings": [],
+  "data_inspections": {},
+  "training_estimates": {},
+  "normalized_config": {},
+  "config_path": "config.yaml"
+}
+```
 
-仓库中的三份 `posttrain_*_example.jsonl` 仅用于格式验证和 smoke test，正式训练必须替换为经过清洗、去重和划分的数据集。
+它会检查阶段名、必填数据、模型后端、训练步数、精度冲突、分布式能力、动作空间和发布门禁等。只检查结构、不打开本地数据时使用：
+
+```powershell
+saddle-llm validate-config config.yaml --skip-data-inspection
+```
+
+#### 第四步：查看执行顺序
+
+```powershell
+saddle-llm train config.yaml --dry-run
+```
+
+返回 `stages`、`pipeline_plan`、`distributed` 和数据源数量。这个参数不会加载模型或训练，只展示调度顺序；完整数据检查仍应使用 `validate-config`。
+
+#### 第五步：正式训练
+
+```powershell
+saddle-llm train config.yaml
+```
+
+成功时返回：
+
+```json
+{
+  "ok": true,
+  "command": "train",
+  "config": "config.yaml",
+  "results": {
+    "sft": {
+      "status": "completed",
+      "model_path": "outputs/my-sft/sft_checkpoints"
+    }
+  }
+}
+```
+
+失败时返回 `ok: false`、异常类型和错误信息，并以退出码 1 结束。需要完整 Python 堆栈时：
+
+```powershell
+saddle-llm train config.yaml --debug
+```
+
+### 2.5 基础命令
+
+| 命令 | 做什么 | 最小用法 | 主要结果 |
+|---|---|---|---|
+| `quickstart` | 创建入门训练目录 | `saddle-llm quickstart .\demo` | `config.yaml`、样例数据、下一步命令 |
+| `doctor` | 检查环境和依赖 | `saddle-llm doctor` | `ready`、硬件、依赖、问题和建议 |
+| `inspect-data` | 检查 SFT/偏好/RL 数据 | `saddle-llm inspect-data data.jsonl --task sft` | 数据质量报告 |
+| `inspect-vla` | 检查 VLA 轨迹、图像和动作维度 | `saddle-llm inspect-vla robot.jsonl --image-root images` | VLA 数据报告 |
+| `validate-config` | 静态校验训练配置 | `saddle-llm validate-config config.yaml` | `valid`、问题、警告和训练量估算 |
+| `train` | 执行训练配置 | `saddle-llm train config.yaml` | 各阶段结果和输出路径 |
+| `plan` | 生成启动命令，不训练 | `saddle-llm plan config.yaml` | `launch_plan.json` 和 `launch.ps1` |
+| `preflight` | 针对一个后训练任务检查数据并生成计划 | `saddle-llm preflight data.jsonl --stage sft` | `preflight_plan.json`、`config.json`、阻断项和估算 |
+| `plugins` | 列出内置和已安装的阶段 | `saddle-llm plugins` | 阶段名称、来源和加载状态 |
+| `smoke-test` | 用本地 tiny 模型检查训练主链 | `saddle-llm smoke-test --in-process` | SFT、VLA、DPO、ORPO、KTO 等测试结果 |
+| `import-data` | 导入数据 manifest | `saddle-llm import-data dataset_info.json` | 保存位置、数据摘要和导入数量 |
+
+`plan` 根据 `distributed.strategy` 生成启动文件。它不执行训练：
+
+```powershell
+saddle-llm plan configs/sft_lora.yaml
+.\configs\launch.ps1
+```
+
+`preflight` 一次只检查一个后训练任务，所以参数使用单数 `--stage`。真正的训练配置仍使用复数 `stages`：
+
+```powershell
+saddle-llm preflight data/posttrain_sft_example.jsonl --stage sft --root-dir .\llm_factory
+```
+
+### 2.6 媒体和生成命令
+
+这些命令用于单独执行某个工具；它们的参数文件只是该命令的输入，不是 `train` 使用的训练配置。
+
+| 命令 | 做什么 | 最小用法 | 主要结果 |
+|---|---|---|---|
+| `media-codecs` | 查看已注册的图像、音频或视频编码器 | `saddle-llm media-codecs --modality image` | Codec 名称、模态和能力 |
+| `build-media-cache` | 把原始媒体清单编码成可恢复分片 | `saddle-llm build-media-cache configs/media_cache_image.yaml` | cache manifest、分片路径和样本统计 |
+
+同样的媒体处理也可以放入主训练配置：
 
 ```yaml
-name: qwen-domain-v1
-model: Qwen/Qwen3-4B
-flow: sft+dpo
-
-data:
-  sft: data/posttrain_sft_example.jsonl
-  preference: data/posttrain_preference_example.jsonl
-
-output: outputs/qwen-domain-v1
+stages: [media_cache, image_generation]
 ```
 
-系统根据 `flow` 自动展开为：
+完整示例见 [raw_image_to_training.yaml](configs/raw_image_to_training.yaml)。
+
+### 2.7 世界模型和眼动控制命令
+
+| 命令 | 做什么 | 最小用法 | 主要结果 |
+|---|---|---|---|
+| `world-model-backends` | 查看 RSSM 后端 | `saddle-llm world-model-backends` | 可用后端及能力 |
+| `train-world-model` | 单独训练世界模型 | `saddle-llm train-world-model configs/world_model.yaml --dry-run` | 推断出的维度、训练计划；去掉 `--dry-run` 后返回 checkpoint 信息 |
+| `infer-world-model` | 从 checkpoint 做 rollout 或动作规划 | `saddle-llm infer-world-model CHECKPOINT request.json` | 预测轨迹、奖励或候选动作 |
+| `build-eye-control-data` | 生成安全过滤后的双轴眼动轨迹 | `saddle-llm build-eye-control-data --episodes 128` | JSONL 数据路径和生成统计 |
+| `simulate-eye-control` | 在软件仿真器评估 PID 或 RSSM+CEM | `saddle-llm simulate-eye-control --config configs/prosthetic_eye_runtime.yaml` | 跟踪误差、安全事件和控制统计 |
+
+世界模型也能作为主训练阶段运行：
+
+```powershell
+saddle-llm train configs/world_model_stage.yaml
+```
+
+世界模型训练后立即做眼动控制评估：
+
+```powershell
+saddle-llm train configs/prosthetic_eye_control.yaml
+```
+
+### 2.8 空间智能和 WorldAgent 命令
+
+| 命令 | 做什么 | 最小用法 | 主要结果 |
+|---|---|---|---|
+| `build-spatial-world-data` | 从俯视图生成空间世界模型轨迹 | `saddle-llm build-spatial-world-data map.png --output data/spatial.jsonl` | 轨迹数据和生成统计 |
+| `evaluate-spatial-world-model` | 评估多步占用、运动和碰撞预测 | `saddle-llm evaluate-spatial-world-model CHECKPOINT data.jsonl` | 分项评测指标 |
+| `plan-spatial-route` | 从地图提取占用网格并规划 Top-K 路线 | `saddle-llm plan-spatial-route map.png --start 10,20 --goal 300,200` | 路线 JSON、HTML 和 PNG |
+| `spatial-studio` | 启动可视化空间工作台 | `saddle-llm spatial-studio` | 前台 HTTP 服务，默认端口 7865 |
+| `world-agent-run` | 一次执行分析、规划和仿真 | `saddle-llm world-agent-run map.png --start 10,20 --goal 300,200` | 状态、候选路线、仿真和产物路径 |
+| `world-agent-api` | 启动无界面的 WorldAgent API | `saddle-llm world-agent-api` | 前台 HTTP 服务，默认端口 7866 |
+
+`spatial-studio`、`world-agent-api` 和 `serve-model` 是持续运行的服务命令，不会像普通命令一样立即返回。按 `Ctrl+C` 停止。
+
+### 2.9 评测、发布和服务命令
+
+| 命令 | 做什么 | 最小用法 | 主要结果 |
+|---|---|---|---|
+| `report` | 汇总一个训练输出目录 | `saddle-llm report outputs/my-run` | 预训练/运行报告 |
+| `export-model` | 把 checkpoint 或 adapter 打包成可验证发布目录 | `saddle-llm export-model CHECKPOINT outputs/release` | 模型文件、manifest、可选权重哈希和门禁信息 |
+| `serve-model` | 启动 OpenAI 兼容推理 API | `saddle-llm serve-model outputs/release` | `/v1/models`、`/v1/chat/completions`、`/v1/completions` |
+
+要求发布门禁通过后才导出：
+
+```powershell
+saddle-llm export-model CHECKPOINT outputs/release --gate-result outputs/run/release_gate.json --require-gate
+```
+
+启动本地推理服务：
+
+```powershell
+saddle-llm serve-model outputs/release --host 127.0.0.1 --port 8000
+```
+
+如果需要 Bearer Token，不要把密钥直接写进命令：
+
+```powershell
+$env:SADDLE_API_KEY = "your-secret"
+saddle-llm serve-model outputs/release --api-key-env SADDLE_API_KEY
+```
+
+### 2.10 Python 调用
+
+直接运行配置：
+
+```python
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
+
+runner = TrainingOrchestrator.from_yaml("config.yaml")
+results = runner.run()
+print(results)
+```
+
+从字典运行：
+
+```python
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
+
+config = {
+    "stages": ["sft"],
+    "model": {
+        "backend": "hf",
+        "name_or_path": "Qwen/Qwen2.5-0.5B-Instruct",
+    },
+    "sft": {
+        "enabled": True,
+        "data_path": "data/sft.jsonl",
+        "use_lora": True,
+        "use_qlora": False,
+    },
+    "training": {"max_steps": 10},
+    "distributed": {"strategy": "single", "bf16": False},
+    "logging": {"output_dir": "outputs/python-run"},
+}
+
+results = TrainingOrchestrator.from_dict(config).run()
+```
+
+只做静态校验：
+
+```python
+import yaml
+from saddlellm.training.TrainingConfigValidator import TrainingConfigValidator
+
+with open("config.yaml", encoding="utf-8") as handle:
+    config = yaml.safe_load(handle)
+
+report = TrainingConfigValidator.validate(config)
+print(report.to_dict())
+```
+
+### 2.11 返回状态和输出目录
+
+阶段结果中的常见 `status`：
+
+| 状态 | 含义 |
+|---|---|
+| `completed`、`trained` | 已实际执行成功 |
+| `planned` | 只生成计划，没有训练 |
+| `planned_no_data` | 缺少数据，只保存计划 |
+| `planned_unsupported` | 已识别，但真实执行尚未接入 |
+| `skipped` | 阶段被关闭 |
+| `rejected` | 评测门禁未通过 |
+| `blocked` | 因上游条件不满足而阻止执行 |
+| `failed` | 执行失败 |
+
+典型输出目录：
 
 ```text
-数据检查 → SFT → DPO → 标准评测 → 发布门禁 → HF 发布包
+outputs/my-run/
+├─ plans/
+│  ├─ sft_plan.json
+│  ├─ preference_plan.json
+│  └─ export_plan.json
+├─ sft_checkpoints/
+├─ preference_checkpoints/
+├─ final_model/
+├─ release/
+├─ pipeline_state.json
+├─ release_gate.json
+├─ summary.json
+└─ training_summary.json
 ```
 
-当前可直接执行的流程包括：
+不同 `stages` 只生成与自己有关的目录。`summary.json` 和 `training_summary.json` 记录执行顺序、耗时、各阶段结果和产物。
 
-- `sft`：数据检查、SFT 和默认评测；
-- `sft+dpo`：SFT 后执行成对偏好优化；
-- `sft+kto`：SFT 后执行正负反馈优化；
-- `dpo` / `kto`：从已有模型直接执行偏好优化；
-- `eval`：只评测已有 checkpoint；
-- `export`：把已有 checkpoint 或 LoRA adapter 导出为 HF 发布包；
-- `full`：展开为 `sft+dpo+eval+export`，也可通过 `alignment: kto` 改用 KTO。
+## 3. 原理、代码逻辑和训练过程
 
-`serve` 是独立的常驻命令，不放进训练 `flow`；训练完成后使用 `serve-model` 启动。`grpo` 的极简流程简写仍在规划中，当前 CLI 会明确拒绝未接入的阶段。原有 Orchestrator 中的 ORPO 仍可使用完整配置运行。
+### 3.1 一条命令进入系统后发生什么
 
-需要调整常用参数时再增加对应配置块：
+执行：
+
+```powershell
+saddle-llm train config.yaml
+```
+
+内部顺序：
+
+```text
+cli.py
+  1. 读取 YAML/JSON
+  2. 检查顶层 stages 是非空、无重复的字符串列表
+        ↓
+TrainingOrchestrator._parse_config()
+  3. 把 model、training、distributed 和各阶段参数解析成配置对象
+        ↓
+StageRegistry
+  4. 确认每个阶段有对应实现，并读取它的能力限制
+        ↓
+PipelinePlan
+  5. 确定执行顺序和依赖关系
+        ↓
+TrainingOrchestrator._validate_config()
+  6. 在模型加载前检查数据、后端、精度、分布式和阶段组合
+        ↓
+TrainingOrchestrator.run()
+  7. 逐个执行阶段，保存状态和产物
+        ↓
+summary.json + 命令行 JSON
+```
+
+CLI 只负责读取参数和展示结果。真正的训练入口位于 `TrainingOrchestrator`，具体数学计算由各 Trainer 完成。
+
+### 3.2 阶段如何排序
+
+默认按 `stages` 的书写顺序执行：
 
 ```yaml
-name: qwen-domain-v1
-model: Qwen/Qwen3-4B
-flow: sft+kto
+stages: [sft, preference, eval, export]
+```
+
+顺序就是：
+
+```text
+sft → preference → eval → export
+```
+
+存在独立分支时可以显式声明依赖：
+
+```yaml
+stages: [sft, world_model, preference, eval, export]
+
+pipeline:
+  dependencies:
+    sft: []
+    world_model: []
+    preference: [sft]
+    eval: [preference, world_model]
+    export: [eval]
+```
+
+此时 `sft` 与 `world_model` 没有相互依赖；`eval` 必须等待两条分支完成。系统会检查不存在的依赖、重复阶段和依赖环。
+
+简单任务不需要写 `pipeline.dependencies`。
+
+### 3.3 阶段之间怎样交接
+
+文本模型主链：
+
+```text
+model.name_or_path
+        │
+        ├───────────────┐
+        ▼               │
+     pretrain           │
+        │ model_path    │
+        ▼               │
+       sft ◄────────────┘
+        │ model_path
+        ▼
+ preference / rlhf
+        │ model_path
+        ▼
+       eval
+        │ metrics + release_gate
+        ▼
+      export
+```
+
+后一个阶段优先使用前一个阶段返回的 `model_path`。没有上游模型时，才使用 `model.name_or_path`。
+
+数据产物也可以交接：
+
+```text
+mopd 产生 on-policy JSONL → sft.data_path 为空时由 SFT 使用
+media_cache 产生编码分片 → image/music/video generation 使用
+world_model 产生 checkpoint → eye_control 使用
+```
+
+每个阶段返回一个普通字典。系统把结果保存在阶段结果表中，同时登记可追踪产物。
+
+### 3.4 预训练逻辑
+
+`pretrain` 有三种启动方式：
+
+| 方式 | 关键配置 | 含义 |
+|---|---|---|
+| 从零训练 | `pretrain_mode: scratch` | 从内置模型规格或 `model.blueprint` 创建新模型 |
+| 继续预训练 | `pretrain_mode: continue` + `model.name_or_path` | 载入已有权重，以新的优化任务继续训练 |
+| 精确恢复 | `training.resume_from_checkpoint` | 在支持的 Trainer 中恢复优化器、调度器和训练步数 |
+
+实际过程：
+
+1. 解析模型规格或 blueprint。
+2. 创建新模型，或加载已有模型/checkpoint。
+3. 加载已有 tokenizer，或使用上游 `tokenizer` 阶段的结果。
+4. 从 `data.sources` 收集数据。
+5. 清洗、去重、质量过滤、tokenize 和 sequence packing。
+6. 创建 Hugging Face `Trainer` 或原生 `SaddleTrainer`。
+7. 执行 causal language modeling。
+8. 保存 `final_model`、tokenizer 和 Trainer state。
+
+最小结构：
+
+```yaml
+stages: [pretrain]
+pretrain_mode: scratch
+
+model:
+  backend: saddle
+  config: qwen-tiny-160m
+  tokenizer: Qwen/Qwen2.5-0.5B
 
 data:
-  sft: data/posttrain_sft_example.jsonl
-  preference: data/posttrain_kto_example.jsonl
+  sources:
+    - type: local
+      path: data/pretrain.jsonl
+      text_column: text
+      streaming: false
 
-train:
-  qlora: true
-  epochs: 2
-  batch_size: 4
+training:
+  max_steps: 1000
 
-kto:
-  beta: 0.1
-  batch_size: 2
+distributed:
+  strategy: single
 
-evaluation:
-  suite: standard
-  fail_on_error: true
-
-output: outputs/qwen-domain-v1
+logging:
+  output_dir: outputs/pretrain
 ```
 
-低频参数统一放入 `advanced`，使日常配置保持简洁：
+完整原生模型结构示例见 [modular_llm.yaml](configs/modular_llm.yaml)。
+
+### 3.5 SFT 逻辑
+
+`sft` 用“输入指令 → 目标回答”训练模型遵循任务要求。
+
+支持的数据形式包括：
+
+```json
+{"instruction":"概括下面内容","input":"待处理文本","output":"目标回答"}
+```
+
+以及 messages：
+
+```json
+{"messages":[{"role":"user","content":"问题"},{"role":"assistant","content":"目标回答"}]}
+```
+
+执行过程：
+
+1. 从上游 `pretrain` 或 `model.name_or_path` 找到模型。
+2. 检查数据字段、空文本、重复样本和长度。
+3. 生成 `plans/sft_plan.json`。
+4. 根据 `use_lora/use_qlora` 选择全参数、LoRA 或 QLoRA。
+5. HF 后端调用 `PeftSFTTrainer`；Saddle 后端调用原生 SFT。
+6. 保存 `sft_checkpoints`，并返回新的 `model_path`。
+
+示例见 [sft_lora.yaml](configs/sft_lora.yaml)。
+
+### 3.6 偏好训练逻辑
+
+`preference` 用于让模型在多个回答之间学习偏好。
+
+| 方法 | 数据 | 作用 |
+|---|---|---|
+| DPO | `prompt/chosen/rejected` | 直接提高 chosen 相对 rejected 的概率 |
+| ORPO | `prompt/chosen/rejected` | 将监督目标和偏好比率目标结合 |
+| KTO | `prompt/completion/label` | 用可取/不可取标签学习偏好；实际 batch 必须大于 1 |
+
+DPO/ORPO 数据：
+
+```json
+{"prompt":"怎样排错？","chosen":"先看日志并构造最小复现。","rejected":"直接忽略错误。"}
+```
+
+KTO 数据：
+
+```json
+{"prompt":"怎样排错？","completion":"先看日志。","label":true}
+```
+
+执行过程：
+
+1. 优先取得 SFT 输出，其次使用预训练输出或基础模型。
+2. 按选定方法检查数据。
+3. 写入 `plans/preference_plan.json`。
+4. 调用对应 DPO、ORPO 或 KTO Trainer。
+5. 保存 `preference_checkpoints`，供评测或导出使用。
+
+示例见 [posttrain.yaml](configs/posttrain.yaml) 和 [dpo_qlora.yaml](configs/dpo_qlora.yaml)。
+
+`rlhf` 阶段当前可实际执行的稳定路径也是 DPO。PPO 需要 reward model 和在线 rollout 接线，目前会明确返回 `planned_unsupported`；需要离线偏好训练时直接使用 `preference` 更清楚。
+
+### 3.7 MOPD 蒸馏逻辑
+
+`mopd` 的目标是先让当前学生模型生成回答，再让一个或多个教师评价或重写，最后形成新的 SFT 数据。
+
+```text
+prompts
+  → 学生生成候选
+  → 教师评分/聚合
+  → mopd_on_policy.jsonl
+  → 可选后续 sft
+```
+
+`mopd.dry_run: true` 只写计划。设置为 `false` 且提供 prompts、教师和可用模型时才收集数据。
+
+示例见 [mopd_sft.yaml](configs/mopd_sft.yaml)。
+
+### 3.8 多模态和 VLA 逻辑
+
+`vla_sft` 处理“图像/指令/机器人动作”轨迹：
+
+1. 创建并校验动作空间，包括维度、连续/离散类型、范围、夹爪和控制频率。
+2. 检查图像路径、动作维度和 episode step 连续性。
+3. 规范化为训练 JSONL。
+4. 总是保存动作空间和训练计划。
+5. 只有 `vla.train: true` 时才调用 `VLATrainer` 做行为克隆训练。
+
+示例见 [vla_sft.yaml](configs/vla_sft.yaml)。该示例默认 `train: false`，因此只做规范化和计划。
+
+`mllm_sft` 和 `vision_alignment` 当前只完成图文数据规范化与计划保存，不应把返回的 `planned` 当作模型已经训练。
+
+### 3.9 图像、音乐和视频生成逻辑
+
+生成训练分为两步：
+
+```text
+原始媒体 + 文本
+       ↓
+media_cache：Codec 编码媒体，文本编码器生成 condition
+       ↓
+NPZ/分片缓存
+       ↓
+image_generation / music_generation / video_generation
+       ↓
+模型 checkpoint
+```
+
+- 图像：读取 `latents[N,C,H,W]` 和 `conditions[N,D]`。
+- 音乐：读取 `codes[N,Q,T]`、`conditions[N,D]` 和可选 mask。
+- 视频：读取 `video_latents[N,C,T,H,W]` 和 `conditions[N,D]`。
+
+训练前会从缓存推断模型维度，并拒绝与手工配置不一致的通道数、码本数或条件维度。
+
+示例：
+
+- [raw_image_to_training.yaml](configs/raw_image_to_training.yaml)
+- [music_generation.yaml](configs/music_generation.yaml)
+- [video_generation.yaml](configs/video_generation.yaml)
+
+### 3.10 世界模型和控制逻辑
+
+`world_model` 从离线轨迹学习：
+
+```text
+当前观测 + 动作
+      ↓
+隐状态更新
+      ↓
+下一观测、奖励和 continuation 预测
+```
+
+数据通常包含 observation、action、reward 和 done。`rssm` 使用连续随机状态；`categorical_rssm` 使用离散类别状态。训练结果可用于 rollout、候选动作评分和空间控制。
+
+`eye_control` 不直接驱动硬件。它在软件 plant 中应用角度、速度、加速度、电流和温度限制，然后比较 PID 或 RSSM+CEM 控制效果。真实硬件仍需要单独实现安全驱动适配器。
+
+示例：
+
+- [world_model_stage.yaml](configs/world_model_stage.yaml)
+- [prosthetic_eye_control.yaml](configs/prosthetic_eye_control.yaml)
+- [unified_model_posttrain_world.yaml](configs/unified_model_posttrain_world.yaml)
+
+### 3.11 评测和导出逻辑
+
+`eval` 的模型选择顺序：
+
+```text
+rlhf 输出
+  → preference 输出
+  → sft 输出
+  → pretrain 输出
+  → model.name_or_path
+```
+
+评测成功后可生成 `release_gate.json`。例如要求 perplexity 不超过阈值：
 
 ```yaml
-advanced:
-  gradient_accumulation_steps: 8
-  max_sequence_length: 4096
-  trust_remote_code: false
-  resume: true
-```
-
-流程编译器会推导 SFT/偏好/评测依赖、应用默认参数，并在 `validate-config` 和真实训练前检查数据格式。`resume` 默认为 `false`；只有显式设为 `true` 或 checkpoint 路径时才续训。`plan` 或 `train --compiled-output` 会保存标准 Orchestrator 配置，便于审计和复现。
-
-```powershell
-saddle-llm validate-config configs\posttrain_simple_flow.yaml
-saddle-llm plan configs\posttrain_simple_flow.yaml
-saddle-llm train configs\posttrain_simple_flow.yaml --dry-run
-saddle-llm train configs\posttrain_simple_flow.yaml
-```
-
-### 5. Dry-run 和训练
-
-```powershell
-saddle-llm train configs\sft_lora.yaml --dry-run
-saddle-llm train configs\sft_lora.yaml
-```
-
-## 后训练功能与使用方法
-
-### 当前可用功能
-
-| 功能 | 状态 | 推荐入口 | 作用 |
-| --- | --- | --- | --- |
-| 环境诊断 | 可用 | `doctor` | 检查 CUDA、显存、PyTorch 及后训练依赖兼容性 |
-| 数据检查 | 可用 | `inspect-data` | 检查格式、可用样本、重复项和无效偏好对 |
-| 数据规范化 | 可用 | Python API | 将 Alpaca、Messages、ShareGPT 和常见偏好格式转为统一 JSONL |
-| 静态预检 | 可用 | `preflight` | 不加载模型，生成数据报告、训练估算和 Orchestrator 配置 |
-| 极简流程编译 | 可用 | `validate-config` / `plan` | 将 `flow` 配置展开成可审计的标准配置和启动脚本 |
-| SFT | 可用 | `flow: sft` | 支持 Full、LoRA 和 QLoRA |
-| DPO | 可用 | `flow: dpo` / `sft+dpo` | 使用 chosen/rejected 偏好对训练 |
-| KTO | 可用 | `flow: kto` / `sft+kto` | 使用正负反馈标签训练 |
-| ORPO | 可用 | 完整 Recipe/Orchestrator 配置 | 尚未加入极简 `flow` 简写 |
-| 困惑度评测 | 可用 | `flow: eval` 或 `evaluation` | 可使用本地文件或 Hugging Face 数据集 |
-| 评测发布门禁 | 可用 | `evaluation.gate` | 按指标 `min/max` 阈值决定模型能否发布 |
-| HF 模型导出 | 可用 | `flow: export` / `export-model` | 合并 LoRA、校验权重并生成发布清单与文件指纹 |
-| OpenAI-compatible API | 可用 | `serve-model` | 提供健康检查、模型列表、Chat Completions 与 Completions |
-| 断点恢复 | 可用 | `advanced.resume` | 从各阶段已有 checkpoint 继续训练 |
-| 真实微型回归 | 可用 | `smoke-test` | 一步跑通 SFT、VLA、DPO、ORPO 和 KTO |
-
-### 选择 Full、LoRA 或 QLoRA
-
-| 方式 | `lora` | `qlora` | 特点 |
-| --- | ---: | ---: | --- |
-| Full fine-tuning | `false` | `false` | 更新全部参数，显存和磁盘开销最大 |
-| LoRA | `true` | `false` | 更新适配器，兼容性好，适合常规单卡训练 |
-| QLoRA | `true` | `true` | 4-bit 基座加 LoRA，显存更省，需要 CUDA 和 bitsandbytes |
-
-配置示例：
-
-```yaml
-train:
-  lora: true
-  qlora: false
-  epochs: 2
-  batch_size: 1
-  learning_rate: 0.0002
-  max_steps: -1
-```
-
-`max_steps: -1` 表示按 `epochs` 训练；设置为正数后以 step 数为准。QLoRA 条件不满足时会直接报出可操作的错误，不会静默退化成普通 LoRA。
-
-### 推荐的完整 CLI 顺序
-
-```powershell
-# 1. 检查运行环境
-saddle-llm doctor --output build\doctor_report.json
-
-# 2. 检查实际训练数据
-saddle-llm inspect-data data\posttrain_sft_example.jsonl --task sft
-saddle-llm inspect-data data\posttrain_preference_example.jsonl --task dpo
-
-# 3. 可选：不加载模型的资源与数据预检
-saddle-llm preflight data\posttrain_sft_example.jsonl `
-  --stage sft --method qlora --base-model Qwen/Qwen3-4B `
-  --root-dir build\preflight_sft
-
-# 4. 编译并严格验证极简配置；默认同时检查本地数据
-saddle-llm validate-config configs\posttrain_simple_flow.yaml `
-  --output build\posttrain_validation.json
-
-# 5. 生成标准配置、启动计划和 PowerShell 启动脚本
-saddle-llm plan configs\posttrain_simple_flow.yaml `
-  --output build\posttrain_compiled.yaml `
-  --launch-plan build\posttrain_launch_plan.json `
-  --launch-script build\posttrain_launch.ps1
-
-# 6. 只编译和展示阶段，不下载模型、不训练
-saddle-llm train configs\posttrain_simple_flow.yaml --dry-run `
-  --compiled-output build\posttrain_compiled.yaml
-
-# 7. 正式训练；失败时 --debug 可显示完整 traceback
-saddle-llm train configs\posttrain_simple_flow.yaml `
-  --compiled-output build\posttrain_compiled.yaml --debug
-```
-
-`validate-config` 失败时不要启动训练。`plan` 只生成产物，不会训练；真正执行入口是 `train` 或生成的 `posttrain_launch.ps1`。
-
-### 极简配置常用字段
-
-| 配置块 | 常用字段 | 说明 |
-| --- | --- | --- |
-| 顶层 | `name`、`model`、`flow`、`seed`、`output` | 实验名、基座、阶段组合和输出目录 |
-| `data` | `sft`、`preference` | SFT 与 DPO/KTO 数据路径 |
-| `train` | `lora`、`qlora`、`epochs`、`max_steps`、`batch_size`、`learning_rate` | 通用训练参数 |
-| `dpo` / `kto` | `beta`、`learning_rate`、`epochs`、`batch_size` | 偏好阶段覆盖参数 |
-| `evaluation` | `enabled`、`suite`、`dataset`、`max_samples`、`fail_on_error`、`gate` | 训练后评测与发布阈值 |
-| `export` | `output_dir`、`format`、`merge_lora`、`require_gate`、`hash_weights`、`overwrite` | HF 或原生 Saddle 发布包配置 |
-| `advanced` | `gradient_accumulation_steps`、`max_sequence_length`、`bf16`、`fp16`、`local_files_only`、`resume` | 低频和硬件相关参数 |
-
-KTO 的实际 batch size 必须大于 1；单卡时建议至少设置 `kto.batch_size: 2`。`trust_remote_code` 默认关闭，需要自定义模型代码时再显式开启。
-
-ORPO 当前使用完整 Recipe 配置。可以复制 `configs/dpo_qlora.yaml`，将方法改为：
-
-```yaml
-stage: preference
-method:
-  type: qlora
-  preference_method: orpo
-```
-
-然后照常执行 `validate-config`、`train --dry-run` 和 `train`。内置 smoke test 已覆盖真实的一步 ORPO 训练。
-
-### 使用本地数据评测
-
-默认 `suite: standard` 当前映射到 perplexity。默认数据集是在线的 `wikitext`；离线环境或领域模型建议显式提供本地留出集：
-
-```yaml
-evaluation:
+eval:
   enabled: true
-  suite: [perplexity]
-  dataset: data/domain_eval.jsonl
-  max_samples: 500
-  fail_on_error: true
-```
-
-`fail_on_error: true` 会让评测失败直接终止流程，防止把没有评测结果的模型误认为成功。设置为 `false` 时会继续流程，但 `summary.json` 中的评测状态仍是 `failed`。
-
-### 评测门禁、导出与推理服务
-
-完整闭环可直接使用 `configs/posttrain_release_flow.yaml`。其中 `perplexity.max` 只是演示阈值，正式项目应先测量基座与历史稳定版本，再按领域留出集设定阈值：
-
-```yaml
-flow: full
-
-evaluation:
-  enabled: true
-  suite: [perplexity]
-  dataset: data/domain_eval.jsonl
-  max_samples: 500
-  fail_on_error: true
+  tasks: [perplexity]
   gate:
     enabled: true
     rules:
       perplexity:
         max: 30.0
-    require_all: true
     fail_on_rejection: true
-
-export:
-  output_dir: outputs/qwen-domain-v1/release
-  merge_lora: true
-  require_gate: true
-  safe_serialization: true
 ```
 
-规则支持多个指标，每个指标可设置 `min`、`max` 和 `required`。`require_all: true` 表示所有必需规则都通过才可发布。门禁拒绝时，流程返回失败，`release_gate.json` 和 `summary.json` 仍会保存拒绝原因；导出阶段不会执行。
+`export` 使用最新上游模型。如果配置 `require_gate: true`，没有已接受的门禁结果就拒绝导出。
 
-执行完整发布流程：
+完整闭环示例见 [posttrain_release.yaml](configs/posttrain_release.yaml)。
 
-```powershell
-saddle-llm validate-config configs\posttrain_release_flow.yaml
-saddle-llm train configs\posttrain_release_flow.yaml --dry-run
-saddle-llm train configs\posttrain_release_flow.yaml --debug
+### 3.12 Batch、步数和显存逻辑
+
+有效 batch：
+
+```text
+effective_batch
+= per_device_batch_size
+× gradient_accumulation_steps
+× num_gpus
 ```
 
-也可以不训练，单独导出已有完整 checkpoint 或 LoRA adapter。LoRA 默认会读取 `adapter_config.json` 中声明的基座并执行合并：
+显存主要受模型参数量、序列长度、每卡 batch、优化器状态、是否全参数训练和精度影响。常用选择：
 
-```powershell
-saddle-llm export-model outputs\qwen-domain-v1\preference_checkpoints `
-  outputs\qwen-domain-v1\release `
-  --gate-result outputs\qwen-domain-v1\release_gate.json --require-gate
-```
+- 显存充足：全参数或 LoRA。
+- 显存较小且有兼容 CUDA/bitsandbytes：QLoRA。
+- OOM：先降低 `per_device_batch_size` 和序列长度，再提高梯度累积保持有效 batch。
+- CPU：只适合 tiny 模型、数据检查和调度测试。
 
-发布目录必须为空；确实要替换旧发布包时显式增加 `--overwrite`。当前稳定导出格式是 Hugging Face，ONNX、GGUF 和量化发布尚未作为稳定能力开放。默认只给配置、分词器等小文件计算 SHA-256；需要连大权重一起校验时增加 `--hash-weights`。
+`bf16` 与 `fp16` 不能同时启用。
 
-训练与导出完成后，独立启动 OpenAI-compatible 服务：
+### 3.13 恢复、失败和状态逻辑
 
-```powershell
-saddle-llm serve-model outputs\qwen-domain-v1\release `
-  --host 127.0.0.1 --port 8000 --device auto
-```
-
-需要鉴权时只传环境变量名，不把密钥写进命令历史或配置文件：
-
-```powershell
-$env:SADDLELLM_API_KEY = "replace-with-a-private-token"
-saddle-llm serve-model outputs\qwen-domain-v1\release `
-  --api-key-env SADDLELLM_API_KEY
-```
-
-调用 Chat Completions：
-
-```powershell
-$headers = @{ Authorization = "Bearer $env:SADDLELLM_API_KEY" }
-$body = @{
-  model = "release"
-  messages = @(@{ role = "user"; content = "请总结这段材料" })
-  temperature = 0.2
-  max_tokens = 256
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8000/v1/chat/completions `
-  -Headers $headers -ContentType "application/json" -Body $body
-```
-
-可用端点为 `GET /health`、`GET /v1/models`、`POST /v1/chat/completions` 和 `POST /v1/completions`。当前稳定版是非流式单机推理；`--max-concurrency` 提供并发上限，`--max-input-tokens` 与 `--max-new-tokens` 提供上下文和输出保护。
-
-### 断点恢复
-
-新任务默认 `resume: false`。已有阶段 checkpoint 时，可以让每个阶段自动寻找自己输出目录下的最近 checkpoint：
+阶段级恢复：
 
 ```yaml
-advanced:
+pipeline:
   resume: true
+  rerun: []
+  state_path: pipeline_state.json
 ```
 
-单阶段流程也可以指定明确路径：
+系统只会恢复配置指纹和依赖图一致、且上次已完成的阶段。`pipeline.rerun` 指定某个阶段重跑时，它的下游阶段也会失效并重新执行。
+
+Trainer checkpoint 恢复使用：
 
 ```yaml
-flow: sft
-advanced:
-  resume: outputs/qwen-domain-v1/sft_checkpoints/checkpoint-200
+training:
+  resume_from_checkpoint: outputs/run/checkpoint-1000
 ```
 
-多阶段流程使用明确路径时应拆成单阶段恢复，避免把 SFT checkpoint 误传给偏好阶段。使用 `resume: true` 前必须确保相应阶段目录中确实存在 checkpoint。
+这与阶段级恢复不同：前者恢复单个 Trainer 内部状态，后者决定整个阶段是否跳过。
 
-### 训练产物
+任何阶段抛出异常时：
 
-以 `output: outputs/qwen-domain-v1` 为例：
+1. 记录 `failed_stage` 和错误。
+2. 更新 `pipeline_state.json`。
+3. 尽可能写出 `summary.json`。
+4. 停止后续阶段。
+5. CLI 返回非零退出码，不把失败包装成成功。
 
-```text
-outputs/qwen-domain-v1/
-  training.log
-  release_gate.json
-  plans/
-    sft_plan.json
-    preference_plan.json
-  sft_checkpoints/
-  preference_checkpoints/
-  release/
-    config.json
-    model.safetensors
-    release_manifest.json
-    SADDLELLM_RELEASE.md
-  summary.json
-  training_summary.json
-```
+### 3.14 从哪里继续阅读
 
-`summary.json` 记录阶段状态、模型路径、数据检查、训练结果、评测指标、门禁结论和耗时。`release_manifest.json` 记录来源 checkpoint、LoRA 是否合并、门禁快照、文件清单和哈希。极简配置编译后的标准配置由 `--compiled-output` 指定，建议和训练产物一起归档。
+- [架构与调用链](docs/ARCHITECTURE.md)：模块关系和详细时序。
+- [函数参考](docs/FUNCTION_REFERENCE.md)：从源码生成的函数、方法和行号。
+- [训练指南](TRAINING_GUIDE.md)：训练检查清单。
+- [多模态生成](docs/MULTIMODAL_GENERATION.md)：媒体缓存和生成训练。
+- [统一训练与眼动控制](docs/UNIFIED_TRAINING_AND_EYE_CONTROL.md)：世界模型、控制和多分支执行。
 
-### 常见问题
-
-- 显存不足：先降低 `max_sequence_length` 和 `batch_size`，再提高 `gradient_accumulation_steps`，或改用 LoRA/QLoRA。
-- QLoRA 报错：确认 `doctor` 显示 CUDA 可用，并检查 bitsandbytes 与当前 PyTorch/CUDA 是否匹配。
-- KTO 校验失败：保证正负样本都存在，并让实际 batch size 大于 1。
-- DPO 无效：检查 `chosen` 与 `rejected` 是否相同、偏好方向是否一致，以及 prompt 是否泄漏答案。
-- 评测下载失败：把 `evaluation.dataset` 改成本地 JSONL/JSON/TXT 文件。
-- 出现 AutoAWQ 兼容警告：说明隔离环境看到了不可用的可选量化包；普通 LoRA 会继续运行，若要导出 AWQ 模型应另建匹配 AutoAWQ 与 Transformers 的专用环境。
-- 只看到简短错误：给 `train` 增加 `--debug`。
-
-机械跑通流程并不能保证模型效果。正式实验至少应保留独立验证集，先记录基座指标，再分别比较 SFT 与偏好训练后的指标，并保存数据版本、编译配置、随机种子和 checkpoint。
-
-## LLM 网络积木与残差初始化
-
-原生 `saddle` 模型支持两条等价构建路径：YAML/JSON 配置和 Python Builder。两条路径都会先归一化为 `ModelBlueprint`，再创建实际网络，因此配置实验与代码实验可以互相保存、比较和复现。
-
-完整训练配置见 [`configs/modular_llm.yaml`](configs/modular_llm.yaml)，其中 `model.blueprint.layers` 按顺序描述层段，`repeat` 展开为彼此独立、不共享参数的 decoder layers。每段可以覆盖：
-
-- Attention：`mha`、`mqa`、`gqa`、`mla`
-- FFN：`swiglu`、`moe`
-- 残差拓扑：`serial`（Attention 后再 FFN）或 `parallel`（两分支读取同一输入）
-- 残差缩放：`attention_scale`、`ffn_scale`，以及 `learnable: true` 的可学习标量门控
-- 残差 dropout 与输出投影初始化：`standard`、`depth_scaled`、`zero`
-
-`depth_scaled` 仅按 `1 / sqrt(2 * 层数)` 缩放 Attention `o_proj` 和 FFN/MoE `down_proj`；`zero` 仅清零这些残差分支输出投影。默认 `standard + learnable: false` 保持原行为，也不会增加 state-dict 键。
-
-Python 组合示例：
-
-```python
-from saddlellm import SaddleModelBuilder
-
-builder = (
-    SaddleModelBuilder("hybrid", hidden_size=512, vocab_size=32000)
-    .defaults(
-        attention={"preset": "gqa", "num_heads": 8, "num_kv_heads": 2},
-        ffn={"preset": "swiglu", "intermediate_size": 1536},
-        residual={"preset": "depth_scaled"},
-    )
-    .add_layers(4, name="dense-stem")
-    .add_layer(
-        name="moe-tail",
-        attention={"preset": "mla", "kv_lora_rank": 32},
-        ffn={"preset": "moe", "num_experts": 8, "experts_per_token": 2},
-        residual={"topology": "parallel", "learnable": True},
-    )
-)
-
-blueprint = builder.build_blueprint()
-model = builder.build()
-```
-
-更完整的可执行脚本见 [`examples/build_modular_llm.py`](examples/build_modular_llm.py)。原生 checkpoint 会保存 `saddle_config.json`、`model_blueprint.json`、`saddle_checkpoint.json` 和权重。推荐使用统一入口加载，它会自动识别原生目录或普通 Hugging Face 模型：
-
-```python
-from saddlellm import load_model_and_tokenizer
-
-model, tokenizer = load_model_and_tokenizer("./outputs/final_model", device="auto")
-inputs = tokenizer("你好，世界", return_tensors="pt")
-tokens = model.generate(**inputs, max_new_tokens=32, do_sample=False)
-```
-
-原生生命周期当前支持 scratch 预训练、weights-only 继续预训练、Trainer 精确恢复、perplexity/文本生成评测、本地 OpenAI 兼容推理服务，以及 `format: saddle` 自包含导出。两种续训语义需要区分：
-
-- `pretrain_mode: continue` + `model.name_or_path`：只继承模型权重，优化器和步数重新开始。
-- `training.resume_from_checkpoint: checkpoint-N`（或 `true` 自动选择最新 checkpoint）：恢复模型、优化器、调度器、随机数状态和 global step。
-
-原生模型尚未接入 PEFT/LoRA、QLoRA、ORPO/KTO 和 PPO/GRPO；原生偏好优化当前支持全参数 DPO。未支持组合会在预检阶段明确拒绝。原生发布应设置 `export.format: saddle`，不会将异构逐层架构伪装成有损的通用 HF `config.json`。
-
-当前原生链路支持网络构建、tokenizer、scratch/continue pretrain、全参数 SFT、全参数 DPO、统一评测、Saddle 格式导出和本地服务。`backend: hf` 不会消费 Saddle Blueprint，因此配置会在预检阶段拒绝该组合。原生 LoRA/QLoRA、ORPO/KTO、分布式后训练和无损 HF 格式导出仍未开放；这些组合会在训练前给出明确错误。完整 SFT+DPO 示例见 `configs/native_posttrain.yaml`。
-
-生成式多模态采用独立 codec/latent/objective 路径，不把图像像素或音频码强行映射到文本词表。统一数据 schema 支持 `text/image/audio/video` segments、时间区间以及可选的 `observations/actions/rewards/dones/timestamps`；旧的 `messages + images` 数据仍兼容。`image_generation` 消费 `latents[N,C,H,W] + conditions[N,D]` 并训练图像 latent flow；`music_generation` 消费多码本 `codes[N,Q,T] + conditions[N,D]` 并训练自回归音频码模型；`video_generation` 消费 `video_latents[N,C,T,H,W] + conditions[N,D]` 并训练 3D patch 时空 flow。`media_cache` stage 已能从原始图片、PCM WAV、帧目录或动图生成带 SHA-256 指纹的可续建 NPZ 分片，并直接把输出交给三个生成 stage。默认 Codec 是端到端基线，生产质量仍应替换为真实 VAE、神经音频 Codec 与因果视频 VAE。配置见 `configs/media_cache_*.yaml`、`configs/raw_image_to_training.yaml` 和三个生成配置。
-
-## 世界模型使用方法
-
-RSSM/离散 RSSM 现在也可作为总编排器的 `world_model` stage 运行；其统一 episode 数据可直接使用 `observations[T+1] + actions/rewards/dones[T]`。原有专用 CLI 保持兼容：
-
-统一编排示例见 `configs/world_model_stage.yaml`：
+开发验证：
 
 ```powershell
-saddle-llm train configs\world_model_stage.yaml --dry-run
-saddle-llm train configs\world_model_stage.yaml
-```
-
-原有独立轨迹训练入口：
-
-```powershell
-saddle-llm train-world-model configs\world_model.yaml --dry-run
-saddle-llm train-world-model configs\world_model.yaml
-saddle-llm train-world-model configs\world_model_categorical.yaml --dry-run
-saddle-llm world-model-backends
-saddle-llm infer-world-model outputs\world_model_example data\world_model_inference_example.json
-```
-
-世界模型训练与推理均使用 `saddlellm/` 内的原生实现；`reference/` 仅用于架构研究，
-不会被这些命令导入或启动。
-
-空间世界模型的完整数据、训练和可视化链路：
-
-```powershell
-saddle-llm build-spatial-world-data data\spatial_floorplan_example.pbm `
-  --output data\spatial_world_model_example.jsonl --episodes 64 --routes-per-pair 2
-saddle-llm train-world-model configs\spatial_world_model.yaml --dry-run
-saddle-llm train-world-model configs\spatial_world_model.yaml
-saddle-llm spatial-studio --world-model outputs\spatial_world_model_example
-```
-
-打开 `http://127.0.0.1:7865` 上传俯视图、设置起终点并查看空间结构、候选路线与模型评分。详见[空间世界模型指南](SPATIAL_WORLD_MODEL_GUIDE.md)。
-
-### WorldAgent：让视觉、规划、世界模型和语言解释协同
-
-`WorldAgent` 是位于现有空间模块之上的统一运行时，不是从 `reference/` 复制来的第三方 Agent。它把一次任务拆成可单独调用、可保存和可复现的四个阶段：
-
-```text
-图片 / 地图
-   -> analyze：几何提取 + 可选 Qwen-VL 语义识别
-   -> plan：结构化 WorldState + Top-K 路线 + 可选 RSSM 重排
-   -> simulate：硬几何碰撞检查 + 可选世界模型想象
-   -> feedback：实际轨迹对比 + 事件记忆 + 可训练 replay JSONL
-```
-
-其中 Qwen-VL 是可替换的视觉语义适配器，负责房间、门、障碍物、危险物和连通关系；SaddleLLM 原生 RSSM 才是学习状态转移、奖励、持续概率、碰撞或未来占用的世界模型。没有配置 Qwen-VL 时仍能规划干净的俯视占用图；没有世界模型 checkpoint 时仍能做确定性的栅格验证，但输出会明确标记为 `geometry`，不会伪装成学习预测。
-
-用内置地图一条命令跑通分析、规划和模拟：
-
-```powershell
-saddle-llm world-agent-run data\spatial_floorplan_example.pbm `
-  --start 2,2 --goal 21,13 `
-  --config configs\world_agent.yaml `
-  --simulation geometry `
-  --output build\world_agent_demo.json
-```
-
-结果包含 `saddle.world-state.v1`、`saddle.world-plan.v1` 和 `saddle.world-simulation.v1` 三种稳定协议。占用栅格使用 `rle-v1` 压缩持久化；计划中包含每条路线的长度、转弯数、净空、几何风险、源图坐标、选择原因、置信度和限制说明。
-
-最简配置只需要工作目录；模型均为可选：
-
-```yaml
-workspace: ../outputs/world_agent
-qwen_model: null
-world_model_checkpoint: null
-device: auto
-```
-
-完整但仍较短的模板见 [`configs/world_agent.yaml`](configs/world_agent.yaml)。需要语义识别和学习预测时设置模型路径：
-
-```yaml
-qwen_model: Qwen/Qwen3-VL-4B-Instruct
-world_model_checkpoint: ../outputs/spatial_world_model_example
-```
-
-然后运行：
-
-```powershell
-saddle-llm world-agent-run floorplan.png `
-  --start 120,80 --goal 930,620 `
-  --config configs\world_agent.yaml `
-  --semantic-backend qwen-vl `
-  --use-world-model --simulation world_model
-```
-
-也可以启动独立 API；原来的 `spatial-studio` 同样会挂载这些端点，并共享已经加载的 Qwen-VL 与 RSSM：
-
-```powershell
-saddle-llm world-agent-api --config configs\world_agent.yaml
-# 或打开带可视化界面的服务
-saddle-llm spatial-studio --qwen-model Qwen/Qwen3-VL-4B-Instruct `
-  --world-model outputs\spatial_world_model_example
-```
-
-API 文档位于 `http://127.0.0.1:7866/docs`。稳定端点为：
-
-- `POST /v1/world/analyze`：上传图片，返回可持久化的 `WorldState`。
-- `POST /v1/world/plan`：传 `state_id`、起点和终点，返回多条路线与推荐解释。
-- `POST /v1/world/simulate`：选择 `geometry`、`world_model` 或自动回退的 `auto`。
-- `POST /v1/world/feedback`：提交结果和实际路径，生成评估记录及训练 replay。
-- `GET /v1/world/memory`：查看状态、计划、模拟、反馈与 replay 数量。
-
-Python 中可以直接复用同一运行时：
-
-```python
-from saddlellm import WorldAgentRuntime, WorldAgentSettings
-
-agent = WorldAgentRuntime(
-    WorldAgentSettings.from_file("configs/world_agent.yaml")
-)
-state = agent.analyze_image("data/spatial_floorplan_example.pbm")
-plan = agent.plan(state.state_id, start=(2, 2), goal=(21, 13), route_count=3)
-simulation = agent.simulate(plan.plan_id, mode="geometry")
-
-# 执行后把真实轨迹反馈回来；只有真实路径才进入训练 replay。
-feedback = agent.record_feedback(
-    plan.plan_id,
-    outcome="success",
-    actual_path=plan.routes[0]["points"],
-    simulation_id=simulation.simulation_id,
-)
-```
-
-默认产物目录如下：
-
-```text
-outputs/world_agent/
-  observations/                  上传图片
-  states/                        压缩 WorldState
-  plans/                         路线、解释和模型使用信息
-  simulations/                   几何验证与学习预测
-  feedback/                      实际执行结果
-  events.jsonl                   追加式事件索引
-  replay/spatial_feedback.jsonl  可直接被原生世界模型数据加载器读取
-```
-
-要利用真实反馈继续训练，可把 `configs/spatial_world_model.yaml` 的 `data.train_path` 改为上述 replay 文件，先执行 `train-world-model --dry-run` 验证，再训练新 checkpoint。生产环境应把合成地图数据和真实反馈混合，而不是只用少量在线样本覆盖原训练集。
-
-当前边界：单张透视照片只能提供可见区域语义，不能恢复被遮挡空间；真实行走还需要深度、相机标定、定位/SLAM、动态障碍感知和机器人控制接口。所有 `confidence.calibrated` 当前均为 `false`，几何可行或模型高分都不是现实安全保证。
-
-训练失败时显示完整 traceback：
-
-```powershell
-saddle-llm train configs\sft_lora.yaml --debug
-```
-
-推荐顺序：
-
-```text
-doctor
-  -> smoke-test --skip-training
-  -> inspect-data
-  -> validate-config
-  -> preflight
-  -> plan
-  -> train --dry-run
-  -> train
-  -> release gate
-  -> export
-  -> serve-model
-  -> report
-```
-
-## Python API
-
-### 创建领域训练工厂
-
-```python
-from saddle_llm import LLMTrainingFactory
-
-factory = LLMTrainingFactory.for_domain(
-    domain="general",
-    root_dir="./llm_factory",
-    base_model="Qwen/Qwen2.5-7B-Instruct",
-    max_seq_length=2048,
-    global_batch_size=16,
-    num_gpus=1,
-    gpu_memory_gb=24.0,
-)
-
-factory.create_workspace()
-factory.save_plan()
-```
-
-### 创建 SFT 计划
-
-```python
-plan = factory.create_post_training_plan(
-    data_path="./data/posttrain_sft_example.jsonl",
-    stage="sft",
-    method="qlora",
-    max_steps=1000,
-    save=True,
-)
-```
-
-该调用会生成规范化数据、Recipe、Orchestrator config 和训练计划。
-
-### 创建 DPO 计划
-
-```python
-plan = factory.create_post_training_plan(
-    data_path="./data/posttrain_preference_example.jsonl",
-    stage="dpo",
-    method="qlora",
-    beta=0.1,
-    save=True,
-)
-```
-
-### 执行 Orchestrator 配置
-
-```python
-from saddle_llm import TrainingOrchestrator
-
-orchestrator = TrainingOrchestrator.from_yaml("./build/posttrain_compiled.yaml")
-result = orchestrator.run()
-```
-
-先通过 `saddle-llm plan ... --output build/posttrain_compiled.yaml` 生成标准配置；`run()` 会立即开始真实训练。
-
-### 用 Python 编译并执行极简 flow
-
-```python
-from pathlib import Path
-
-import yaml
-
-from saddle_llm import (
-    SimpleFlowCompiler,
-    TrainingOrchestrator,
-    validate_training_config,
-)
-
-config_path = Path("configs/posttrain_simple_flow.yaml")
-raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-compiled = SimpleFlowCompiler.compile(raw, base_dir=str(config_path.parent))
-
-report = validate_training_config(compiled, inspect_data=True)
-if not report["valid"]:
-    raise RuntimeError(report["issues"])
-
-result = TrainingOrchestrator.from_dict(compiled).run()
-print(result)
-```
-
-如果只想编译和检查，到 `report` 为止即可；最后两行会加载模型并开始真实训练。正式运行前请替换仓库中的示例数据。
-
-### 用 Python 规范化后训练数据
-
-```python
-from saddle_llm import normalize_post_training_file
-
-report = normalize_post_training_file(
-    input_path="data/posttrain_sft_example.jsonl",
-    output_path="build/normalized_sft.jsonl",
-    task="sft",  # 也可使用 dpo、orpo、kto 或 grpo
-)
-print(report)
-```
-
-规范化会同时生成 `normalized_sft.jsonl.report.json`，记录保留、丢弃和识别到的 schema 数量。
-
-## 数据格式
-
-### SFT：Alpaca JSONL
-
-```json
-{"instruction":"总结下面的政策意见","input":"...","output":"..."}
-```
-
-### SFT：Messages JSONL
-
-```json
-{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
-```
-
-### Preference：DPO/ORPO JSONL
-
-```json
-{"prompt":"...","chosen":"更好的回答","rejected":"较差的回答"}
-```
-
-### KTO JSONL
-
-```json
-{"prompt":"...","completion":"可接受或不可接受的回答","label":true}
-```
-
-KTO 数据必须同时包含正例与负例；`label` 可使用布尔值，训练前建议通过 `inspect-data --task kto` 检查。
-
-在加载模型前运行 `inspect-data`，可以检查字段、重复样本、长度和 `chosen == rejected` 等问题。
-
-
-## 测试
-
-## 分布式预训练
-
-当前原生 Saddle 模型支持单机/多机 DDP 预训练，并提供 FSDP 配置入口。先编译
-配置和启动脚本，再由启动器创建所有 worker：
-
-```yaml
-stages: [pretrain]
-model:
-  backend: saddle
-distributed:
-  strategy: ddp       # single | ddp | fsdp
-  num_gpus: 4         # 每个节点的进程数
-  num_nodes: 1
-  ddp_backend: auto   # CUDA 使用 nccl，CPU/Gloo 测试使用 gloo
-```
-
-```powershell
-saddle-llm plan recipe.yaml --output build/distributed.yaml
-& ./build/launch.ps1
-```
-
-分布式模式目前只运行 `pretrain`。评估和导出应在训练完成后，用单进程读取
-`final_model` 单独执行。TP/PP/CP/EP 仍属于规划能力，运行时会明确拒绝而不会
-静默退化。原生 checkpoint 会记录并行策略、world size 和 state-dict 类型；
-精确 DDP 恢复要求每个 rank 的 RNG 状态齐全。目前 FSDP/DeepSpeed 的分片恢复
-尚未开放。
-
-```powershell
+python -m compileall -q saddlellm tests
+python tools/generate_function_reference.py --check
 python -m pytest -q
 ```
-
-当前项目级 `pytest.ini` 会排除 `build/`、`dist/` 和 `external_research/`，避免测试发现过程进入第三方研究仓库。
-
-## 目录结构
-
-```text
-configs/                    训练 Recipe 模板
-experiments/                可执行实验
-outputs/                    实验输出
-spatial-studio/             React 空间世界模型工作台源码
-saddlellm/                  Python 主包源码
-saddle_llm/                 旧包名兼容层
-docs/                       架构和函数参考
-tools/                      可重复运行的文档生成工具
-tests/                      项目测试
-SADDLE_LLM_FULL_DOCUMENTATION.md
-SADDLE_LLM_CODE_GUIDE.md
-TRAINING_GUIDE.md
-WORLD_MODEL_TRAINING_GUIDE.md
-```
-
-## 文档导航
-
-- [架构、模块逻辑与调用时序](docs/ARCHITECTURE.md)
-- [逐函数与方法参考](docs/FUNCTION_REFERENCE.md)
-- [完整文档](SADDLE_LLM_FULL_DOCUMENTATION.md)
-- [训练指南](TRAINING_GUIDE.md)
-- [世界模型训练指南](WORLD_MODEL_TRAINING_GUIDE.md)
-- [空间世界模型与可视化工作台](SPATIAL_WORLD_MODEL_GUIDE.md)
-- [代码学习指南](SADDLE_LLM_CODE_GUIDE.md)
-
-## 还可以继续建设的后训练能力
-
-评测门禁、HF 导出与 OpenAI-compatible 推理服务已经形成可执行闭环。后续建议按以下顺序继续：
-
-1. GRPO/RLVR 流程接入：把现有 native GRPO、奖励函数和 rollout 数据检查接入 `flow: sft+grpo`。
-2. checkpoint 对比评测：自动对比基座、SFT、DPO/KTO 多个 checkpoint，而不只判断单个结果是否过线。
-3. 推理性能：增加 SSE 流式输出、连续批处理、KV Cache 管理、超时和取消机制。
-4. 更多发布格式：在可重复验证后开放量化、ONNX 和 GGUF 导出。
-5. 实验追踪与可视化：统一展示 loss、reward、KL、吞吐、显存、评测变化和 checkpoint 对比。
-6. 自动数据闭环：清洗、去重、难例挖掘、拒答样本、训练/验证集切分和数据版本管理。
-
-
-## 当前边界
-
-- CLI、数据检查、Recipe、Orchestrator 和 smoke-test 是推荐入口。
-- 发布闭环当前稳定支持 HF 格式和非流式单机 API；量化导出、SSE 与动态批处理仍待实现。
-- native GRPO 适合小规模研究和链路验证；大规模实验应进一步验证吞吐、分布式和 checkpoint 行为。
-- VLA、世界模型、多模态、部分高级架构及部分第三方后端仍属于实验性能力。
-
-## License
-
-[MIT](LICENSE)

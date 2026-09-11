@@ -46,7 +46,7 @@ paths, and sampled episode step continuity.
 
 ## 4. Validate Config
 
-Validate a recipe or compiled orchestrator config without starting training:
+Validate the same config that will be used for training:
 
 ```bash
 python -m saddle_llm.cli validate-config configs/sft_lora.yaml
@@ -68,8 +68,7 @@ python -m saddle_llm.cli preflight data/preference.jsonl --stage dpo --root-dir 
 Preflight writes:
 
 - `preflight_plan.json`
-- `orchestrator_config.json`
-- a recipe YAML
+- `config.json`
 
 ## 6. Use Templates
 

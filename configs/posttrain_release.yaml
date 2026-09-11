@@ -1,0 +1,59 @@
+project: saddlellm
+experiment: qwen-domain-release-v1
+stages: [sft, preference, eval, export]
+
+model:
+  name_or_path: Qwen/Qwen3-4B
+  tokenizer: Qwen/Qwen3-4B
+  backend: hf
+pretrain_mode: continue
+
+sft:
+  enabled: true
+  data_path: data/posttrain_sft_example.jsonl
+  use_lora: true
+  use_qlora: true
+  epochs: 2
+  learning_rate: 0.0002
+  per_device_batch_size: 1
+  max_seq_length: 2048
+
+preference:
+  enabled: true
+  method: dpo
+  data_path: data/posttrain_preference_example.jsonl
+  use_lora: true
+  use_qlora: true
+  beta: 0.1
+  epochs: 2
+  learning_rate: 0.000005
+  per_device_batch_size: 1
+  max_length: 2048
+  max_prompt_length: 1024
+
+eval:
+  enabled: true
+  dataset: data/posttrain_sft_example.jsonl
+  max_samples: 100
+  gate:
+    enabled: true
+    rules:
+      perplexity:
+        max: 30.0
+
+export:
+  enabled: true
+  output_dir: outputs/qwen-domain-release-v1/release
+  format: hf
+  merge_lora: true
+  require_gate: true
+
+training:
+  max_steps: -1
+
+distributed:
+  strategy: single
+
+logging:
+  output_dir: outputs/qwen-domain-release-v1
+  backend: local

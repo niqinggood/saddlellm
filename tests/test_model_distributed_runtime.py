@@ -5,7 +5,7 @@ from copy import deepcopy
 import pytest
 import torch
 
-from saddlellm.SaddleModeling import SaddleForCausalLM, SaddleModelConfig, SaddleMoE
+from saddlellm.models.SaddleModeling import SaddleForCausalLM, SaddleModelConfig, SaddleMoE
 
 
 def _attention(kind="gqa"):

@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-rmdir /s /q dist build saddle_llm.egg-info 2>nul
+rmdir /s /q dist build saddlellm.egg-info saddle_llm.egg-info 2>nul
 python -m build --wheel
 echo.
 echo Done: saddle_llm

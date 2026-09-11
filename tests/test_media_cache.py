@@ -4,17 +4,17 @@ import wave
 import numpy as np
 from PIL import Image
 
-from saddlellm.BuiltinMediaCodecs import (
+from saddlellm.multimodal.BuiltinMediaCodecs import (
     FrameVideoCodec,
     HashTextConditionEncoder,
     RGBImageCodec,
     WAVResidualCodec,
 )
-from saddlellm.LatentFlowTrainer import CachedLatentDataset
-from saddlellm.MediaCache import MediaCacheBuildConfig, ShardedNpzStore, build_media_cache
-from saddlellm.MusicCodeTrainer import CachedMusicCodeDataset
-from saddlellm.VideoLatentFlowTrainer import CachedVideoLatentDataset
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.multimodal.LatentFlowTrainer import CachedLatentDataset
+from saddlellm.multimodal.MediaCache import MediaCacheBuildConfig, ShardedNpzStore, build_media_cache
+from saddlellm.multimodal.MusicCodeTrainer import CachedMusicCodeDataset
+from saddlellm.multimodal.VideoLatentFlowTrainer import CachedVideoLatentDataset
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 from saddlellm.cli import main as cli_main
 
 

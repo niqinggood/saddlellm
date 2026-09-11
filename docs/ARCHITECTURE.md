@@ -1,6 +1,6 @@
 # SaddleLLM 架构与调用链
 
-> 基于当前 `2.32` 源码整理。本文描述的是仓库中的一方实现，而不是 README 中的愿景，也不把 `external_research/`、`reference/`、`node_modules/`、`build/`、`dist/`、`outputs/` 当作框架源码。
+> 基于当前 `2.33` 源码整理。本文描述的是仓库中的一方实现，而不是 README 中的愿景，也不把 `external_research/`、`reference/`、`node_modules/`、`build/`、`dist/`、`outputs/` 当作框架源码。
 >
 > 本文负责“为什么这样分层、各部分如何协作、主调用顺序是什么”；全部具名函数和方法的源码位置、签名、职责与静态直调对象见 [FUNCTION_REFERENCE.md](FUNCTION_REFERENCE.md)。
 
@@ -13,7 +13,7 @@ SaddleLLM 是一个以统一配置和阶段编排为骨架、同时承载文本 
 它的核心不是某一个 Trainer，而是下面这条稳定契约：
 
 ```text
-用户意图/短配置 → 规范化配置 → TrainingConfig → 阶段调度 → 专用执行器 → 标准产物
+普通 YAML/JSON → TrainingConfig → Stage Registry → 阶段调度 → 专用执行器 → 标准产物
 ```
 
 空间智能是与训练流水线并列的第二条主线：
@@ -35,11 +35,37 @@ SaddleLLM 是一个以统一配置和阶段编排为骨架、同时承载文本 
 | `build/`、`dist/`、`outputs/` | 编译、训练、测试和发布产物 | 否 |
 | `spatial-studio/node_modules/` | 前端依赖 | 否 |
 
-静态盘点结果：Python 一方源码约 5.3 万行、121 个 `saddlellm` 模块；前端约 2,300 行。函数参考覆盖 1,950 余个 Python 具名可调用项以及前端具名组件/函数。匿名 lambda、JSX 内联事件和第三方框架动态回调不可能由纯静态扫描完全枚举。
+静态盘点结果：Python 一方源码约 5.4 万行、123 个 `saddlellm` 模块；前端约 2,100 行。函数参考覆盖 2,000 余个 Python 具名可调用项以及前端具名组件/函数。匿名 lambda、JSX 内联事件和第三方框架动态回调不可能由纯静态扫描完全枚举。
+
+### 2.1 Python 包目录
+
+`saddlellm/` 顶层只保留公共入口、延迟导出表和少量兼容模块；实现代码按领域归档：
+
+| 子包 | 职责 |
+|---|---|
+| `agents/` | 模型服务提供方、agent 算子和现实环境算子 |
+| `alignment/` | RLHF、GRPO、安全生成与实验性对齐算法 |
+| `compression/` | 量化、剪枝与轻量化 |
+| `data/` | 数据采集、清洗、配比、manifest 和训练前检查 |
+| `distillation/` | 通用、快速、on-policy 蒸馏 |
+| `evaluation/` | benchmark、模型评测、smoke test 和发布门禁 |
+| `experiments/` | 实验计划、追踪、报告、稳定性与 scaling law |
+| `factory/` | quickstart、训练工厂和后端规划 |
+| `framework/` | stage 注册、插件协议和产物协议 |
+| `models/` | 模型蓝图、构建、加载、算子后端与 tokenizer |
+| `multimodal/` | 视觉/音频/视频生成、多模态模型与 VLA |
+| `runtime/` | 导出、推理服务、部署和交互界面 |
+| `spatial/` | 空间感知、路径规划、控制、API 与 WorldAgent |
+| `training/` | 预训练、后训练、分布式运行时与统一编排 |
+| `tuning/` | LoRA、Prompt、TRL、Swift、Unsloth 训练适配 |
+| `utils/` | 可选依赖和训练诊断工具 |
+| `world_models/` | RSSM 世界模型、数据、训练、后端与推理 |
+
+新代码应使用领域路径，例如 `saddlellm.models.ModelLoader`；稳定的公共对象也可直接从 `saddlellm` 导入。顶层仅保留 `DataPipeline.py`、`TextProcess.py`、`Lightweight.py`、`ModelPruner.py`、`ModelQuantizer.py` 五个有明确外部价值的旧路径转发层，不为所有历史平铺模块继续复制 shim。
 
 ## 3. 总体架构图
 
-阅读路径：先看左侧入口，经配置编译和编排核心，再看底部的各执行域；右侧是统一产物和服务面。
+阅读路径：先看左侧入口，经配置校验和编排核心，再看底部的各执行域；右侧是统一产物和服务面。
 
 ```mermaid
 flowchart LR
@@ -51,8 +77,7 @@ flowchart LR
     end
 
     subgraph Compile[配置与规划层]
-        Flow[SimpleFlowCompiler]
-        Recipe[TrainingRecipe]
+        File[普通 YAML / JSON]
         Factory[LLMTrainingFactory]
         Validate[TrainingConfigValidator]
         Backend[Backend / Distributed Planner]
@@ -83,13 +108,11 @@ flowchart LR
         SpatialAPI[Spatial / WorldAgent API]
     end
 
-    CLI --> Flow
-    CLI --> Recipe
+    CLI --> File
     API --> Factory
-    Factory --> Recipe
+    Factory --> File
     Factory --> Blueprint
-    Flow --> Config
-    Recipe --> Config
+    File --> Validate
     Validate --> Config
     Backend --> Config
     Blueprint --> Registry
@@ -119,7 +142,7 @@ flowchart LR
 
 图中最重要的边界有三条：
 
-1. `SimpleFlow` 与 `TrainingRecipe` 只是两种输入语法，最终都必须编译为 `TrainingOrchestrator` 接受的规范配置。
+1. 用户配置只有一种：顶层 `stages` 必须是非空列表，CLI 和 Python API 直接交给 `TrainingOrchestrator`。
 2. `ModelBlueprint` 是设计时模型结构；`SaddleModelConfig`/`SaddleForCausalLM` 是运行时模型结构，二者不能混为一层。
 3. `SpatialWorldModelCoordinator` 负责单次空间组合；`WorldAgentRuntime` 在其外面增加有状态协议、持久化、仿真和真实反馈闭环。
 
@@ -127,11 +150,12 @@ flowchart LR
 
 ### 4.1 入口与公共 API
 
-核心文件：`setup.py`、`saddlellm/__init__.py`、`saddle_llm/__init__.py`、`saddlellm/cli.py`、`saddlellm/easy.py`。
+核心文件：`pyproject.toml`、`setup.py`、`saddlellm/__init__.py`、`saddle_llm/__init__.py`、`saddlellm/cli.py`、`saddlellm/easy.py`。
 
-- `setup.py` 注册 `saddle-llm` 和 `saddlellm` 两个 console script，二者都进入 `saddlellm.cli:main`。
-- `saddlellm.__init__` 定义约 330 个公共符号，但用 `_LAZY_IMPORT_MAP` 延迟导入，避免仅 `import saddlellm` 就加载 Torch、Transformers、FastAPI 等重依赖。
-- `saddle_llm` 不重复实现业务，只把旧命名空间的属性、版本、公开名和子模块搜索路径转发给 `saddlellm`。
+- `pyproject.toml` 是发布元数据、依赖分组和 console script 的唯一来源；`setup.py` 只保留构建前端发现兼容层，不再承载元数据。
+- `saddle-llm` 和 `saddlellm` 两个 console script 都进入 `saddlellm.cli:main`。
+- `saddlellm.__init__` 从 `_exports.py` 的单一注册表派生约 400 个公共符号，并延迟导入实现模块，避免仅 `import saddlellm` 就加载 Torch、Transformers、FastAPI 等重依赖。
+- `saddle_llm` 不重复实现业务，只转发旧命名空间的属性、版本、公开名和领域子包搜索路径；历史平铺实现模块不属于长期兼容契约。
 - `cli.main` 只负责参数声明与命令分派；每个 `_cmd_*` 函数负责把 CLI 参数转换为领域入口调用，并用退出码区分成功/失败。
 - `easy.py` 是便捷门面，适合交互式实验；稳定生产链仍应优先走配置、校验和 orchestrator。
 
@@ -139,7 +163,7 @@ CLI 命令按职责分为：
 
 | 类别 | 命令 |
 |---|---|
-| 工作区/配置 | `init`、`import-data`、`create-recipe`、`plan`、`validate-config`、`preflight` |
+| 工作区/配置 | `quickstart`、`import-data`、`plan`、`validate-config`、`preflight`、`plugins` |
 | 训练/检查 | `train`、`doctor`、`smoke-test`、`inspect-data`、`inspect-vla` |
 | 世界模型 | `train-world-model`、`world-model-backends`、`infer-world-model` |
 | 空间智能 | `build-spatial-world-data`、`evaluate-spatial-world-model`、`plan-spatial-route`、`spatial-studio`、`world-agent-run`、`world-agent-api` |
@@ -147,27 +171,15 @@ CLI 命令按职责分为：
 
 ### 4.2 配置、工厂与规划
 
-核心文件：`TrainingFactory.py`、`TrainingRecipe.py`、`SimpleFlow.py`、`TrainingConfigValidator.py`、`TrainingPlanEstimator.py`、`DatasetManifest.py`、`FactoryBackendPlanner.py`、`BackendAdapters.py`。
+核心文件：`factory/Quickstart.py`、`factory/TrainingFactory.py`、`training/TrainingConfigValidator.py`、`training/TrainingPlanEstimator.py`、`data/DatasetManifest.py`、`factory/FactoryBackendPlanner.py`、`factory/BackendAdapters.py`。
 
-#### SimpleFlow
+#### 统一配置
 
-`SimpleFlowCompiler` 面向最常见的 `sft+dpo+eval+export` 流程：
-
-1. 解析 `flow` 字符串并去重；`full` 展开为 SFT、对齐、评测、导出。
-2. 拒绝当前尚未接入的 `grpo`/`serve` 短流程 token 和互斥的 `dpo+kto`。
-3. 将扁平、易写的字段编译成规范的 `model/data/training/distributed/eval/export` 配置。
-4. 将 `dpo`/`kto` 统一映射为 orchestrator 的 `preference` stage。
-
-#### TrainingRecipe
-
-`TrainingRecipe` 是完整、强类型的用户配方：
-
-1. `from_dict/load` 把 YAML/JSON 解析为各子配置 dataclass。
-2. `stages` 根据 stage 和 eval 开关得到有序阶段。
-3. `_resolve_sources` 从内联 sources 或 `DatasetManifest` 产生统一数据源。
-4. `_resolve_distributed` 在 `strategy=auto` 时调用 `FactoryBackendPlanner` 估算并行策略。
-5. `_compile_*` 为每一种 stage 生成 orchestrator 专用子配置。
-6. `compile/save_compiled` 输出唯一的执行契约。
+- YAML 和 JSON 使用同一结构，顶层 `stages` 是唯一的执行阶段入口。
+- `model`、`training`、`distributed`、`logging` 放公共参数。
+- 每个阶段的参数放在同名块中，例如 `sft`、`preference`、`eval`。
+- CLI 不猜格式、不编译配置，也不生成中间配置；读取和校验后直接执行。
+- `Quickstart` 和 `LLMTrainingFactory` 生成的也是这种普通配置。
 
 #### LLMTrainingFactory
 
@@ -189,30 +201,34 @@ CLI 命令按职责分为：
 
 ### 4.3 编排核心
 
-核心文件：`TrainingOrchestrator.py`。
+核心文件：`training/TrainingOrchestrator.py`、`framework/registry.py`、`framework/stages.py`。
 
 `TrainingOrchestrator` 是全框架调用图的枢纽：
 
 ```mermaid
 flowchart TD
-    Raw[规范配置 dict] --> Parse[_parse_config]
+    File[普通 YAML / JSON] --> Parse[_parse_config]
     Parse --> TC[TrainingConfig]
     TC --> Init[__init__ / _validate_config]
     Init --> Run[run]
     Run --> Dist[validate_distributed_runtime]
     Dist --> Loop{按 stages 顺序循环}
     Loop --> Dispatch[run_stage]
-    Dispatch --> Tok[tokenizer]
-    Dispatch --> Pre[pretrain]
-    Dispatch --> SFT[sft]
-    Dispatch --> Pref[preference]
-    Dispatch --> RLHF[rlhf]
-    Dispatch --> MOPD[mopd]
-    Dispatch --> VLA[vla_sft]
-    Dispatch --> MLLM[mllm_sft]
-    Dispatch --> EV[eval]
-    Dispatch --> EX[export]
-    Dispatch --> OP[operator]
+    Dispatch --> Registry[StageRegistry]
+    Registry --> Builtin[内置 OrchestratorMethodStage]
+    Registry --> External[第三方 StagePlugin]
+    Builtin --> Tok[tokenizer]
+    Builtin --> Pre[pretrain]
+    Builtin --> SFT[sft]
+    Builtin --> Pref[preference]
+    Builtin --> RLHF[rlhf]
+    Builtin --> MOPD[mopd]
+    Builtin --> VLA[vla_sft]
+    Builtin --> MLLM[mllm_sft]
+    Builtin --> EV[eval]
+    Builtin --> EX[export]
+    Builtin --> OP[operator]
+    External --> Results
     Tok & Pre & SFT & Pref & RLHF & MOPD & VLA & MLLM & EV & EX & OP --> Results[_stage_results]
     Results --> Summary[pipeline_summary.json / 日志]
 ```
@@ -220,6 +236,9 @@ flowchart TD
 执行语义：
 
 - stage 严格按用户给出的顺序运行，后段通过 `_stage_results` 获取上游 `model_path` 或 `data_path`。
+- `StageRegistry` 通过 `saddlellm.stages` entry-point group 发现第三方 Stage；发现阶段只读取元数据，配置引用时才导入实现。
+- 每个 Stage 用 `StageCapabilities` 声明分布式策略和是否进入 `ModelAdapter` 能力校验；未声明的能力会 fail closed。
+- HF 与 Saddle 是项目当前两种内置模型执行路径，由 `ModelAdapter.py` 中的简单映射选择，不作为插件扩展面。
 - 流水线失败时记录 `failed_stage` 和错误，输出汇总，随后重新抛出；CLI 再转为结构化失败响应。
 - 目前只有 `pretrain` 被声明为分布式安全；非单进程运行时，其他 stage 会 fail closed。
 - `dry_run`/`preflight_only` 对 SFT、preference、RLHF、export 写计划但不训练/导出；它们不是静默成功的假训练。
@@ -242,7 +261,7 @@ flowchart TD
 
 ### 4.4 数据与 Tokenizer
 
-核心文件：`DataPipeline.py`、`DataStrategy.py`、`DatasetManifest.py`、`DataCatalog.py`、`DataBalance.py`、`TextProcess.py`、`PostTrainingData.py`、`TrainingDataInspector.py`、`TokenizerTrainer.py`、`TokenizerLoader.py`。
+核心文件：`data/pipeline.py`、`data/text_processing.py`、`data/DataStrategy.py`、`data/DatasetManifest.py`、`data/DataCatalog.py`、`data/DataBalance.py`、`data/PostTrainingData.py`、`data/TrainingDataInspector.py`、`models/TokenizerTrainer.py`、`models/TokenizerLoader.py`。顶层 `DataPipeline.py` 和 `TextProcess.py` 只保留旧导入路径兼容。
 
 预训练数据链：
 
@@ -266,7 +285,7 @@ DataSourceConfig[]
 
 ### 4.5 模型蓝图、构建与原生运行时
 
-核心文件：`ModelRegistry.py`、`ModelBlueprint.py`、`ModelBuilder.py`、`SaddleModeling.py`、`OperatorBackends.py`、`ModelLoader.py`、`NativeTrainer.py`、`ModelMetrics.py`。
+核心文件：`models/ModelRegistry.py`、`models/ModelBlueprint.py`、`models/ModelBuilder.py`、`models/SaddleModeling.py`、`models/OperatorBackends.py`、`models/ModelLoader.py`、`training/NativeTrainer.py`、`models/ModelMetrics.py`。
 
 模型有三种表达，职责不同：
 
@@ -319,7 +338,7 @@ flowchart LR
 
 ### 4.7 评测、发布和推理
 
-核心文件：`LLModelEvalute.py`、`BenchmarkRunner.py`、`ReleaseGate.py`、`ModelExporter.py`、`InferenceServer.py`、`ModelLoader.py`、`TokenizerLoader.py`。
+核心文件：`evaluation/LLModelEvalute.py`、`evaluation/BenchmarkRunner.py`、`evaluation/ReleaseGate.py`、`runtime/ModelExporter.py`、`runtime/InferenceServer.py`、`models/ModelLoader.py`、`models/TokenizerLoader.py`。
 
 发布链遵守“评测决定能否发布，导出负责形成可复现目录，服务只加载完整 release”的职责分离：
 
@@ -343,9 +362,9 @@ flowchart LR
 ### 4.8 蒸馏、压缩、安全和观测
 
 - 蒸馏：`UniversalDistiller`、`RapidDistill`、`DistillationTrainer`、`distill`。
-- 量化：`ModelQuantizer`、`quantize`。
-- 剪枝：`ModelPruner`、`prune`。
-- 组合门面：`Lightweight`、`Deploy`。
+- 模型压缩的规范实现集中在 `saddlellm/compression/`：`quantizer`、`pruner`、`lightweight` 分别负责量化、剪枝和组合门面。
+- 顶层 `ModelQuantizer.py`、`ModelPruner.py`、`Lightweight.py` 仅作为旧导入路径的兼容层；旧 CLI 实现 `quantize.py`、`prune.py` 也归入 `compression/`。
+- 部署门面由 `runtime/Deploy.py` 提供，并直接依赖压缩子包。
 - 安全生成：`SafeGenerate` 处理反重复和输出过滤，但不等于完整内容安全系统。
 - 观测与实验：`ExperimentTracker`、`TrainingMonitor`、`monitordashbord`、`TrainerUtils`、`SmokeTestRunner`、`CurriculumScheduler`、`ScalingLawAnalyzer`。
 
@@ -353,7 +372,7 @@ flowchart LR
 
 ### 4.9 原生世界模型
 
-核心文件：`_WorldModel.py`、`_CategoricalWorldModel.py`、`WorldModelBackends.py`、`WorldModelData.py`、`_WorldModelTrainer.py`、`WorldModelInference.py`。
+核心文件：`world_models/_WorldModel.py`、`world_models/_CategoricalWorldModel.py`、`world_models/WorldModelBackends.py`、`world_models/WorldModelData.py`、`world_models/_WorldModelTrainer.py`、`world_models/WorldModelInference.py`。
 
 两种后端共享训练/推理门面：
 
@@ -375,7 +394,12 @@ state feature → observation/reward/continue/(collision/occupancy/motion) heads
 
 ### 4.10 空间世界模型与 WorldAgent
 
-核心文件：`SpatialPerception.py`、`SpatialPlanner.py`、`SpatialWorldModel.py`、`SpatialWorldModelControl.py`、`SpatialWorldModelData.py`、`SpatialWorldModelEvaluation.py`、`SpatialVisualization.py`、`SpatialAPI.py`、`WorldAgent.py`、`WorldAgentAPI.py`。
+核心文件：`spatial/SpatialPerception.py`、`spatial/SpatialPlanner.py`、`spatial/SpatialWorldModel.py`、`spatial/SpatialWorldModelControl.py`、`spatial/SpatialWorldModelData.py`、`spatial/SpatialWorldModelEvaluation.py`、`spatial/SpatialVisualization.py`、`spatial/SpatialAPI.py`、`spatial/WorldAgent.py`、`spatial/WorldAgentAPI.py`。
+
+`SpatialWorldModelEvaluation` 从真实首帧建立 posterior，随后只使用动作进行 prior rollout。
+报告既保留整段 occupancy/reward/motion/collision 指标，也输出逐步 `horizon_curve`、
+首末步 `rollout_drift` 和 continuation 对应的终止概率校准。短 episode 的 padding 始终由
+mask 排除，避免把复制帧计入长期预测质量。
 
 #### 单次空间规划
 
@@ -436,24 +460,13 @@ sequenceDiagram
     autonumber
     actor U as 用户
     participant CLI as cli.main/_cmd_train
-    participant C as SimpleFlow或TrainingRecipe
     participant O as TrainingOrchestrator
     participant D as DistributedRuntime
     participant S as Stage Executor
     participant A as Artifact Store
 
     U->>CLI: saddle-llm train config.yaml
-    CLI->>CLI: _load_config
-    alt 配置含 flow
-        CLI->>C: SimpleFlowCompiler.compile(raw)
-        C-->>CLI: canonical dict
-        CLI->>A: 保存 compiled_orchestrator.yaml
-    else 配方字段 stage/method/backend
-        CLI->>C: TrainingRecipe.from_dict + save_compiled
-        C-->>CLI: canonical dict
-    else 已是规范配置
-        CLI->>CLI: 直接使用
-    end
+    CLI->>CLI: 读取配置并校验顶层 stages
     alt --dry-run
         CLI-->>U: stages/distributed/data_sources
     else 正式执行
@@ -695,31 +708,26 @@ sequenceDiagram
 
 | 模块组 | 文件 | 逻辑 |
 |---|---|---|
-| 公共入口/兼容 | `__init__`、`cli`、`easy`、`saddle_llm/__init__` | 延迟导出、命令分派、便捷 API、旧包名转发 |
-| 工厂/配方/编排 | `TrainingFactory`、`TrainingRecipe`、`SimpleFlow`、`TrainingOrchestrator`、`DomainBuilder` | 用户意图转规范配置，再按 stage 执行 |
-| 静态检查/资源计划 | `TrainingConfigValidator`、`TrainingPlanEstimator`、`TrainingStrategyAdvisor`、`FactoryBackendPlanner`、`BackendAdapters`、`Architecture` | 可执行性、规模、后端和架构能力判断 |
-| 分布式 | `DistributedConfig`、`DistributedRuntime` | 训练参数转换、进程组状态、barrier 和 fail-closed 检查 |
-| 数据 | `DataPipeline`、`DataStrategy`、`DataCatalog`、`DataBalance`、`DatasetManifest`、`TextProcess`、`PostTrainingData`、`TrainingDataInspector` | 收集、清洗、配比、manifest、格式规范化和 preflight |
-| Tokenizer | `TokenizerTrainer`、`TokenizerLoader` | 训练/评估/保存及兼容加载 |
-| 模型设计 | `ModelRegistry`、`ModelBlueprint`、`ModelBuilder`、`ModelExperimentPlanner`、`OperatorBackends` | 规格、蓝图、组件组合、对照实验和算子后端 |
-| 原生 Causal LM | `SaddleModeling`、`ModelLoader`、`NativeTrainer`、`ModelMetrics` | 原生 Transformer、统一加载、Trainer 生命周期、MoE/模型指标 |
-| 预训练 | `DensePretrainer`、`pretrain`、`PretrainExperimentRunner`、`PretrainEvalSuite`、`PretrainReport`、`PretrainStability` | 训练、实验网格、评测、报告和稳定性 |
-| SFT/偏好/RL | `PeftSFTTrainer`、`Preference`、`GRPOTrainer`、`RLScaling`、`RLHFTrainer`、`PublicPolicyRLVR`、`PublicPolicySFT` | SFT、离线偏好优化、GRPO/RL 工具和领域 pilot |
-| 对齐实验 | `FrontierAlign`、`AdvancedTechniques`、`ExclusiveTechniques`、`OnPolicyDistillation` | 宪法式对齐、EMA/自洽、MTP/MoE 技术、on-policy 多教师蒸馏 |
-| 多模态/VLA | `VisionBackbones`、`MultimodalProjector`、`MultimodalModeling`、`SaddleMultimodalModeling`、`MultimodalData`、`VLA`、`VLADataInspector`、`VLATrainer` | 视觉编码、projector、VLM 包装、动作 token 和行为克隆 |
-| 世界模型 | `_WorldModel`、`_CategoricalWorldModel`、`WorldModelBackends`、`WorldModelData`、`_WorldModelTrainer`、`WorldModelInference` | RSSM 模型、数据、训练、保存/加载、rollout 与规划 |
-| 空间智能 | `SpatialPerception`、`SpatialPlanner`、`SpatialWorldModel`、`SpatialWorldModelControl`、`SpatialWorldModelData`、`SpatialWorldModelEvaluation`、`SpatialVisualization` | 图像到栅格、Top-K A*、RSSM 评分/MPC、数据生成、评测、可视化 |
-| Agent/API | `WorldAgent`、`WorldAgentAPI`、`SpatialAPI` | 有状态闭环、HTTP 协议、Studio 请求级编排 |
-| 评测/发布/服务 | `LLModelEvalute`、`BenchmarkRunner`、`ReleaseGate`、`ModelExporter`、`InferenceServer` | 指标、发布门禁、可验证 release、OpenAI 兼容服务 |
-| 压缩/部署 | `UniversalDistiller`、`RapidDistill`、`DistillationTrainer`、`distill`、`ModelQuantizer`、`quantize`、`ModelPruner`、`prune`、`Lightweight`、`Deploy` | 蒸馏、量化、剪枝和部署门面 |
-| 安全/观测/工具 | `SafeGenerate`、`ExperimentTracker`、`TrainingMonitor`、`monitordashbord`、`TrainerUtils`、`SmokeTestRunner`、`CurriculumScheduler`、`ScalingLawAnalyzer` | 输出过滤、实验追踪、训练诊断、smoke、课程和 scaling law |
-| 外部/旧后端适配 | `AgentModelProvider`、`AgentOperators`、`RealWorldOperators`、`PostTrainingCompatibility`、`LLMLoader`、`load_model`、`LoRATuner`、`PromptTuner`、`TRLFullFineTuner`、`SwiftFullFineTuner`、`UnslothFineTuner`、`UnslothSFTTrainer` | 外部模型/agent/训练后端兼容以及旧 API 保留 |
+| 公共入口/兼容 | 顶层 `__init__`、`_exports`、`cli`、`easy`、五个 shim、`saddle_llm/__init__` | 延迟导出、命令分派、便捷 API、受控兼容 |
+| 工厂/配方/规划 | `factory/` | 用户意图、配方和短流程转为规范配置 |
+| 编排与训练 | `training/`、`framework/` | stage 执行、预/后训练、分布式运行与插件协议 |
+| 数据 | `data/` | 收集、清洗、配比、manifest、格式规范化和 preflight |
+| 模型设计与加载 | `models/` | 规格、蓝图、组件组合、原生模型、加载与 tokenizer |
+| SFT 后端适配 | `tuning/` | LoRA、Prompt、TRL、Swift 与 Unsloth 训练入口 |
+| 对齐 | `alignment/` | 偏好/RL、GRPO、安全生成和实验性对齐技术 |
+| 蒸馏与压缩 | `distillation/`、`compression/` | 蒸馏、量化、剪枝和轻量化 |
+| 多模态/VLA | `multimodal/` | 视觉编码、媒体生成、VLM 包装、动作 token 和行为克隆 |
+| 世界模型 | `world_models/` | RSSM 模型、数据、训练、保存/加载、rollout 与规划 |
+| 空间智能与 Agent | `spatial/` | 感知、路径规划、RSSM 评分、控制、HTTP API 和闭环 agent |
+| 评测与实验 | `evaluation/`、`experiments/` | 指标、门禁、实验追踪、报告、稳定性与 scaling law |
+| 发布与服务 | `runtime/` | 模型导出、部署、推理 API、Chat UI 与运行监控 |
+| 外部集成与工具 | `agents/`、`utils/` | 模型服务/agent 算子、可选依赖和训练诊断 |
 
 ## 7. 产物和状态契约
 
 | 产物 | 生产者 | 消费者 |
 |---|---|---|
-| `compiled_orchestrator.yaml/json` | `SimpleFlowCompiler` / `TrainingRecipe` | `TrainingOrchestrator`、launch script |
+| `config.yaml/json` | 用户、`Quickstart`、`LLMTrainingFactory` | `TrainingOrchestrator`、launch script |
 | `backend_plan.json` / `launch_plan.json` / `launch.ps1` | backend planner/adapter | 用户、调度环境 |
 | stage plan JSON | orchestrator 各后训练 stage | preflight、审计、用户 |
 | `final_model/` / stage checkpoints | Trainer | 后续 stage、Evaluator、Exporter |
@@ -746,7 +754,7 @@ sequenceDiagram
 
 当前测试不是平均覆盖全部实验模块，而是重点保护主合同：
 
-- 配置与后训练：simple flow 编译、真实 tiny post-training smoke、release gate/export/server。
+- 配置与后训练：统一 `stages` 配置、真实 tiny post-training smoke、release gate/export/server。
 - 原生模型：蓝图等价、异构层、残差、MoE、gradient checkpoint、checkpoint 生命周期。
 - 分布式：CPU gloo DDP 对齐、rank-zero manifest、精确 resume、FSDP 配置和未支持 hybrid fail-closed。
 - 世界模型：Gaussian/Categorical RSSM、训练、保存加载、rollout、连续/离散规划。

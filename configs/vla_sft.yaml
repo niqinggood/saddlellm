@@ -1,34 +1,42 @@
 project: saddlellm
 experiment: vla-sft
-stage: vla_sft
+stages: [vla_sft, eval]
+
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
   tokenizer: Qwen/Qwen2.5-7B-Instruct
   backend: hf
-  pretrain_mode: continue
-data:
-  sources:
-    - type: local
-      path: data/robot.jsonl
-      format: jsonl
-  max_seq_length: 2048
+pretrain_mode: continue
+
 vla:
   enabled: true
   data_path: data/robot.jsonl
   image_root: data/images
-  action_dim: 7
-  action_bins: 256
-  control_hz: 10
-  coordinate_frame: end_effector_delta
-  train: false
+  output_dir: outputs/vla_sft/vla
+  action_space:
+    action_dim: 7
+    action_type: continuous
+    bins: 256
+    min_value: -1.0
+    max_value: 1.0
+    include_gripper: true
+    control_hz: 10
+    coordinate_frame: end_effector_delta
+  vision_backbone: tiny_patch
+  projector: mlp
   use_lora: true
+  use_qlora: false
+  train: false
+
+eval:
+  enabled: true
+
 training:
-  preflight_only: false
-  per_device_batch_size: 1
-  global_batch_size: 8
-  learning_rate: 0.0002
-  epochs: 1
   max_steps: 1000
+
+distributed:
+  strategy: single
+
 logging:
   output_dir: outputs/vla_sft
   backend: local

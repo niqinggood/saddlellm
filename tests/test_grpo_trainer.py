@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from saddlellm.GRPOTrainer import GRPOConfig, GRPOTrainer
+from saddlellm.alignment.GRPOTrainer import GRPOConfig, GRPOTrainer
 
 
 def test_config_validates_sequence_budget_and_optimization_values():

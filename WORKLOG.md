@@ -1023,7 +1023,7 @@ saddle-llm world-agent-run data\spatial_floorplan_example.pbm `
 
 #### 可配置流程
 
-- `SimpleFlow` 支持更短的 flow 配置。
+- `FlowConfigAdapter` 支持字段较少的 Flow 配置。
 - 数据检查、SFT、偏好训练、评测、导出可以按需组合。
 - `flow: full` 会编译为 SFT、偏好训练、评测和导出流程。
 - DPO、ORPO、KTO 已接入统一偏好数据和训练入口。
@@ -1342,7 +1342,7 @@ README.md
 分布式配置已贯通：
 
 - `TrainingRecipe`
-- `SimpleFlow`
+- `FlowConfigAdapter`
 - `TrainingOrchestrator`
 - `TrainingConfigValidator`
 - `BackendAdapterRegistry`

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from saddlellm.LatentFlowModel import (
+from saddlellm.multimodal.LatentFlowModel import (
     ConditionalLatentFlowTransformer,
     LatentFlowConfig,
 )

@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from saddlellm import WorldModel, WorldModelConfig, WorldModelRuntime
-from saddlellm.SpatialAPI import (
+from saddlellm.spatial.SpatialAPI import (
     SpatialStudioService,
     SpatialStudioSettings,
     create_spatial_studio_app,

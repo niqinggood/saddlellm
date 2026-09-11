@@ -5,17 +5,16 @@ import pytest
 import torch
 from torch import nn
 
-from saddlellm.ModelBlueprint import (
+from saddlellm.models.ModelBlueprint import (
     AttentionBlueprint,
     FFNBlueprint,
     LayerBlueprint,
     ModelBlueprint,
     ResidualBlueprint,
 )
-from saddlellm.ModelBuilder import ModelComponentRegistry, SaddleModelBuilder
-from saddlellm.SaddleModeling import SaddleForCausalLM, SaddleMoE, SaddleSwiGLU
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
-from saddlellm.TrainingRecipe import RecipeModelConfig, TrainingRecipe
+from saddlellm.models.ModelBuilder import ModelComponentRegistry, SaddleModelBuilder
+from saddlellm.models.SaddleModeling import SaddleForCausalLM, SaddleMoE, SaddleSwiGLU
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 def _attention(kind="gqa", **overrides):
@@ -662,22 +661,21 @@ def test_training_orchestrator_rejects_conflicting_blueprint_locations():
         )
 
 
-def test_training_recipe_compile_preserves_model_blueprint(tmp_path):
-    blueprint = _tiny_mapping("recipe-blueprint")
-    recipe = TrainingRecipe(
-        experiment="composed-model-recipe",
-        stage="eval",
-        model=RecipeModelConfig(
-            config="qwen-tiny-160m",
-            backend="saddle",
-            blueprint=blueprint,
-        ),
-    )
+def test_plain_config_preserves_model_blueprint():
+    blueprint = _tiny_mapping("config-blueprint")
+    config = {
+        "experiment": "composed-model",
+        "stages": ["eval"],
+        "model": {
+            "config": "qwen-tiny-160m",
+            "backend": "saddle",
+            "blueprint": blueprint,
+        },
+    }
 
-    compiled = recipe.compile(base_dir=str(tmp_path))
-    parsed = TrainingOrchestrator._parse_config(compiled)
+    parsed = TrainingOrchestrator._parse_config(config)
 
-    assert compiled["model"]["blueprint"] == blueprint
+    assert config["model"]["blueprint"] == blueprint
     assert parsed.model_blueprint == blueprint
 
 

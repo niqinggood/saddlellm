@@ -1,14 +1,14 @@
 import numpy as np
 import torch
 
-from saddlellm.LatentFlowModel import LatentFlowConfig
-from saddlellm.LatentFlowTrainer import (
+from saddlellm.multimodal.LatentFlowModel import LatentFlowConfig
+from saddlellm.multimodal.LatentFlowTrainer import (
     CachedLatentDataset,
     LatentFlowTrainingConfig,
     load_latent_flow_checkpoint,
     train_latent_flow,
 )
-from saddlellm.TrainingOrchestrator import TrainingOrchestrator
+from saddlellm.training.TrainingOrchestrator import TrainingOrchestrator
 
 
 def test_cached_latent_training_and_reload(tmp_path):

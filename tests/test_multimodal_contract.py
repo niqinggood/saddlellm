@@ -2,12 +2,12 @@ import json
 
 import pytest
 
-from saddlellm.ModalityCodec import (
+from saddlellm.multimodal.ModalityCodec import (
     CallableModalityCodec,
     ModalityCodecRegistry,
     ModalityCodecSpec,
 )
-from saddlellm.MultimodalData import MultimodalDataAdapter, MultimodalSegment
+from saddlellm.multimodal.MultimodalData import MultimodalDataAdapter, MultimodalSegment
 
 
 def test_legacy_image_record_normalizes_to_v2_segments(tmp_path):

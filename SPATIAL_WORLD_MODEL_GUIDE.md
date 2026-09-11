@@ -26,7 +26,7 @@ Qwen-VL 只负责语义理解和坐标指代；是否能走、路径是否穿墙
 安装项目后直接启动同一个 FastAPI 服务；React 生产包已随 `saddlellm` 一起提供：
 
 ```powershell
-python -m pip install -e .
+python -m pip install -e ".[spatial]"
 saddle-llm spatial-studio --host 127.0.0.1 --port 7865
 ```
 
@@ -185,6 +185,15 @@ saddle-llm evaluate-spatial-world-model `
   --group-value "1:spatial_floorplan_variant" `
   --output outputs\spatial_world_model_v2_hybrid_eval_h20.json
 ```
+
+评测报告不只提供整段平均值：
+
+- `horizon_curve` 按第 1、2、…、N 步报告占用 mean IoU、copy-last 增益、奖励误差、
+  自身运动误差、碰撞校准和终止校准；padding 不会计入曲线。
+- `rollout_drift` 汇总首步到最后一个有效步的占用 IoU 与奖励误差变化，用于快速发现
+  长时漂移。
+- `termination` 把模型 continuation 头转换为终止概率，报告 Brier、ECE、准确率、
+  precision/recall 和正样本数量。没有真实终止样本时应重点看 Brier/ECE，不能只看准确率。
 
 | 留出集指标 | 5 步 | 20 步 |
 | --- | ---: | ---: |

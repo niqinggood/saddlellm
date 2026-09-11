@@ -1,7 +1,8 @@
-"""Backward-compatible import alias for the canonical :mod:`saddlellm` package.
+"""Backward-compatible alias for the canonical :mod:`saddlellm` package.
 
-New code should import ``saddlellm``.  This namespace remains so older code
-using ``saddle_llm.SomeModule`` continues to resolve during the rename.
+New code should import ``saddlellm``. Public top-level symbols and canonical
+subpackages are forwarded; historical flat implementation-module paths are
+not part of the compatibility contract.
 """
 
 from __future__ import annotations
