@@ -1,0 +1,93 @@
+# Research reference, NOT a Kimi checkpoint or a fused KDA kernel.
+# Supply your own licensed UTF-8 corpus at data/train.jsonl: {"text": "..."}.
+project: saddle-hybrid-research
+experiment: kda-gqa-block-attnres
+seed: 42
+stages: [tokenizer, pretrain]
+pretrain_mode: scratch
+
+model:
+  backend: saddle
+  config: saddle-hybrid-research
+  local_files_only: true
+  blueprint:
+    name: saddle-hybrid-research
+    family: saddle
+    hidden_size: 128
+    vocab_size: 8192
+    max_position_embeddings: 128
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 4
+      num_kv_heads: 2
+    ffn:
+      kind: swiglu
+      intermediate_size: 512
+    residual:
+      topology: serial
+      attention_mode: block
+      block_size: 4  # 4 sublayers = 2 decoder layers, NOT 4 decoder layers
+    layers:
+      - name: recurrent
+        repeat: 3
+        attention:
+          kind: kda
+          backend: eager
+          kda_conv_size: 4
+          kda_gate_rank: 0
+      - name: global
+        repeat: 1
+        attention:
+          kind: gqa
+          backend: sdpa
+
+tokenizer_training:
+  algorithm: bpe
+  vocab_size: 8192
+  min_frequency: 2
+  byte_level: true
+  output_dir: outputs/hybrid_kda_attnres/tokenizer
+
+data:
+  sources:
+    - type: local
+      path: data/train.jsonl
+      text_column: text
+      streaming: false
+  max_seq_length: 128
+  min_text_length: 1
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 1
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.0
+
+training:
+  max_steps: 20
+  per_device_batch_size: 1
+  global_batch_size: 2
+  learning_rate: 0.0003
+  min_lr: 0.0
+  warmup_steps: 2
+  save_every_steps: 10
+  log_every_steps: 1
+  keep_last_n_checkpoints: 2
+  load_best_model_at_end: false
+  gradient_checkpointing: true
+  loss_chunk_size: 32
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: false
+  fp16: false
+
+logging:
+  output_dir: outputs/hybrid_kda_attnres/run
+  backend: local

@@ -1,0 +1,4 @@
+{"instruction":"Summarize: The package arrived two days late.","output":"The delivery was delayed."}
+{"instruction":"Summarize: The customer received a damaged item.","output":"The item arrived damaged."}
+{"instruction":"Summarize: The invoice was paid twice by mistake.","output":"The customer made a duplicate payment."}
+{"instruction":"Summarize: The customer wants to change their delivery address.","output":"The customer requests an address change."}

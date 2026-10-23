@@ -1,0 +1,98 @@
+# Reproducible Chinese-first bilingual scratch-pretraining run.
+# Corpus provenance and checksums:
+# outputs/zh_en_small_pretrain_v2_20260923/assets/corpus_manifest.json
+project: saddle-zh-en-small
+experiment: zh-en-32k-28m
+seed: 42
+stages: [pretrain]
+pretrain_mode: scratch
+
+model:
+  backend: saddle
+  config: zh-en-32k-28m
+  tokenizer: outputs/zh_en_small_pretrain_v2_20260923/tokenizer32k
+  local_files_only: true
+  blueprint:
+    name: zh-en-32k-28m
+    family: qwen
+    hidden_size: 384
+    vocab_size: 32768
+    num_layers: 10
+    max_position_embeddings: 512
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 6
+      num_kv_heads: 2
+      rope_theta: 10000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 1024
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+data:
+  sources:
+    - type: local
+      path: outputs/zh_en_small_pretrain_v2_20260923/assets/zh_story.jsonl
+      text_column: text
+      streaming: false
+    - type: local
+      path: outputs/zh_en_small_pretrain_v2_20260923/assets/zh_wikipedia.jsonl
+      text_column: text
+      streaming: false
+    - type: local
+      path: outputs/zh_en_small_pretrain_v2_20260923/assets/en_story.jsonl
+      text_column: text
+      streaming: false
+  # The weights match source row counts (5:1:1), so interleaving consumes
+  # essentially all three corpora instead of stopping at the shortest source.
+  source_weights: [0.7142857, 0.14285715, 0.14285715]
+  output_dir: outputs/zh_en_small_pretrain_v2_20260923/processed_32k_256
+  max_seq_length: 256
+  min_text_length: 40
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 4
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.01
+
+training:
+  # 12k * 16 sequences * 256 tokens = 49.15M training-token positions.
+  max_steps: 12000
+  per_device_batch_size: 16
+  global_batch_size: 16
+  learning_rate: 0.0003
+  min_lr: 0.00003
+  lr_scheduler: cosine
+  warmup_steps: 500
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+  eval_every_steps: 1000
+  save_every_steps: 2000
+  keep_last_n: 3
+  log_every_steps: 50
+  load_best_model_at_end: true
+  gradient_checkpointing: false
+  loss_chunk_size: 512
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+
+logging:
+  output_dir: outputs/zh_en_small_pretrain_v2_20260923/run_28m
+  backend: local

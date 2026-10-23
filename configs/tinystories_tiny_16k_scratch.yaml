@@ -1,0 +1,92 @@
+# 16k-token from-scratch TinyStories experiment for readable-generation validation.
+project: saddle-tinystories
+experiment: tiny-stories-16k
+seed: 42
+stages: [tokenizer, pretrain]
+pretrain_mode: scratch
+
+model:
+  backend: saddle
+  config: tinystories-tiny-16k
+  local_files_only: true
+  blueprint:
+    name: tinystories-tiny-16k
+    family: qwen
+    hidden_size: 256
+    vocab_size: 16384
+    num_layers: 6
+    max_position_embeddings: 256
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 4
+      num_kv_heads: 2
+      rope_theta: 10000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 704
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+tokenizer_training:
+  algorithm: bpe
+  vocab_size: 16384
+  min_frequency: 2
+  max_token_length: 64
+  byte_level: true
+  output_dir: outputs/tinystories_saddle_tiny_20260923_vocab16k/tokenizer
+  eval_max_samples: 1000
+
+data:
+  sources:
+    - type: local
+      path: outputs/tinystories_saddle_tiny_20260923/assets/stories.jsonl
+      text_column: text
+      streaming: false
+  output_dir: outputs/tinystories_saddle_tiny_20260923_vocab16k/processed
+  max_seq_length: 256
+  min_text_length: 80
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 1
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.05
+
+training:
+  max_steps: 10000
+  per_device_batch_size: 4
+  global_batch_size: 8
+  learning_rate: 0.0003
+  min_lr: 0.00003
+  lr_scheduler: cosine
+  warmup_steps: 300
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+  eval_every_steps: 500
+  save_every_steps: 1000
+  keep_last_n_checkpoints: 3
+  log_every_steps: 50
+  load_best_model_at_end: true
+  gradient_checkpointing: false
+  loss_chunk_size: 128
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+
+logging:
+  output_dir: outputs/tinystories_saddle_tiny_20260923_vocab16k/run
+  backend: local

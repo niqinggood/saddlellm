@@ -1,0 +1,14 @@
+ptq:
+  enabled: false
+qat:
+  enabled: true
+  backend: portable-int8-weight-only
+  train_data: examples/retention/business.train.jsonl
+  validation_data: examples/retention/business.validation.jsonl
+  validation_split: 0
+  max_steps: 100
+  batch_size: 1
+  learning_rate: 0.00002
+  max_seq_length: 512
+  device: cpu
+  local_files_only: true

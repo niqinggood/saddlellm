@@ -1,0 +1,28 @@
+# Replace model paths and teacher endpoint before real execution.
+stages: [mopd]
+model:
+  backend: hf
+  name_or_path: /models/llama-3.2-1b
+backends:
+  training: default
+  rollout: sglang
+  sglang:
+    mode: http
+    base_url: http://127.0.0.1:30000
+    policy_version: student-v1
+    refresh_weights: true
+    concurrency: 4
+    max_pending_requests: 128
+    timeout_seconds: 120
+mopd:
+  enabled: true
+  dry_run: false
+  prompts_path: data/prompts.jsonl
+  max_new_tokens: 128
+  teachers:
+    - type: endpoint
+      name: local-teacher
+      model: teacher
+      endpoint_url: http://127.0.0.1:30001/v1
+logging:
+  output_dir: outputs/sglang-mopd

@@ -77,22 +77,59 @@ def validate_distributed_runtime(
     if strategy == "single":
         if info.world_size != 1:
             raise ValueError(
-                f"distributed.strategy='single' cannot run with WORLD_SIZE={info.world_size}"
+                "distributed.strategy='single' cannot run with "
+                f"WORLD_SIZE={info.world_size}"
             )
         return info
 
     if strategy not in {"ddp", "fsdp", "deepspeed_zero2", "deepspeed_zero3"}:
         raise ValueError(f"unsupported distributed strategy: {strategy!r}")
     if expected < 2:
-        raise ValueError(f"distributed.strategy={strategy!r} requires at least 2 processes")
+        raise ValueError(
+            f"distributed.strategy={strategy!r} requires at least 2 processes"
+        )
     if require_initialized and info.world_size == 1:
         raise RuntimeError(
             f"distributed.strategy={strategy!r} requires a multi-process launcher; "
             "use the generated launch script or torchrun/accelerate launch"
         )
+    if info.world_size > 1:
+        missing = [
+            name
+            for name in ("RANK", "LOCAL_RANK")
+            if os.environ.get(name) in {None, ""}
+        ]
+        if missing:
+            raise RuntimeError(
+                "distributed worker environment is incomplete; missing "
+                + ", ".join(missing)
+            )
+        if not 0 <= info.rank < info.world_size:
+            raise ValueError(
+                f"RANK={info.rank} must be in [0, WORLD_SIZE={info.world_size})"
+            )
+        if not 0 <= info.local_rank < info.local_world_size:
+            raise ValueError(
+                "LOCAL_RANK must be in [0, LOCAL_WORLD_SIZE); got "
+                f"{info.local_rank} and {info.local_world_size}"
+            )
+        try:
+            import torch
+
+            if (
+                torch.cuda.is_available()
+                and info.local_rank >= torch.cuda.device_count()
+            ):
+                raise ValueError(
+                    f"LOCAL_RANK={info.local_rank} cannot address only "
+                    f"{torch.cuda.device_count()} visible CUDA device(s)"
+                )
+        except ImportError:
+            pass
     if info.world_size > 1 and info.world_size != expected:
         raise ValueError(
-            f"configured world size is {expected} ({num_gpus} processes x {num_nodes} nodes), "
+            f"configured world size is {expected} "
+            f"({num_gpus} processes x {num_nodes} nodes), "
             f"but launcher WORLD_SIZE is {info.world_size}"
         )
     return info
@@ -101,11 +138,13 @@ def validate_distributed_runtime(
 def distributed_barrier() -> None:
     try:
         import torch.distributed as dist
-
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            dist.barrier()
-    except Exception:
+    except ImportError:
         return
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        # Once a process group exists, a failed barrier is a real consistency
+        # error. Propagating it prevents the next stage from consuming a
+        # partially written checkpoint.
+        dist.barrier()
 
 
 def _env_int(name: str, default: int) -> int:

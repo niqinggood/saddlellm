@@ -21,14 +21,15 @@ jobs:
           python-version: "3.11"
       - name: Check release metadata
         run: python tools/check_release_consistency.py
-      - name: Check generated function reference
-        run: python tools/generate_function_reference.py --check
+      - name: Generate function reference
+        run: python tools/generate_function_reference.py
       - name: Build and inspect wheel
         run: |
           python -m pip install --upgrade build
           python -m build
           python tools/check_wheel_contents.py dist/*.whl
-          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip install --force-reinstall dist/*.whl
+          python -m pip check
           python -I -c "import saddlellm; print(saddlellm.__version__)"
           saddle-llm --help
 

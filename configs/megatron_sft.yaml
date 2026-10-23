@@ -1,0 +1,32 @@
+# Linux CUDA + an installed Megatron Bridge runtime are required.
+# Native training.max_steps/use_lora knobs do not configure Bridge recipes.
+stages: [sft]
+model:
+  backend: hf
+  name_or_path: /models/llama-3.2-1b
+backends:
+  training: megatron
+  rollout: native
+  megatron:
+    recipe: megatron.bridge.recipes.llama:llama32_1b_sft_config
+    nproc_per_node: 1
+    hf_export_source: /models/llama-3.2-1b
+    overrides:
+      train:
+        train_iters: 100
+        global_batch_size: 2
+        micro_batch_size: 1
+      model:
+        tensor_model_parallel_size: 1
+        pipeline_model_parallel_size: 1
+        context_parallel_size: 1
+        seq_length: 1024
+      dataset:
+        seq_length: 1024
+sft:
+  enabled: true
+  data_path: data/sft.jsonl
+eval:
+  enabled: false
+logging:
+  output_dir: outputs/megatron-sft

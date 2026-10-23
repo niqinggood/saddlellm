@@ -1,6 +1,6 @@
 project: saddlellm
 experiment: mopd-sft
-stages: [mopd, sft, eval]
+stages: [mopd]
 
 model:
   name_or_path: Qwen/Qwen2.5-7B-Instruct
@@ -16,10 +16,13 @@ mopd:
     - name: placeholder_teacher
       domain: general
       weight: 1.0
+  teacher_concurrency: 4
+  requires_review: true
   dry_run: true
 
 sft:
-  enabled: true
+  # Enable only after replacing data_path with the domain-reviewed JSONL.
+  enabled: false
   data_path: ""
   use_lora: true
   use_qlora: false
@@ -29,7 +32,7 @@ sft:
   max_seq_length: 2048
 
 eval:
-  enabled: true
+  enabled: false
 
 training:
   max_steps: 1000

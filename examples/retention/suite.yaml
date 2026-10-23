@@ -1,0 +1,29 @@
+# Tiny wiring examples only. Replace with representative, independent benchmarks.
+# max_drop is an absolute metric difference, not a relative percentage.
+schema_version: 1
+name: posttraining-capability-smoke
+tasks:
+  - name: general_retention
+    task: completion
+    data: general.validation.jsonl
+    split: validation
+    options:
+      max_length: 256
+      device: auto
+      local_files_only: true
+    metrics:
+      completion_nll:
+        higher_is_better: false
+        max_drop: 0.15
+  - name: business_quality
+    task: completion
+    data: business.validation.jsonl
+    split: validation
+    options:
+      max_length: 256
+      device: auto
+      local_files_only: true
+    metrics:
+      completion_nll:
+        higher_is_better: false
+        max_drop: 0.05

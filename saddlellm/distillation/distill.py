@@ -11,6 +11,8 @@ import os
 import json
 import random
 
+from ._model_compat import inputs_requiring_logits
+
 # 设置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -116,10 +118,18 @@ class DistillationTrainer(Trainer):
         """
         # 检查模型需要哪些输入参数
         signature = inspect.signature(model.forward)
+        accepts_arbitrary_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
         expected_inputs = list(signature.parameters.keys())
 
         # 过滤掉模型不需要的参数
-        filtered_inputs = {k: v for k, v in inputs.items() if k in expected_inputs}
+        filtered_inputs = (
+            dict(inputs)
+            if accepts_arbitrary_kwargs
+            else {k: v for k, v in inputs.items() if k in expected_inputs}
+        )
 
         # 确保只提供input_ids或inputs_embeds中的一个
         if 'input_ids' in filtered_inputs and 'inputs_embeds' in filtered_inputs:
@@ -133,7 +143,8 @@ class DistillationTrainer(Trainer):
                 filtered_inputs['input_ids'] = inputs['input_ids']
 
         # 获取学生模型输出
-        student_outputs = model(**filtered_inputs)
+        student_inputs = inputs_requiring_logits(model, filtered_inputs)
+        student_outputs = model(**student_inputs)
         student_logits = student_outputs.logits
 
         # 计算学生模型的交叉熵损失
@@ -141,7 +152,8 @@ class DistillationTrainer(Trainer):
 
         # 禁用教师模型的梯度计算
         with torch.no_grad():
-            teacher_outputs = self.teacher(**filtered_inputs)
+            teacher_inputs = inputs_requiring_logits(self.teacher, filtered_inputs)
+            teacher_outputs = self.teacher(**teacher_inputs)
             teacher_logits = teacher_outputs.logits
 
         # 计算蒸馏损失 (KL散度)

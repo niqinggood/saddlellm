@@ -1,0 +1,6 @@
+# Pin the tested model/loading family; other serve dependencies follow pyproject.
+# This is not a complete transitive lockfile. torch comes from the chosen index.
+torch==2.6.0
+transformers==4.57.6
+accelerate==1.12.0
+peft==0.18.1

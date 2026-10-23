@@ -1,0 +1,49 @@
+# One phase-ordered distillation round, not asynchronous online RL.
+stages: [mopd, sft]
+model:
+  backend: hf
+  name_or_path: /models/llama-3.2-1b
+backends:
+  training: megatron
+  rollout: sglang
+  megatron:
+    recipe: megatron.bridge.recipes.llama:llama32_1b_sft_config
+    nproc_per_node: 1
+    hf_export_source: /models/llama-3.2-1b
+    overrides:
+      train:
+        train_iters: 100
+        global_batch_size: 2
+        micro_batch_size: 1
+      model:
+        tensor_model_parallel_size: 1
+        pipeline_model_parallel_size: 1
+        context_parallel_size: 1
+        seq_length: 1024
+      dataset:
+        seq_length: 1024
+  sglang:
+    mode: http
+    base_url: http://127.0.0.1:30000
+    policy_version: student-v1
+    refresh_weights: true
+    concurrency: 4
+    max_pending_requests: 128
+mopd:
+  enabled: true
+  dry_run: false
+  prompts_path: data/prompts.jsonl
+  max_new_tokens: 128
+  teachers:
+    - type: endpoint
+      name: local-teacher
+      model: teacher
+      endpoint_url: http://127.0.0.1:30001/v1
+sft:
+  enabled: true
+  # Empty means use the preceding MOPD stage's JSONL.
+  data_path: ""
+eval:
+  enabled: false
+logging:
+  output_dir: outputs/megatron-sglang-mopd

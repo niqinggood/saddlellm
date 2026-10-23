@@ -1,0 +1,6 @@
+[
+  "Write a numbered list of 20 practical tips for reading technical documentation. Keep each tip to one sentence.",
+  "Explain what a KV cache does in a language model, and what it does not cache.",
+  "请用三句话解释什么是大模型推理中的 KV 缓存。",
+  "Write a Python function that returns the largest number in a non-empty list."
+]

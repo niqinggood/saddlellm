@@ -224,6 +224,8 @@ def _infer_kind(stage: str, field_name: str) -> str:
         return "dataset"
     if "checkpoint" in name:
         return "checkpoint"
+    if stage == "decision" and name in {"model", "model_path"}:
+        return "decision_model"
     if stage == "world_model" and name in {
         "model",
         "model_path",

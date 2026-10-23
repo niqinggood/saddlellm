@@ -14,21 +14,25 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class AttentionBlueprint:
-    kind: str = "gqa"  # mha | mqa | gqa | mla
+    kind: str = "gqa"  # mha | mqa | gqa | mla | kda (PyTorch reference)
     backend: str = "sdpa"  # auto | sdpa | flash | eager | xformers | transformer_engine
     mla_cache_mode: str = "kv"  # kv | latent
     num_heads: int = 16
     num_kv_heads: int = 4
     head_dim: Optional[int] = None
+    qk_norm: bool = False
+    fused_qkv: bool = False
     q_lora_rank: int = 0
     kv_lora_rank: int = 0
     rope_theta: float = 10000.0
     rope_scaling: Optional[Dict] = None
     sliding_window: int = 0
+    kda_conv_size: int = 4
+    kda_gate_rank: int = 0  # 0 selects head_dim
 
     def __post_init__(self) -> None:
         self.kind = str(self.kind).lower()
-        if self.kind == "mha":
+        if self.kind in {"mha", "kda"}:
             self.num_kv_heads = self.num_heads
         elif self.kind == "mqa":
             self.num_kv_heads = 1
@@ -38,6 +42,7 @@ class AttentionBlueprint:
 class FFNBlueprint:
     kind: str = "swiglu"  # swiglu | moe
     intermediate_size: int = 4096
+    fused_gate_up: bool = False
     num_experts: int = 0
     experts_per_token: int = 0
     expert_intermediate_size: int = 0
@@ -65,6 +70,8 @@ class ResidualBlueprint:
     learnable: bool = False
     dropout: float = 0.0
     initialization: str = "standard"  # standard | depth_scaled | zero
+    attention_mode: str = "none"  # none | full | block, depth-wise AttnRes
+    block_size: int = 4  # counts attention + FFN sublayers; even for block mode
 
     def __post_init__(self) -> None:
         topology = str(self.topology).lower().replace("_", "-")
@@ -74,6 +81,7 @@ class ResidualBlueprint:
             "prenorm": "serial",
         }.get(topology, topology)
         self.initialization = str(self.initialization).lower().replace("-", "_")
+        self.attention_mode = str(self.attention_mode).lower()
 
 
 @dataclass
@@ -450,23 +458,45 @@ class ModelBlueprint:
                 or not isinstance(attention.head_dim, int)
             ):
                 raise TypeError(f"layer {index}: head_dim must be an integer")
-            head_dim = attention.head_dim or self.hidden_size // heads
-            if head_dim <= 0 or head_dim % 2:
+            head_dim = self.hidden_size // heads if attention.head_dim is None else attention.head_dim
+            if head_dim <= 0 or (attention.kind != "kda" and head_dim % 2):
                 raise ValueError(
                     f"layer {index}: head_dim must be a positive even integer"
                 )
+            if not isinstance(attention.qk_norm, bool):
+                raise TypeError(f"layer {index}: qk_norm must be boolean")
+            if not isinstance(attention.fused_qkv, bool):
+                raise TypeError(f"layer {index}: fused_qkv must be boolean")
+            if not isinstance(ffn.fused_gate_up, bool):
+                raise TypeError(f"layer {index}: fused_gate_up must be boolean")
             if kv_heads <= 0 or heads % kv_heads:
                 raise ValueError(
                     f"layer {index}: num_heads must be divisible by num_kv_heads"
                 )
-            if attention.kind not in {"mha", "mqa", "gqa", "mla"}:
+            if attention.kind not in {"mha", "mqa", "gqa", "mla", "kda"}:
                 raise ValueError(f"layer {index}: unsupported attention kind {attention.kind!r}")
+            for label, value, minimum in (
+                ("kda_conv_size", attention.kda_conv_size, 1),
+                ("kda_gate_rank", attention.kda_gate_rank, 0),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                    raise ValueError(f"layer {index}: {label} must be an integer >= {minimum}")
+            if attention.kind == "kda":
+                if attention.backend not in {"eager", "auto"}:
+                    raise ValueError(f"layer {index}: KDA reference requires backend eager or auto")
+                if attention.fused_qkv or attention.qk_norm or attention.sliding_window:
+                    raise ValueError(f"layer {index}: KDA uses intrinsic L2 Q/K norm and does not support fused_qkv, qk_norm or sliding_window")
             if attention.kind == "mha" and kv_heads != heads:
                 raise ValueError(f"layer {index}: mha requires num_kv_heads == num_heads")
             if attention.kind == "mqa" and kv_heads != 1:
                 raise ValueError(f"layer {index}: mqa requires num_kv_heads == 1")
             if attention.kind == "mla" and attention.kv_lora_rank <= 0:
                 raise ValueError(f"layer {index}: mla requires a positive kv_lora_rank")
+            if attention.kind == "mla" and attention.fused_qkv:
+                raise ValueError(
+                    f"layer {index}: fused_qkv is not supported for MLA; "
+                    "MLA uses separate latent projections"
+                )
             if attention.mla_cache_mode not in {"kv", "latent"}:
                 raise ValueError(
                     f"layer {index}: mla_cache_mode must be kv or latent"
@@ -528,6 +558,16 @@ class ModelBlueprint:
                 raise ValueError(
                     f"layer {index}: unsupported residual topology {residual.topology!r}"
                 )
+            if residual.attention_mode not in {"none", "full", "block"}:
+                raise ValueError(f"layer {index}: attention_mode must be none, full or block")
+            if isinstance(residual.block_size, bool) or not isinstance(residual.block_size, int) or residual.block_size < 1:
+                raise ValueError(f"layer {index}: residual block_size must be a positive integer")
+            if residual.attention_mode == "block" and (residual.block_size < 2 or residual.block_size % 2):
+                raise ValueError(f"layer {index}: block AttnRes block_size must be even and >= 2 (sublayers)")
+            if residual.attention_mode != self.residual.attention_mode or residual.block_size != self.residual.block_size:
+                raise ValueError(f"layer {index}: AttnRes mode and block_size must match the model-level residual configuration")
+            if residual.attention_mode != "none" and residual.topology != "serial":
+                raise ValueError(f"layer {index}: AttnRes requires serial residual topology")
             if residual.initialization not in {"standard", "depth_scaled", "zero"}:
                 raise ValueError(
                     f"layer {index}: unsupported residual initialization "
@@ -616,6 +656,7 @@ class ModelBlueprint:
         """Convert to the existing ModelSpec format for scratch experiments."""
         from .ModelRegistry import ModelSpec
 
+        self._require_legacy_architecture_conversion()
         return ModelSpec(
             name=self.name,
             architecture=self.family,
@@ -638,12 +679,16 @@ class ModelBlueprint:
             shared_expert=self.ffn.shared_expert,
             kv_lora_rank=self.attention.kv_lora_rank,
             q_lora_rank=self.attention.q_lora_rank,
+            qk_norm=self.attention.qk_norm,
+            fused_qkv=self.attention.fused_qkv,
+            fused_gate_up=self.ffn.fused_gate_up,
             multi_token_prediction=self.objective.multi_token_prediction,
             num_mtp_layers=self.objective.mtp_extra_tokens,
         )
 
     def to_transformers_config_dict(self) -> Dict:
         """Return a runnable HF-style config dict for dense fallback models."""
+        self._require_legacy_architecture_conversion()
         return {
             "model_type": "qwen2" if self.family.startswith("qwen") else "llama",
             "vocab_size": self.vocab_size,
@@ -654,6 +699,9 @@ class ModelBlueprint:
             "num_key_value_heads": self.attention.num_kv_heads or self.attention.num_heads,
             "max_position_embeddings": self.max_position_embeddings,
             "rope_theta": self.attention.rope_theta,
+            "qk_norm": self.attention.qk_norm,
+            "fused_qkv": self.attention.fused_qkv,
+            "fused_gate_up": self.ffn.fused_gate_up,
             "rms_norm_eps": self.norm_eps,
             "tie_word_embeddings": self.tie_word_embeddings,
             "attention_bias": False,
@@ -664,10 +712,19 @@ class ModelBlueprint:
                 "ffn_kind": self.ffn.kind,
                 "q_lora_rank": self.attention.q_lora_rank,
                 "kv_lora_rank": self.attention.kv_lora_rank,
+                "qk_norm": self.attention.qk_norm,
+                "fused_qkv": self.attention.fused_qkv,
+                "fused_gate_up": self.ffn.fused_gate_up,
                 "multi_token_prediction": self.objective.multi_token_prediction,
                 "mtp_extra_tokens": self.objective.mtp_extra_tokens,
             },
         }
+
+    def _require_legacy_architecture_conversion(self):
+        if self.residual.attention_mode != "none" or any(
+            layer.attention.kind == "kda" for layer in self.expanded_layers()
+        ):
+            raise ValueError("KDA/Attention Residuals require the native saddle blueprint path; conversion to a legacy ModelSpec/HF dense config would lose the architecture")
 
     def to_saddle_config(self):
         """Convert this blueprint into SaddleLLM's modular model config."""
@@ -736,11 +793,19 @@ class ModelBlueprint:
             heads = attention.num_heads
             kv_heads = attention.num_kv_heads or heads
             head_dim = attention.head_dim or hidden // heads
-            if attention.kind == "mla" and attention.kv_lora_rank > 0:
+            if attention.kind == "kda":
+                inner = heads * head_dim
+                rank = attention.kda_gate_rank or head_dim
+                attention_params = (
+                    4 * hidden * inner + 2 * rank * (hidden + inner)
+                    + hidden * heads + 3 * inner * attention.kda_conv_size
+                    + heads + inner + head_dim
+                )
+            elif attention.kind == "mla" and attention.kv_lora_rank > 0:
                 q_rank = attention.q_lora_rank or max(1, hidden // 8)
                 attention_params = (
                     hidden * attention.kv_lora_rank
-                    + attention.kv_lora_rank * (kv_heads + heads) * head_dim
+                    + attention.kv_lora_rank * 2 * kv_heads * head_dim
                     + hidden * q_rank
                     + q_rank * heads * head_dim
                     + heads * head_dim * hidden
@@ -751,6 +816,10 @@ class ModelBlueprint:
                     + hidden * kv_heads * head_dim * 2
                     + heads * head_dim * hidden
                 )
+            if attention.qk_norm:
+                # One learned scale of ``head_dim`` values is shared by all
+                # query heads and another is shared by all key heads.
+                attention_params += 2 * head_dim
             if ffn.kind == "moe":
                 expert_hidden = ffn.expert_intermediate_size or ffn.intermediate_size
                 per_expert = 3 * hidden * expert_hidden
@@ -763,9 +832,14 @@ class ModelBlueprint:
             else:
                 total_ffn = active_ffn = 3 * hidden * ffn.intermediate_size
             residual_parameters = 2 if (layer.residual or self.residual).learnable else 0
+            if self.residual.attention_mode != "none":
+                residual_parameters += 4 * hidden  # two query + key-norm pairs
             norms = 2 * hidden
             total += attention_params + total_ffn + norms + residual_parameters
             active += attention_params + active_ffn + norms + residual_parameters
+        if self.residual.attention_mode != "none":
+            total += 2 * hidden  # final depth-wise readout
+            active += 2 * hidden
         mtp = len(range(max(0, self.objective.mtp_extra_tokens))) * hidden * self.vocab_size
         return total + mtp, active + mtp
 
@@ -777,10 +851,23 @@ class ModelBlueprint:
                 1, attention.num_heads
             )
             kv_heads = attention.num_kv_heads or attention.num_heads
-            if attention.kind == "mla" and attention.kv_lora_rank > 0:
+            if attention.kind == "kda":
+                continue  # fixed recurrent state, not per-token KV
+            if attention.kind == "mla" and attention.mla_cache_mode == "latent" and attention.kv_lora_rank > 0:
                 total += attention.kv_lora_rank * dtype_bytes
             else:
                 total += 2 * kv_heads * head_dim * dtype_bytes
+        return total
+
+    def estimate_recurrent_cache_bytes(self, dtype_bytes: int = 2) -> int:
+        total = 0
+        for layer in self.expanded_layers():
+            attention = layer.attention
+            if attention.kind == "kda":
+                dim = attention.head_dim or self.hidden_size // attention.num_heads
+                total += attention.num_heads * dim * dim * (8 if dtype_bytes == 8 else 4)
+                total += 3 * attention.num_heads * dim * (attention.kda_conv_size - 1) * dtype_bytes
+                total += 9  # optional document id + validity flag
         return total
 
     def estimate_training_flops(self, token_budget: int) -> float:
@@ -798,7 +885,7 @@ class ModelBlueprint:
     ) -> float:
         seq = sequence_length or self.max_position_embeddings
         cache_bytes = self.estimate_kv_cache_bytes_per_token(dtype_bytes=dtype_bytes)
-        total_bytes = cache_bytes * max(1, int(batch_size)) * max(1, int(seq))
+        total_bytes = (cache_bytes * max(1, int(seq)) + self.estimate_recurrent_cache_bytes(dtype_bytes)) * max(1, int(batch_size))
         return total_bytes / (1024 ** 3)
 
     def cost_profile(
@@ -822,6 +909,7 @@ class ModelBlueprint:
             "training_flops": train_flops,
             "training_peta_flops": train_flops / 1e15,
             "kv_cache_gb": round(kv_gb, 4),
+            "recurrent_state_bytes_per_sequence": self.estimate_recurrent_cache_bytes(dtype_bytes),
             "params_gb_bf16": round(params_gb_bf16, 4),
             "active_to_total_ratio": round(active_ratio, 4),
             "assumptions": {
@@ -840,11 +928,29 @@ class ModelBlueprint:
         ffn_kinds = list(dict.fromkeys(
             (layer.ffn or self.ffn).kind for layer in expanded
         ))
+        qk_norm_values = list(dict.fromkeys(
+            (layer.attention or self.attention).qk_norm for layer in expanded
+        ))
+        fused_qkv_values = list(dict.fromkeys(
+            (layer.attention or self.attention).fused_qkv for layer in expanded
+        ))
+        fused_gate_up_values = list(dict.fromkeys(
+            (layer.ffn or self.ffn).fused_gate_up for layer in expanded
+        ))
         return {
             "attention": attention_kinds[0] if len(attention_kinds) == 1 else "hybrid",
             "attention_kinds": attention_kinds,
+            "attention_residuals": self.residual.attention_mode,
+            "attention_residual_block_size": self.residual.block_size,
             "ffn": ffn_kinds[0] if len(ffn_kinds) == 1 else "hybrid",
             "ffn_kinds": ffn_kinds,
+            "qk_norm": qk_norm_values[0] if len(qk_norm_values) == 1 else "hybrid",
+            "fused_qkv": fused_qkv_values[0] if len(fused_qkv_values) == 1 else "hybrid",
+            "fused_gate_up": (
+                fused_gate_up_values[0]
+                if len(fused_gate_up_values) == 1
+                else "hybrid"
+            ),
             "sparsity": "sparse_moe" if "moe" in ffn_kinds else "dense",
             "context": "long" if self.max_position_embeddings >= 32768 else "standard",
             "objective": "mtp" if self.objective.multi_token_prediction else "next_token",
@@ -876,6 +982,10 @@ class ModelBlueprint:
             risks.append("MoE needs router stability, expert load monitoring, and more tokens than dense smoke tests.")
         if "mla" in attention_kinds:
             risks.append("MLA uses SaddleLLM's native model path; validate native checkpoint consumers separately from Hugging Face AutoModel workflows.")
+        if "kda" in attention_kinds:
+            risks.append("KDA is a sequential PyTorch research reference; measure long-sequence speed, memory and convergence, not just asymptotic cache savings.")
+        if self.residual.attention_mode != "none":
+            risks.append("Attention Residuals change the architecture and retain depth sources; train new weights and compare against an additive-residual control.")
         if self.objective.multi_token_prediction:
             risks.append("MTP changes loss accounting and checkpoint compatibility; evaluate quality and speed separately.")
         if self.max_position_embeddings >= 32768:
@@ -898,6 +1008,10 @@ class ModelBlueprint:
             ideas.append("Track expert entropy, dropped tokens, and per-expert token counts.")
         if "mla" in attention_kinds:
             ideas.append("Compare KV-cache savings and long-context perplexity against GQA.")
+        if "kda" in attention_kinds:
+            ideas.append("Compare hybrid KDA against a dense control at matched data and compute; report prefill and decode separately.")
+        if self.residual.attention_mode != "none":
+            ideas.append("Ablate Full/Block AttnRes independently of token attention and measure activation-memory cost.")
         if self.objective.multi_token_prediction:
             ideas.append("Compare sample efficiency at fixed token budget and fixed wall-clock budget.")
         if self.max_position_embeddings >= 32768:
@@ -922,6 +1036,76 @@ class ModelBlueprintLab:
     """Factory for model-first architecture experiments."""
 
     @staticmethod
+    def hybrid_kda(
+        name: str = "saddle-hybrid-kda-research",
+        hidden_size: int = 256,
+        layers: int = 8,
+        heads: int = 8,
+        kv_heads: int = 2,
+        vocab_size: int = 32000,
+        seq_length: int = 4096,
+        linear_layers_per_full: int = 3,
+        full_attention_kind: str = "gqa",
+        attention_residuals: str = "none",
+        residual_block_size: int = 4,
+        kda_conv_size: int = 4,
+        kda_gate_rank: int = 0,
+    ) -> ModelBlueprint:
+        """Periodic KDA + global GQA/MLA with optional Full/Block AttnRes.
+
+        KDA is a sequential PyTorch correctness reference, not a fused kernel.
+        Global layers retain native RoPE, unlike Kimi Linear's NoPE MLA.
+        One full-attention layer is emitted per complete period. Any trailing
+        incomplete period contains KDA layers; at least one period is required.
+        """
+        if (
+            isinstance(linear_layers_per_full, bool)
+            or not isinstance(linear_layers_per_full, int)
+            or linear_layers_per_full < 1
+        ):
+            raise ValueError("linear_layers_per_full must be a positive integer")
+        period = linear_layers_per_full + 1
+        if isinstance(layers, bool) or not isinstance(layers, int) or layers < period:
+            raise ValueError("hybrid_kda requires at least one complete KDA/full period")
+        if full_attention_kind not in {"gqa", "mla"}:
+            raise ValueError("full_attention_kind must be gqa or mla")
+        global_attention = AttentionBlueprint(
+            kind=full_attention_kind,
+            backend="sdpa",
+            num_heads=heads,
+            num_kv_heads=kv_heads,
+            kv_lora_rank=max(1, hidden_size // 16) if full_attention_kind == "mla" else 0,
+            q_lora_rank=max(1, hidden_size // 8) if full_attention_kind == "mla" else 0,
+            mla_cache_mode="latent" if full_attention_kind == "mla" else "kv",
+        )
+        linear_attention = AttentionBlueprint(
+            kind="kda", backend="eager", num_heads=heads,
+            kda_conv_size=kda_conv_size, kda_gate_rank=kda_gate_rank,
+        )
+        return ModelBlueprint(
+            name=name, family="saddle", hidden_size=hidden_size, num_layers=layers,
+            vocab_size=vocab_size, max_position_embeddings=seq_length,
+            attention=global_attention,
+            ffn=FFNBlueprint(kind="swiglu", intermediate_size=hidden_size * 4),
+            residual=ResidualBlueprint(
+                attention_mode=attention_residuals, block_size=residual_block_size,
+            ),
+            layers=[
+                LayerBlueprint(
+                    name=f"{'global' if (index + 1) % period == 0 else 'kda'}-{index}",
+                    attention=AttentionBlueprint(**asdict(
+                        global_attention if (index + 1) % period == 0 else linear_attention
+                    )),
+                )
+                for index in range(layers)
+            ],
+            notes=[
+                "Research KDA reference with fixed-size recurrent state, not an optimized kernel.",
+                "Global GQA/MLA uses native RoPE; this is not a Kimi checkpoint replica.",
+            ],
+        )
+
+    @staticmethod
     def dense_gqa(
         name: str = "saddle-dense-gqa-300m",
         hidden_size: int = 1024,
@@ -941,6 +1125,112 @@ class ModelBlueprintLab:
             attention=AttentionBlueprint(kind="gqa", num_heads=heads, num_kv_heads=kv_heads),
             ffn=FFNBlueprint(kind="swiglu", intermediate_size=hidden_size * 4),
             notes=["Dense GQA baseline: use as control arm before trying sparse or MLA variants."],
+        )
+
+    @staticmethod
+    def optimized_dense_gqa(
+        name: str = "saddle-optimized-dense-gqa-300m",
+        hidden_size: int = 1024,
+        layers: int = 24,
+        heads: int = 16,
+        kv_heads: int = 4,
+        vocab_size: int = 32000,
+        seq_length: int = 4096,
+        qk_norm: bool = True,
+    ) -> ModelBlueprint:
+        """Dense scratch-pretraining preset with packed input projections."""
+
+        return ModelBlueprint(
+            name=name,
+            family="qwen",
+            hidden_size=hidden_size,
+            num_layers=layers,
+            vocab_size=vocab_size,
+            max_position_embeddings=seq_length,
+            attention=AttentionBlueprint(
+                kind="gqa",
+                num_heads=heads,
+                num_kv_heads=kv_heads,
+                qk_norm=qk_norm,
+                fused_qkv=True,
+            ),
+            ffn=FFNBlueprint(
+                kind="swiglu",
+                intermediate_size=hidden_size * 4,
+                fused_gate_up=True,
+            ),
+            residual=ResidualBlueprint(initialization="depth_scaled"),
+            notes=[
+                "Optimized dense GQA: packed QKV and gate/up projections reduce GEMM launches.",
+                "QK-Norm and depth-scaled residual outputs target stable scratch pretraining.",
+            ],
+        )
+
+    @staticmethod
+    def efficient_dense_gqa_v2(
+        name: str = "saddle-gqa-300m-efficient-v2",
+        hidden_size: int = 1024,
+        layers: int = 24,
+        heads: int = 16,
+        kv_heads: int = 4,
+        vocab_size: int = 32000,
+        seq_length: int = 4096,
+        intermediate_size: Optional[int] = None,
+        ffn_multiple_of: int = 256,
+        qk_norm: bool = True,
+        tie_word_embeddings: bool = True,
+    ) -> ModelBlueprint:
+        """Parameter-efficient dense GQA preset for scratch pretraining.
+
+        SwiGLU uses three projections instead of the two in a conventional
+        GeLU FFN.  An intermediate width near ``8 / 3 * hidden_size`` keeps a
+        comparable parameter budget; rounding upward makes the matrices more
+        hardware friendly.  This is a separate v2 preset so checkpoints made
+        with :meth:`optimized_dense_gqa` retain their original shapes.
+        """
+
+        if isinstance(ffn_multiple_of, bool) or not isinstance(
+            ffn_multiple_of, int
+        ):
+            raise TypeError("ffn_multiple_of must be an integer")
+        if ffn_multiple_of <= 0:
+            raise ValueError("ffn_multiple_of must be positive")
+        if intermediate_size is None:
+            raw_intermediate = math.ceil(8 * hidden_size / 3)
+            intermediate_size = (
+                math.ceil(raw_intermediate / ffn_multiple_of) * ffn_multiple_of
+            )
+
+        return ModelBlueprint(
+            name=name,
+            family="qwen",
+            hidden_size=hidden_size,
+            num_layers=layers,
+            vocab_size=vocab_size,
+            max_position_embeddings=seq_length,
+            tie_word_embeddings=tie_word_embeddings,
+            attention=AttentionBlueprint(
+                kind="gqa",
+                num_heads=heads,
+                num_kv_heads=kv_heads,
+                qk_norm=qk_norm,
+                fused_qkv=True,
+            ),
+            ffn=FFNBlueprint(
+                kind="swiglu",
+                intermediate_size=intermediate_size,
+                fused_gate_up=True,
+            ),
+            residual=ResidualBlueprint(initialization="depth_scaled"),
+            notes=[
+                "Efficient v2 keeps SwiGLU near the 4h GeLU-equivalent "
+                "parameter budget.",
+                "Tied token embeddings remove a redundant vocabulary "
+                "projection by default.",
+                "Packed QKV and gate/up projections reduce GEMM launches.",
+                "This preset has independent tensor shapes and does not "
+                "replace optimized v1.",
+            ],
         )
 
     @staticmethod
@@ -977,6 +1267,7 @@ class ModelBlueprintLab:
                 expert_intermediate_size=hidden_size * 2,
                 shared_expert=True,
                 aux_loss_free=True,
+                router_aux_loss_coef=0.0,
             ),
             objective=ObjectiveBlueprint(multi_token_prediction=True, mtp_extra_tokens=3),
             notes=["Research blueprint for MLA + aux-loss-free MoE + MTP experiments."],
@@ -1001,7 +1292,7 @@ class ModelBlueprintLab:
                 num_heads=heads,
                 num_kv_heads=max(1, heads // 4),
                 rope_theta=1000000.0,
-                rope_scaling={"type": "longrope", "factor": max(1, seq_length // 4096)},
+                rope_scaling={"type": "linear", "factor": max(1, seq_length // 4096)},
             ),
             ffn=FFNBlueprint(kind="swiglu", intermediate_size=hidden_size * 4),
             notes=["Long-context dense baseline; custom linear/flash attention can replace GQA later."],

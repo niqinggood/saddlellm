@@ -1,0 +1,6 @@
+{"instruction":"What is two plus three?","output":"Five."}
+{"instruction":"Translate hello into French.","output":"Bonjour."}
+{"instruction":"Name the planet we live on.","output":"Earth."}
+{"instruction":"Write a Python expression that adds one and two.","output":"1 + 2"}
+{"instruction":"What is the opposite of hot?","output":"Cold."}
+{"instruction":"Name a primary color.","output":"Red."}

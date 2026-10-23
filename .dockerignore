@@ -1,0 +1,19 @@
+# Allow-list: do not send corpora, checkpoints, artifacts or local secrets.
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!LICENSE
+!saddlellm/
+!saddlellm/**
+!saddle_llm/
+!saddle_llm/**
+!deploy/
+!deploy/constraints-serve.txt
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.env
+**/.env.*
+**/*.pem
+**/*.key

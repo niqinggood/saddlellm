@@ -7,6 +7,7 @@ from the current student policy, not a static offline prompt/answer set.
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
@@ -49,10 +50,12 @@ class MOPDConfig:
     student_top_p: float = 0.95
     teacher_temperature: float = 0.3
     teacher_max_tokens: int = 1024
+    teacher_concurrency: int = 4
     aggregation: str = "best_score"  # best_score | weighted_round_robin
     output_dir: str = "./mopd"
     seed: int = 42
     include_student_response_in_prompt: bool = True
+    requires_review: bool = False
 
 
 class MultiTeacherOnPolicyDistiller:
@@ -80,6 +83,8 @@ class MultiTeacherOnPolicyDistiller:
         self.rollout_fn = rollout_fn
         self.score_fn = score_fn
         self.config = config or MOPDConfig()
+        if self.config.teacher_concurrency < 1:
+            raise ValueError("teacher_concurrency must be at least 1")
         self.records: List[Dict] = []
         random.seed(self.config.seed)
 
@@ -88,13 +93,44 @@ class MultiTeacherOnPolicyDistiller:
         for prompt in prompts:
             expanded.extend([prompt] * self.config.num_rollouts_per_prompt)
         student_responses = self._student_rollout(expanded)
+        if (
+            not isinstance(student_responses, (list, tuple))
+            or len(student_responses) != len(expanded)
+            or any(not isinstance(item, str) for item in student_responses)
+        ):
+            raise ValueError("student rollout must return one response string per prompt")
+
+        signal_rows: List[List[Optional[TeacherPolicySignal]]] = [
+            [None] * len(self.teachers) for _ in expanded
+        ]
+        jobs = [
+            (row_index, teacher_index, spec, prompt, student_responses[row_index])
+            for row_index, prompt in enumerate(expanded)
+            for teacher_index, spec in enumerate(self.teachers)
+        ]
+        if self.config.teacher_concurrency == 1 or len(jobs) <= 1:
+            for row_index, teacher_index, spec, prompt, student_response in jobs:
+                signal_rows[row_index][teacher_index] = self._teacher_signal(
+                    spec, prompt, student_response
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=self.config.teacher_concurrency) as pool:
+                futures = {
+                    pool.submit(self._teacher_signal, spec, prompt, student_response): (
+                        row_index,
+                        teacher_index,
+                    )
+                    for row_index, teacher_index, spec, prompt, student_response in jobs
+                }
+                for future in as_completed(futures):
+                    row_index, teacher_index = futures[future]
+                    signal_rows[row_index][teacher_index] = future.result()
 
         batch_records = []
-        for prompt, student_response in zip(expanded, student_responses):
-            signals = [
-                self._teacher_signal(spec, prompt, student_response)
-                for spec in self.teachers
-            ]
+        for row_index, (prompt, student_response) in enumerate(
+            zip(expanded, student_responses)
+        ):
+            signals = [signal for signal in signal_rows[row_index] if signal is not None]
             selected = self._aggregate(signals)
             record = {
                 "prompt": prompt,
@@ -110,6 +146,9 @@ class MultiTeacherOnPolicyDistiller:
                     "aggregation": self.config.aggregation,
                     "selected_score": selected.score,
                     "student_response_chars": len(student_response or ""),
+                    "review_status": (
+                        "pending" if self.config.requires_review else "not_required"
+                    ),
                 },
             }
             batch_records.append(record)
@@ -159,15 +198,36 @@ class MultiTeacherOnPolicyDistiller:
         self.student_model.eval()
         responses = []
         for prompt in prompts:
-            inputs = self.student_tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
+            context_limit = getattr(
+                getattr(self.student_model, "config", None),
+                "max_position_embeddings",
+                None,
+            )
+            tokenize_kwargs = {"return_tensors": "pt", "truncation": True}
+            if isinstance(context_limit, int) and context_limit > 1:
+                tokenize_kwargs["max_length"] = max(
+                    1, context_limit - self.config.max_new_tokens
+                )
+            inputs = self.student_tokenizer(prompt, **tokenize_kwargs).to(device)
+            pad_token_id = self.student_tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = self.student_tokenizer.eos_token_id
+            generation_kwargs = {
+                "max_new_tokens": self.config.max_new_tokens,
+                "do_sample": self.config.student_temperature > 0,
+                "pad_token_id": pad_token_id,
+            }
+            if self.config.student_temperature > 0:
+                generation_kwargs.update(
+                    {
+                        "temperature": self.config.student_temperature,
+                        "top_p": self.config.student_top_p,
+                    }
+                )
             with torch.no_grad():
                 output = self.student_model.generate(
                     **inputs,
-                    max_new_tokens=self.config.max_new_tokens,
-                    temperature=self.config.student_temperature,
-                    top_p=self.config.student_top_p,
-                    do_sample=self.config.student_temperature > 0,
-                    pad_token_id=self.student_tokenizer.pad_token_id or self.student_tokenizer.eos_token_id,
+                    **generation_kwargs,
                 )
             text = self.student_tokenizer.decode(output[0], skip_special_tokens=True)
             responses.append(text[len(prompt):].strip() if text.startswith(prompt) else text)
@@ -189,6 +249,8 @@ class MultiTeacherOnPolicyDistiller:
                 temperature=self.config.teacher_temperature,
                 max_tokens=self.config.teacher_max_tokens,
             )
+        if not str(teacher_response or "").strip():
+            raise ValueError(f"teacher {spec.name!r} returned an empty response")
         score = self._score(prompt, student_response, teacher_response)
         return TeacherPolicySignal(
             teacher_name=spec.name,
@@ -198,6 +260,13 @@ class MultiTeacherOnPolicyDistiller:
             teacher_response=teacher_response,
             score=score,
             weight=spec.weight,
+            metadata={
+                "score_semantics": (
+                    "custom_score_fn"
+                    if self.score_fn is not None
+                    else "nonempty_availability_not_correctness"
+                )
+            },
         )
 
     def _build_teacher_prompt(self, spec: OnPolicyTeacherSpec, prompt: str, student_response: str) -> str:
@@ -213,9 +282,9 @@ class MultiTeacherOnPolicyDistiller:
             return float(self.score_fn(prompt, student_response, teacher_response))
         if not teacher_response:
             return 0.0
-        length_score = min(1.0, len(teacher_response) / 512.0)
-        improvement = 0.2 if len(teacher_response) > len(student_response or "") else 0.0
-        return min(1.0, 0.5 + length_score * 0.3 + improvement)
+        # Without an explicit evaluator we know only that a response exists.
+        # Length is not a correctness signal, especially for clinical answers.
+        return 1.0
 
     def _aggregate(self, signals: Sequence[TeacherPolicySignal]) -> TeacherPolicySignal:
         if self.config.aggregation == "weighted_round_robin":

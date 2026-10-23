@@ -43,6 +43,8 @@ class ModelMetricsExtractor:
             "mtp_extra_tokens",
             "residual_topology",
             "residual_initialization",
+            "residual_attention_mode",
+            "residual_block_size",
         ]
         result = {key: data.get(key) for key in keys if key in data}
         layer_configs = data.get("layer_configs") or []
@@ -55,6 +57,7 @@ class ModelMetricsExtractor:
                     "ffn_kind": (layer.get("ffn") or {}).get("kind"),
                     "residual_topology": (layer.get("residual") or {}).get("topology"),
                     "residual_initialization": (layer.get("residual") or {}).get("initialization"),
+                    "attention_residuals": (layer.get("residual") or {}).get("attention_mode", "none"),
                 }
                 for index, layer in enumerate(layer_configs)
             ]
@@ -69,23 +72,31 @@ class ModelMetricsExtractor:
         return metrics
 
     @staticmethod
-    def cache_profile(model) -> Dict:
+    def cache_profile(model, dtype_bytes: int = 2) -> Dict:
         cfg = getattr(model, "config", None)
         if cfg is None:
             return {}
-        dtype_bytes = 2
         layer_configs = getattr(cfg, "layer_configs", None) or []
         resolved = (
             [cfg.for_layer(index) for index in range(len(layer_configs))]
             if layer_configs and hasattr(cfg, "for_layer")
             else [cfg] * getattr(cfg, "num_hidden_layers", 0)
         )
-        per_layer = []
+        per_layer, fixed_state = [], []
         for layer_cfg in resolved:
             hidden = getattr(layer_cfg, "hidden_size", 0)
             heads = getattr(layer_cfg, "num_attention_heads", 1)
             kv_heads = getattr(layer_cfg, "num_key_value_heads", heads)
             head_dim = getattr(layer_cfg, "head_dim", None) or hidden // max(1, heads)
+            if getattr(layer_cfg, "attention_kind", "gqa") == "kda":
+                per_layer.append(0)
+                fixed_state.append(
+                    heads * head_dim * head_dim * (8 if dtype_bytes == 8 else 4)
+                    + 3 * heads * head_dim * (layer_cfg.kda_conv_size - 1) * dtype_bytes
+                    + 9  # optional document-id and validity state
+                )
+                continue
+            fixed_state.append(0)
             is_latent = (
                 getattr(layer_cfg, "attention_kind", "gqa") == "mla"
                 and getattr(layer_cfg, "mla_cache_mode", "kv") == "latent"
@@ -97,7 +108,9 @@ class ModelMetricsExtractor:
                 else 2 * kv_heads * head_dim * dtype_bytes
             )
         modes = {
-            "mla_latent"
+            "kda_recurrent"
+            if getattr(layer_cfg, "attention_kind", "gqa") == "kda"
+            else "mla_latent"
             if getattr(layer_cfg, "attention_kind", "gqa") == "mla"
             and getattr(layer_cfg, "mla_cache_mode", "kv") == "latent"
             else "kv"
@@ -111,6 +124,9 @@ class ModelMetricsExtractor:
             ),
             "bytes_per_token_by_layer": per_layer,
             "bytes_per_token_total": total,
+            "recurrent_state_bytes_by_layer": fixed_state,
+            "recurrent_state_bytes_per_sequence": sum(fixed_state),
+            "assumed_activation_dtype_bytes": dtype_bytes,
         }
 
     @staticmethod

@@ -1,0 +1,46 @@
+# Run from repository root. Supply a real local base checkpoint before training.
+# The bundled data checks wiring; it does not establish production model quality.
+project: saddlellm
+experiment: posttrain-retention
+seed: 42
+model:
+  backend: hf
+  name_or_path: outputs/base
+  local_files_only: true
+stages: [sft, eval, export]
+training:
+  max_steps: 100
+logging:
+  output_dir: outputs/posttrain-retention
+  logging_backend: local
+sft:
+  enabled: true
+  data_path: examples/retention/business.train.jsonl
+  validation_data_path: examples/retention/business.validation.jsonl
+  replay_data_path: examples/retention/replay.train.jsonl
+  replay_ratio: 0.25
+  # Reference defaults to the starting checkpoint. Set weight to 0 to disable.
+  retention_kl_weight: 0.1
+  retention_temperature: 1.0
+  use_lora: true
+  use_qlora: false
+  lora_target_modules: all-linear
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_seq_length: 256
+  learning_rate: 0.00002
+  warmup_steps: 0
+  save_steps: 20
+  eval_steps: 20
+  logging_steps: 10
+  local_files_only: true
+  trust_remote_code: false
+eval:
+  enabled: true
+  regression_suite: examples/retention/suite.yaml
+  regression_baseline: outputs/base
+  regression_fail_on_rejection: true
+export:
+  enabled: true
+  require_gate: true
+  local_files_only: true

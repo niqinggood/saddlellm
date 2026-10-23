@@ -3,6 +3,18 @@
 New code should import from :mod:`saddlellm.data`.
 """
 
-from .data.pipeline import DataMixConfig, DataMixer, DataPipeline, PipelineConfig
+from .data.pipeline import (
+    CausalLMDataCollator,
+    DataMixConfig,
+    DataMixer,
+    DataPipeline,
+    PipelineConfig,
+)
 
-__all__ = ["DataMixConfig", "DataMixer", "DataPipeline", "PipelineConfig"]
+__all__ = [
+    "CausalLMDataCollator",
+    "DataMixConfig",
+    "DataMixer",
+    "DataPipeline",
+    "PipelineConfig",
+]

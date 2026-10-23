@@ -7,6 +7,8 @@ Approval scope: desktop, mobile portrait, mobile landscape, and implementation d
 
 ## Approved references
 
+The reference PNGs are kept locally and excluded from Git. They are not required to build or run Spatial Studio.
+
 - `desktop-v1.png` — 1536 × 1024 desktop workspace
 - `mobile-portrait-v1.png` — 430 × 932 mobile portrait workspace
 - `mobile-landscape-v1.png` — 932 × 430 mobile landscape workspace

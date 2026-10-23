@@ -1,0 +1,8 @@
+{"instruction":"把 hello 改成大写。","output":"HELLO"}
+{"instruction":"计算 3 加 4，只输出结果。","output":"7"}
+{"instruction":"将颜色 red 翻译成中文。","output":"红色"}
+{"instruction":"把数字 9、2、5 按从小到大排序。","output":"2、5、9"}
+{"instruction":"将短语 good morning 翻译成中文。","output":"早上好"}
+{"instruction":"从句子“小猫在窗边睡觉”中找出动物名称。","output":"小猫"}
+{"instruction":"把列表 apple, pear, banana 中的项目分成三行。","output":"apple\npear\nbanana"}
+{"instruction":"用礼貌的方式请求同事发送文件。","output":"请把文件发给我，谢谢。"}

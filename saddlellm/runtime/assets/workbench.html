@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#226d5a">
+  <title>SaddleLLM 实验工作台</title>
+  <link rel="stylesheet" href="/assets/workbench.css?v=1">
+  <script src="/assets/workbench.js?v=1" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到页面内容</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="实验工作台导航">
+      <a class="brand" href="/" aria-label="SaddleLLM 实验工作台首页"><span class="brand-mark" aria-hidden="true">S</span><span><strong>SaddleLLM</strong><small>实验工作台</small></span></a>
+      <p class="nav-label">从数据到结论</p>
+      <nav class="nav-list">
+        <button type="button" data-view="data"><span aria-hidden="true">01</span>数据说明</button>
+        <button type="button" data-view="checks"><span aria-hidden="true">02</span>训练前检查</button>
+        <button type="button" data-view="experiments"><span aria-hidden="true">03</span>实验方案</button>
+        <button type="button" data-view="training"><span aria-hidden="true">04</span>训练过程</button>
+        <button type="button" data-view="results"><span aria-hidden="true">05</span>效果对比</button>
+        <button type="button" data-view="reports"><span aria-hidden="true">06</span>报告与复现</button>
+      </nav>
+      <div class="sidebar-note"><strong>历史实验 · 只读</strong><p>查看真实记录、复制命令、下载产物。此页面不会启动训练。</p></div>
+    </aside>
+    <div class="main-shell">
+      <header class="topbar">
+        <div class="study-picker"><label for="studySelect">实验项目</label><select id="studySelect" disabled><option>正在读取项目…</option></select></div>
+        <div class="top-actions"><button class="button secondary" id="copyLink" type="button">复制页面链接</button><button class="button secondary" id="refresh" type="button">刷新记录</button></div>
+      </header>
+      <main id="main" tabindex="-1">
+        <div class="page-heading"><div><p class="eyebrow" id="studyMeta">本地实验记录</p><h1 id="pageTitle">数据说明</h1><p class="page-description" id="pageDescription">先看原始数据，再看模型实际学习的内容。</p></div><span class="badge neutral" id="readStatus">读取中</span></div>
+        <div class="notice" id="studyNotice" hidden></div>
+        <div id="content" aria-busy="true"><div class="state-box" role="status"><span class="spinner" aria-hidden="true"></span><h2>正在读取实验记录</h2><p>所有图表和结果均来自已保存的实验产物。</p></div></div>
+        <footer class="page-footer">SaddleLLM 实验工作台 · 数据、命令和结论均可追溯到本地产物</footer>
+      </main>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

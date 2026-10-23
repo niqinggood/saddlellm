@@ -14,6 +14,7 @@ import time
 import math
 import json
 import logging
+import warnings
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -33,7 +34,7 @@ class EnvCheckResult:
     gpu_count: int
     gpu_name: str
     gpu_memory_gb: float
-    gpu_total_memoryory_gb: float
+    gpu_total_memory_gb: float
     ram_total_gb: float
     ram_available_gb: float
     disk_free_gb: float
@@ -43,6 +44,16 @@ class EnvCheckResult:
     issues: List[str]
     recommendations: List[str]
     ready: bool
+
+    @property
+    def gpu_total_memoryory_gb(self) -> float:
+        """Deprecated compatibility alias for the pre-2.35 misspelling."""
+        warnings.warn(
+            "gpu_total_memoryory_gb is deprecated; use gpu_total_memory_gb",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.gpu_total_memory_gb
 
 
 def check_environment() -> EnvCheckResult:
@@ -78,7 +89,11 @@ def check_environment() -> EnvCheckResult:
     if gpu_count > 0:
         gpu_name = torch.cuda.get_device_name(0)
         gpu_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        gpu_mem = gpu_total - torch.cuda.memory_allocated(0) / (1024**3)
+        try:
+            free, total = torch.cuda.mem_get_info(0)
+            gpu_mem, gpu_total = free / (1024**3), total / (1024**3)
+        except Exception:
+            issues.append("无法查询驱动可用显存；不要按总显存推算当前可用容量")
     else:
         issues.append("未检测到 GPU — 只能训练 100M 以下模型, 且速度很慢")
 
@@ -129,14 +144,8 @@ def check_environment() -> EnvCheckResult:
     transformers_ver = pkg_versions.get("transformers", "N/A")
 
     # GPU 建议
-    if gpu_count >= 8:
-        recommendations.append("8+ GPU: 可以使用 DeepSpeed ZeRO-3 训练 7B+ 模型")
-    elif gpu_count >= 4:
-        recommendations.append("4+ GPU: 可以使用 DeepSpeed ZeRO-2 训练 3B 模型")
-    elif gpu_count >= 1:
-        max_params_gb = gpu_total * 0.7  # 70% 可用
-        max_params = max_params_gb / 2  # bf16 ≈ 2 bytes/param
-        recommendations.append(f"单 GPU: 可训练约 {max_params:.1f}B 参数模型")
+    if gpu_count:
+        recommendations.append("训练容量还需预算梯度、优化器状态和激活；多卡策略需按每卡容量、互联和模型实测，不能仅凭卡数判断")
 
     ready = len(issues) == 0
 
@@ -174,7 +183,7 @@ def check_environment() -> EnvCheckResult:
         gpu_count=gpu_count,
         gpu_name=gpu_name,
         gpu_memory_gb=gpu_mem,
-        gpu_total_memoryory_gb=gpu_total,
+        gpu_total_memory_gb=gpu_total,
         ram_total_gb=ram_total,
         ram_available_gb=ram_avail,
         disk_free_gb=disk_free,

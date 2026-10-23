@@ -15,7 +15,6 @@
 """
 import os
 import json
-import time
 import random
 import logging
 from typing import List, Dict, Optional, Callable, Union, Tuple
@@ -55,7 +54,14 @@ class TeacherInterface:
     ):
         self.model_type = model_type
         self.model_name = model_name
-        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        default_key_env = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "deepseek": "DEEPSEEK_API_KEY",
+        }.get(model_type)
+        self.api_key = api_key or (
+            os.environ.get(default_key_env) if default_key_env else None
+        )
         self.api_base = api_base
         self.local_model = local_model
         self.local_tokenizer = local_tokenizer
@@ -77,14 +83,19 @@ class TeacherInterface:
     def batch_generate(self, prompts: List[str], temperature: float = 0.7,
                        max_tokens: int = 2048, concurrency: int = 5) -> List[str]:
         """批量生成。"""
-        results = []
-        for i in range(0, len(prompts), concurrency):
-            batch = prompts[i:i+concurrency]
-            batch_results = [self.generate(p, temperature, max_tokens) for p in batch]
-            results.extend(batch_results)
-            if i + concurrency < len(prompts):
-                time.sleep(0.5)
-        return results
+        if concurrency < 1:
+            raise ValueError("concurrency must be at least 1")
+        if concurrency == 1 or len(prompts) <= 1:
+            return [self.generate(p, temperature, max_tokens) for p in prompts]
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            return list(
+                pool.map(
+                    lambda prompt: self.generate(prompt, temperature, max_tokens),
+                    prompts,
+                )
+            )
 
     def _generate_openai_compatible(self, prompt: str, temperature: float, max_tokens: int) -> str:
         try:
@@ -134,13 +145,49 @@ class TeacherInterface:
         return full[prompt_len:].strip()
 
     def _generate_endpoint(self, prompt: str, temperature: float, max_tokens: int) -> str:
-        import requests
-        response = requests.post(
-            self.endpoint_url,
-            json={"prompt": prompt, "temperature": temperature, "max_tokens": max_tokens},
-            timeout=120,
-        )
-        return response.json()["response"]
+        if not self.endpoint_url:
+            raise ValueError("endpoint_url is required for an endpoint teacher")
+        from urllib.error import HTTPError, URLError
+        from urllib.parse import urlparse
+        from urllib.request import Request, urlopen
+
+        endpoint = self.endpoint_url.rstrip("/")
+        parsed = urlparse(endpoint)
+        if parsed.path in {"", "/"}:
+            endpoint += "/v1/chat/completions"
+        elif parsed.path.rstrip("/") == "/v1":
+            endpoint += "/chat/completions"
+        payload = json.dumps(
+            {
+                "model": self.model_name or "teacher",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "stream": False,
+            }
+        ).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = Request(endpoint, data=payload, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"teacher endpoint returned HTTP {exc.code}: {body[:500]}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(f"teacher endpoint request failed: {exc.reason}") from exc
+        try:
+            return str(result["choices"][0]["message"]["content"])
+        except (KeyError, IndexError, TypeError):
+            if result.get("response") is not None:
+                return str(result["response"])
+            raise ValueError(
+                "teacher endpoint response must contain choices[0].message.content"
+            )
 
     @classmethod
     def from_openai(cls, model_name: str = "gpt-4o", api_key: str = None):

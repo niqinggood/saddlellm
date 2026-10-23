@@ -1,0 +1,34 @@
+project: saddlellm
+experiment: banking77_choice
+seed: 42
+stages: [decision]
+
+model:
+  backend: hf
+  name_or_path: /home/medmodel/models/Qwen3-Embedding-0.6B
+  local_files_only: true
+
+decision:
+  task_type: choice
+  method: supervised
+  freeze_backbone: true
+  dataset_dir: artifacts/decision_model_20261002/data/banking77
+  epochs: 40
+  batch_size: 256
+  learning_rate: 0.001
+  projection_rank: 64
+  encoder_device: auto
+  encoder_dtype: auto
+  encoder_batch_size: 16
+  max_length: 512
+
+distributed:
+  strategy: single
+
+logging:
+  output_dir: outputs/decision_choice
+  logging_backend: local
+
+# The decision stage owns held-out evaluation and model saving.
+eval:
+  enabled: false

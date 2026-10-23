@@ -1,0 +1,36 @@
+project: saddlellm
+experiment: typed_decision_native
+seed: 42
+stages: [decision]
+model:
+  backend: hf
+  name_or_path: native-byte-transformer
+decision:
+  task_type: typed
+  typed_backbone: native
+  method: supervised
+  freeze_backbone: false
+  dataset_dir: data/decision_typed_example
+  hidden_size: 64
+  num_layers: 2
+  num_heads: 4
+  max_length: 256
+  epochs: 20
+  batch_size: 16
+  learning_rate: 0.001
+  query_pooling: mean
+  instance_question_in_query: false
+  backbone_learning_rate: null
+  head_learning_rate: null
+  head_warmup_epochs: 0
+  early_stopping_patience: 0
+  evaluate_test: true
+  encoder_device: auto
+  encoder_dtype: float32
+distributed:
+  strategy: single
+logging:
+  output_dir: outputs/decision_typed
+  logging_backend: local
+eval:
+  enabled: false

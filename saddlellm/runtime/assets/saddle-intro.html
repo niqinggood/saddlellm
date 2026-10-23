@@ -1,0 +1,33 @@
+<div class="saddle-intro-page">
+  <header class="intro-page-header">
+    <div><p class="intro-overline" data-intro-i18n="overline">认识工具 · 从这里开始</p><h1 id="saddleGuideTitle" tabindex="-1">SaddleLLM 介绍</h1><p class="intro-description" id="saddleGuideDescription">了解数据准备、训练微调、效果评估和模型部署的基本流程。</p></div>
+    <div class="intro-header-actions">
+      <label class="intro-language" for="saddleGuideLanguage"><span data-intro-i18n="language">语言</span><select id="saddleGuideLanguage" aria-label="介绍语言"><option value="zh">中文</option><option value="en">English</option></select></label>
+      <a class="intro-button secondary" id="saddleBackToChat" href="/"><span data-intro-i18n="backToChat">返回模型问答</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M14 6l6 6-6 6"/></svg></a>
+    </div>
+  </header>
+
+  <section class="intro-overview" aria-labelledby="introWorkflowTitle">
+    <div class="intro-section-heading"><h2 id="introWorkflowTitle" data-intro-i18n="workflowTitle">一条模型工作流程</h2><span class="intro-label" data-intro-i18n="referenceLabel">介绍与命令参考</span></div>
+    <p data-intro-i18n="workflowDescription">先准备数据、检查环境，再按任务选择训练方法；用评测结果判断效果，最后按需要部署模型。</p>
+    <ol class="intro-workflow" id="saddleWorkflow"><li class="intro-workflow-loading">正在读取流程说明…</li></ol>
+    <p class="intro-overview-note" data-intro-i18n="workflowNote">这个页面用于理解功能和复制命令。点击介绍、搜索或复制命令不会启动训练。</p>
+  </section>
+
+  <div class="intro-browser">
+    <aside class="intro-directory" aria-label="介绍目录" data-intro-aria-i18n="directoryAria">
+      <label for="saddleGuideSearch" data-intro-i18n="searchLabel">查找功能与问题</label>
+      <div class="intro-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input id="saddleGuideSearch" type="search" placeholder="如：SFT、评估、数据" maxlength="200" disabled></div>
+      <div class="intro-directory-heading"><h2 data-intro-i18n="directoryTitle">功能目录</h2><button id="saddleGuideClear" type="button" data-intro-i18n="clearFilters" hidden>清除筛选</button></div>
+      <nav class="intro-categories" id="saddleGuideCategories" aria-label="按用途筛选功能" data-intro-aria-i18n="categoriesAria"></nav>
+      <p class="intro-directory-note" data-intro-i18n="directoryNote">每项功能包含适用场景、命令和可展开的问题排查建议。</p>
+    </aside>
+
+    <div class="intro-content">
+      <div class="intro-results-heading"><h2 id="saddleGuideSectionTitle">功能说明</h2><span id="saddleGuideCount" aria-live="polite">正在加载</span></div>
+      <div id="saddleGuideFeatures" aria-busy="true"><div class="intro-state" role="status"><span class="intro-spinner" aria-hidden="true"></span><h3>正在读取功能说明</h3><p>说明和命令来自当前服务内置的 SaddleLLM 目录。</p></div></div>
+    </div>
+  </div>
+  <footer class="intro-footer" data-intro-i18n="footer">SaddleLLM 功能介绍 · 示例中的路径和参数需要按实际数据与环境调整。</footer>
+</div>
+<div class="intro-toast" id="saddleGuideToast" role="status" aria-live="polite" hidden></div>

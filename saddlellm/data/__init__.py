@@ -4,10 +4,27 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "CausalLMDataCollator": (".pipeline", "CausalLMDataCollator"),
     "DataMixConfig": (".pipeline", "DataMixConfig"),
     "DataMixer": (".pipeline", "DataMixer"),
     "DataPipeline": (".pipeline", "DataPipeline"),
     "PipelineConfig": (".pipeline", "PipelineConfig"),
+    "AutoPostTrainingDecision": (
+        ".TrainingDataInspector",
+        "AutoPostTrainingDecision",
+    ),
+    "TrainingDataInspector": (
+        ".TrainingDataInspector",
+        "TrainingDataInspector",
+    ),
+    "audit_training_splits": (
+        ".TrainingDataInspector",
+        "audit_training_splits",
+    ),
+    "inspect_training_data": (
+        ".TrainingDataInspector",
+        "inspect_training_data",
+    ),
     "DataSourceHandler": (".text_processing", "DataSourceHandler"),
     "TextCleaner": (".text_processing", "TextCleaner"),
     "TextProcessor": (".text_processing", "TextProcessor"),

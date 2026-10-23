@@ -8,6 +8,7 @@ checks until their checkpoint semantics are implemented.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -18,13 +19,30 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from transformers import TrainingArguments
 
+from ..data.PostTrainingData import PostTrainingDataAdapter
 from ..models.ModelAdapter import SaddleModelAdapter
 from .NativeTrainer import SaddleTrainer
-from ..data.PostTrainingData import PostTrainingDataAdapter
+from .Retention import ReferenceKLMixin
 
 
 def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _activate_local_device() -> None:
+    if not torch.cuda.is_available():
+        return
+    raw = os.environ.get("LOCAL_RANK", "0")
+    try:
+        local_rank = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"LOCAL_RANK must be an integer, got {raw!r}") from exc
+    if not 0 <= local_rank < torch.cuda.device_count():
+        raise ValueError(
+            f"LOCAL_RANK={local_rank} cannot address only "
+            f"{torch.cuda.device_count()} visible CUDA device(s)"
+        )
+    torch.cuda.set_device(local_rank)
 
 
 def _format_messages(tokenizer: Any, messages: Sequence[Dict[str, str]], *, add_generation_prompt: bool) -> str:
@@ -62,64 +80,91 @@ def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
     return count
 
 
-def _sft_features(record: Dict[str, Any], tokenizer: Any, max_length: int) -> Optional[Dict[str, List[int]]]:
+def _sft_features(
+    record: Dict[str, Any], tokenizer: Any, max_length: int
+) -> List[Dict[str, List[int]]]:
     normalized = PostTrainingDataAdapter.normalize_record(record, task="sft")
     if normalized is None:
-        return None
+        return []
     if normalized.get("text"):
         input_ids = _encode(tokenizer, str(normalized["text"]), max_length)
-        return {"input_ids": input_ids, "labels": list(input_ids)} if len(input_ids) > 1 else None
+        return (
+            [{"input_ids": input_ids, "labels": list(input_ids)}]
+            if len(input_ids) > 1
+            else []
+        )
 
     messages = list(normalized.get("messages") or [])
     assistant_indices = [
         index for index, message in enumerate(messages) if message.get("role") == "assistant"
     ]
     if not assistant_indices:
-        return None
-    # Train the final assistant response.  This keeps prompt masking correct for
-    # both two-turn instruction data and multi-turn chat records.
-    assistant_index = assistant_indices[-1]
-    context = messages[:assistant_index]
-    supervised = messages[: assistant_index + 1]
-    prompt_text = _format_messages(tokenizer, context, add_generation_prompt=True)
-    full_text = _format_messages(tokenizer, supervised, add_generation_prompt=False)
-    input_ids = _encode(tokenizer, full_text, max_length)
-    prompt_ids = _encode(tokenizer, prompt_text, max_length)
-    prompt_length = _common_prefix_length(prompt_ids, input_ids)
-    if prompt_length >= len(input_ids):
-        # Some generic tokenizers do not have a compatible chat template.  In
-        # that case retain at least the final token as a supervised target.
-        prompt_length = max(0, len(input_ids) - 1)
-    labels = [-100] * prompt_length + input_ids[prompt_length:]
-    return {"input_ids": input_ids, "labels": labels} if len(input_ids) > 1 else None
+        return []
+
+    features: List[Dict[str, List[int]]] = []
+    for assistant_index in assistant_indices:
+        context = messages[:assistant_index]
+        supervised = messages[: assistant_index + 1]
+        prompt_text = _format_messages(
+            tokenizer, context, add_generation_prompt=True
+        )
+        full_text = _format_messages(
+            tokenizer, supervised, add_generation_prompt=False
+        )
+        input_ids = _encode(tokenizer, full_text, max_length)
+        prompt_ids = _encode(tokenizer, prompt_text, max_length)
+        prompt_length = _common_prefix_length(prompt_ids, input_ids)
+        if prompt_length >= len(input_ids):
+            # The answer was fully truncated or the template could not provide
+            # a trustworthy response boundary.  Dropping it is safer than
+            # silently supervising a prompt token.
+            continue
+        labels = [-100] * prompt_length + input_ids[prompt_length:]
+        if len(input_ids) > 1 and any(label != -100 for label in labels):
+            features.append({"input_ids": input_ids, "labels": labels})
+    return features
 
 
 def _preference_features(
     record: Dict[str, Any], tokenizer: Any, max_length: int, max_prompt_length: int
 ) -> Optional[Dict[str, List[int]]]:
+    if (isinstance(max_length, bool) or not isinstance(max_length, int) or max_length < 2
+            or isinstance(max_prompt_length, bool) or not isinstance(max_prompt_length, int)
+            or max_prompt_length < 1):
+        raise ValueError("DPO max_length must be >= 2 and max_prompt_length must be a positive integer")
     normalized = PostTrainingDataAdapter.normalize_record(record, task="dpo")
     if normalized is None:
         return None
     prompt_text = str(normalized["prompt"])
-
-    def completion(value: Any) -> Dict[str, List[int]]:
-        completion_text = str(value)
-        separator = "" if prompt_text.endswith((" ", "\n", "\t")) else " "
-        full_text = f"{prompt_text}{separator}{completion_text}"
-        ids = _encode(tokenizer, full_text, max_length)
-        prompt_ids = _encode(tokenizer, prompt_text, min(max_prompt_length, max_length))
-        prompt_length = min(_common_prefix_length(prompt_ids, ids), max_prompt_length)
-        if prompt_length >= len(ids):
-            prompt_length = max(0, len(ids) - 1)
-        labels = [-100] * prompt_length + ids[prompt_length:]
-        return {"input_ids": ids, "labels": labels}
-
-    chosen = completion(normalized["chosen"])
-    rejected = completion(normalized["rejected"])
-    if not any(label != -100 for label in chosen["labels"]):
+    answers = [str(normalized[name]) for name in ("chosen", "rejected")]
+    if any(not answer.strip() for answer in answers):
         return None
-    if not any(label != -100 for label in rejected["labels"]):
+    separator = "" if prompt_text.endswith((" ", "\n", "\t")) else " "
+    context_text = prompt_text + separator
+
+    def encode_full(text: str) -> List[int]:
+        return list(tokenizer(text, add_special_tokens=True, truncation=False)["input_ids"])
+
+    # Find the response boundary BEFORE applying either length budget. Capping
+    # only the mask length leaves long prompt tokens in the supervised answer.
+    # Joint tokenization preserves tokens merged across the text boundary; the
+    # two alternatives share exactly the same retained causal context.
+    prompt_ids = encode_full(context_text)
+    alternatives = [encode_full(context_text + answer) for answer in answers]
+    boundary = min(_common_prefix_length(prompt_ids, ids) for ids in alternatives)
+    if boundary == 0 or any(boundary >= len(ids) for ids in alternatives):
         return None
+    # Keep the recent prompt context, reserving at least one response token.
+    # Never rescue an empty/truncated answer by supervising a prompt token.
+    retained_prompt = prompt_ids[:boundary][-min(max_prompt_length, max_length - 1):]
+    response_budget = max_length - len(retained_prompt)
+
+    def completion(ids: List[int]) -> Dict[str, List[int]]:
+        response = ids[boundary:boundary + response_budget]
+        return {"input_ids": retained_prompt + response,
+                "labels": [-100] * len(retained_prompt) + response}
+
+    chosen, rejected = [completion(ids) for ids in alternatives]
     return {
         "chosen_input_ids": chosen["input_ids"],
         "chosen_labels": chosen["labels"],
@@ -246,6 +291,10 @@ class NativeDPOTrainer(SaddleTrainer):
         return loss
 
 
+class NativeRetentionSFTTrainer(ReferenceKLMixin, SaddleTrainer):
+    """Native SFT with explicit full-logit reference KL during training."""
+
+
 @dataclass
 class NativeSFTConfig:
     model_path: str
@@ -261,10 +310,20 @@ class NativeSFTConfig:
     save_steps: int = 200
     logging_steps: int = 10
     validation_split: float = 0.0
+    validation_dataset_path: Optional[str] = None
+    load_best_model_at_end: bool = True
+    save_total_limit: int = 3
     eval_steps: int = 0
     gradient_checkpointing: bool = True
     report_to: str = "none"
     seed: int = 42
+    ddp_backend: Optional[str] = None
+    replay_data_path: Optional[str] = None
+    replay_ratio: float = 0.0
+    replay_count: Optional[int] = None
+    reference_model_path: Optional[str] = None
+    retention_kl_weight: float = 0.0
+    retention_temperature: float = 1.0
 
 
 @dataclass
@@ -284,10 +343,14 @@ class NativeDPOConfig:
     save_steps: int = 200
     logging_steps: int = 10
     validation_split: float = 0.0
+    validation_dataset_path: Optional[str] = None
+    load_best_model_at_end: bool = True
+    save_total_limit: int = 3
     eval_steps: int = 0
     gradient_checkpointing: bool = True
     report_to: str = "none"
     seed: int = 42
+    ddp_backend: Optional[str] = None
 
 
 def _training_arguments(config: Any, *, remove_unused_columns: bool) -> TrainingArguments:
@@ -297,8 +360,21 @@ def _training_arguments(config: Any, *, remove_unused_columns: bool) -> Training
             "Native post-training requires warmup_steps < max_steps; otherwise "
             "the entire short run can execute at zero learning rate"
         )
-    has_eval = bool(config.validation_split and 0 < config.validation_split < 1)
+    has_eval = bool(
+        config.validation_dataset_path
+        or (config.validation_split and 0 < config.validation_split < 1)
+    )
     eval_strategy = "steps" if has_eval and config.eval_steps > 0 else ("epoch" if has_eval else "no")
+    load_best = bool(has_eval and config.load_best_model_at_end)
+    if (
+        load_best
+        and eval_strategy == "steps"
+        and config.save_steps % config.eval_steps != 0
+    ):
+        raise ValueError(
+            "save_steps must be a multiple of eval_steps when selecting the "
+            "best native post-training checkpoint"
+        )
     return TrainingArguments(
         output_dir=config.output_path,
         per_device_train_batch_size=config.batch_size,
@@ -309,65 +385,212 @@ def _training_arguments(config: Any, *, remove_unused_columns: bool) -> Training
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
         save_steps=config.save_steps,
-        save_strategy="steps" if config.save_steps > 0 else "no",
+        save_strategy=(
+            eval_strategy
+            if load_best
+            else ("steps" if config.save_steps > 0 else "no")
+        ),
         logging_steps=max(1, config.logging_steps),
         eval_strategy=eval_strategy,
         eval_steps=config.eval_steps if config.eval_steps > 0 else None,
+        load_best_model_at_end=load_best,
+        metric_for_best_model="eval_loss" if load_best else None,
+        greater_is_better=False if load_best else None,
+        save_total_limit=config.save_total_limit,
         gradient_checkpointing=config.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         report_to=config.report_to,
         remove_unused_columns=remove_unused_columns,
+        prediction_loss_only=not remove_unused_columns,
+        label_names=(
+            None
+            if remove_unused_columns
+            else ["chosen_labels", "rejected_labels"]
+        ),
         dataloader_num_workers=0,
         dataloader_pin_memory=device == "cuda",
         bf16=device == "cuda" and torch.cuda.is_bf16_supported(),
         fp16=device == "cuda" and not torch.cuda.is_bf16_supported(),
         use_cpu=device == "cpu",
+        ddp_backend=config.ddp_backend,
         seed=config.seed,
     )
 
 
-def _split_features(features: List[Dict[str, List[int]]], fraction: float, seed: int):
-    if not fraction or not 0 < fraction < 1:
+def _split_features(features: List[Dict[str, List[int]]], fraction: float, seed: int, *, groups=None):
+    if (isinstance(fraction, bool) or not isinstance(fraction, (int, float))
+            or not math.isfinite(fraction) or not 0 <= fraction < 1):
+        raise ValueError("validation_split must be a finite fraction in [0, 1)")
+    if not fraction:
         return _FeatureDataset(features), None
-    if len(features) < 2:
-        raise ValueError("validation_split requires at least two usable samples")
+    groups = list(range(len(features))) if groups is None else list(groups)
+    if len(groups) != len(features):
+        raise ValueError("validation_split groups must match tokenized samples")
+    unique_groups = list(dict.fromkeys(groups))
+    if len(unique_groups) < 2:
+        raise ValueError("validation_split requires at least two usable source records")
     generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(len(features), generator=generator).tolist()
-    eval_size = max(1, int(math.ceil(len(features) * fraction)))
-    eval_indices = set(order[:eval_size])
-    train = [item for index, item in enumerate(features) if index not in eval_indices]
-    evaluation = [item for index, item in enumerate(features) if index in eval_indices]
+    order = torch.randperm(len(unique_groups), generator=generator).tolist()
+    eval_size = min(len(unique_groups) - 1, max(1, int(math.ceil(len(unique_groups) * fraction))))
+    eval_groups = {unique_groups[index] for index in order[:eval_size]}
+    train = [item for item, group in zip(features, groups) if group not in eval_groups]
+    evaluation = [item for item, group in zip(features, groups) if group in eval_groups]
     return _FeatureDataset(train), _FeatureDataset(evaluation)
 
 
 def train_native_sft(config: NativeSFTConfig) -> Dict[str, Any]:
+    from ..data.ReplayData import (
+        sft_source_groups,
+        validate_replay_config,
+    )
+    from .Retention import validate_reference_tokenizers, validate_retention_config
+    from .TrainingProgress import LocalProgressCallback
+
+    replay_enabled = validate_replay_config(
+        config.replay_data_path, config.replay_ratio, config.replay_count
+    )
+    retention_enabled = validate_retention_config(
+        config.reference_model_path, config.retention_kl_weight, config.retention_temperature
+    )
+    _activate_local_device()
     adapter = SaddleModelAdapter()
     adapter.validate_stage("sft")
     tokenizer = adapter.load_tokenizer(config.model_path, local_files_only=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     records = PostTrainingDataAdapter.load_records(config.dataset_path)
-    features = [
-        feature
-        for record in records
-        if (feature := _sft_features(record, tokenizer, config.max_length)) is not None
-    ]
+    source_groups = sft_source_groups(records)
+    features, feature_groups, feature_sources = [], [], []
+    for source_index, record in enumerate(records):
+        turns = _sft_features(record, tokenizer, config.max_length)
+        features.extend(turns)
+        feature_groups.extend([source_groups[source_index]] * len(turns))
+        feature_sources.extend([source_index] * len(turns))
     if not features:
         raise ValueError("Native SFT dataset produced zero usable tokenized samples")
-    train_dataset, eval_dataset = _split_features(features, config.validation_split, config.seed)
+    if config.validation_dataset_path and config.validation_split:
+        raise ValueError(
+            "Use either validation_dataset_path or validation_split for native "
+            "SFT, not both."
+        )
+    validation_records = []
+    source_train_records = records
+    if config.validation_dataset_path:
+        validation_records = PostTrainingDataAdapter.load_records(
+            config.validation_dataset_path
+        )
+        validation_features = [
+            feature
+            for record in validation_records
+            for feature in _sft_features(record, tokenizer, config.max_length)
+        ]
+        if not validation_features:
+            raise ValueError(
+                "Native SFT validation dataset produced zero usable tokenized samples"
+            )
+        train_dataset = _FeatureDataset(features)
+        eval_dataset = _FeatureDataset(validation_features)
+    else:
+        train_dataset, eval_dataset = _split_features(
+            features, config.validation_split, config.seed, groups=feature_groups
+        )
+        if eval_dataset is not None:
+            held_out_features = {id(item) for item in eval_dataset.features}
+            held_out_sources = {
+                source_index for feature, source_index in zip(features, feature_sources)
+                if id(feature) in held_out_features
+            }
+            validation_records = [records[index] for index in sorted(held_out_sources)]
+            source_train_records = [
+                record for index, record in enumerate(records)
+                if index not in held_out_sources
+            ]
+    replay_info = {"enabled": False}
+    if replay_enabled:
+        from ..data.ReplayData import (
+            filter_replay_records,
+            mix_replay_samples,
+            replay_source_fingerprint,
+        )
+
+        replay_records = PostTrainingDataAdapter.load_records(config.replay_data_path)
+        eligible, filtering = filter_replay_records(replay_records, validation_records)
+        replay_features = [
+            feature for record in eligible
+            for feature in _sft_features(record, tokenizer, config.max_length)
+        ]
+        mixed, replay_info = mix_replay_samples(
+            train_dataset.features, replay_features,
+            replay_ratio=config.replay_ratio, replay_count=config.replay_count,
+            seed=config.seed,
+            validation_samples=eval_dataset.features if eval_dataset is not None else [],
+        )
+        replay_info.update(filtering)
+        replay_info["data_path"] = os.path.abspath(config.replay_data_path)
+        replay_info["source_fingerprint"] = replay_source_fingerprint(replay_records)
+        train_dataset = _FeatureDataset(mixed)
+    split_audit = None
+    if eval_dataset is not None:
+        from ..data.TrainingSplitAudit import audit_record_splits
+
+        split_audit = audit_record_splits(
+            source_train_records,
+            validation_records,
+            train_features=train_dataset.features,
+            validation_features=eval_dataset.features,
+            report_path=os.path.join(config.output_path, "split_audit.json"),
+            protected_paths=(config.dataset_path, config.validation_dataset_path, config.replay_data_path),
+        )
     model = adapter.load_model(config.model_path, map_location="cpu")
-    trainer = SaddleTrainer(
+    retention_info = {"enabled": False}
+    retention_kwargs = {}
+    if retention_enabled:
+        reference_path = config.reference_model_path or config.model_path
+        reference_tokenizer = adapter.load_tokenizer(reference_path, local_files_only=True)
+        if reference_tokenizer.pad_token_id is None and reference_tokenizer.eos_token_id is not None:
+            reference_tokenizer.pad_token = reference_tokenizer.eos_token
+        validate_reference_tokenizers(tokenizer, reference_tokenizer)
+        reference_model = adapter.load_model(reference_path, map_location="cpu")
+        if model.config.vocab_size != reference_model.config.vocab_size:
+            raise ValueError("Retention student and reference models must have matching output vocabulary sizes")
+        retention_kwargs = {
+            "reference_model": reference_model,
+            "retention_kl_weight": config.retention_kl_weight,
+            "retention_temperature": config.retention_temperature,
+        }
+        retention_info = {
+            "enabled": True, "reference_model_path": reference_path,
+            "kl_weight": config.retention_kl_weight, "temperature": config.retention_temperature,
+            "direction": "reference_to_student", "applies_to": "training_supervised_tokens",
+            "requires_full_logits": True,
+        }
+    trainer_class = NativeRetentionSFTTrainer if retention_enabled else SaddleTrainer
+    trainer = trainer_class(
         model=model,
         args=_training_arguments(config, remove_unused_columns=True),
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=NativeSFTCollator(tokenizer),
         processing_class=tokenizer,
+        **retention_kwargs,
     )
+    trainer.add_callback(LocalProgressCallback(config.output_path))
     result = trainer.train()
+    if retention_enabled:
+        retention_info.update(trainer.retention_metrics())
     trainer.save_model(config.output_path)
-    tokenizer.save_pretrained(config.output_path)
     trainer.save_state()
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(config.output_path)
+        if replay_enabled:
+            with open(os.path.join(config.output_path, "replay_manifest.json"), "w", encoding="utf-8") as handle:
+                json.dump(replay_info, handle, ensure_ascii=False, indent=2)
+        if retention_enabled:
+            with open(os.path.join(config.output_path, "retention_manifest.json"), "w", encoding="utf-8") as handle:
+                json.dump(retention_info, handle, ensure_ascii=False, indent=2)
+    from .DistributedRuntime import distributed_barrier
+
+    distributed_barrier()
     return {
         "output_path": os.path.abspath(config.output_path),
         "train_samples": len(train_dataset),
@@ -378,29 +601,95 @@ def train_native_sft(config: NativeSFTConfig) -> Dict[str, Any]:
         "backend": "saddle",
         "use_lora": False,
         "use_qlora": False,
+        "validation_dataset_path": config.validation_dataset_path,
+        "best_model_checkpoint": getattr(trainer.state, "best_model_checkpoint", None),
+        "best_metric": getattr(trainer.state, "best_metric", None),
+        "replay": replay_info,
+        "retention": retention_info,
+        "split_audit": split_audit,
     }
 
 
 def train_native_dpo(config: NativeDPOConfig) -> Dict[str, Any]:
+    from .TrainingProgress import LocalProgressCallback
+
+    _activate_local_device()
     adapter = SaddleModelAdapter()
     adapter.validate_stage("preference", method="dpo")
     tokenizer = adapter.load_tokenizer(config.model_path, local_files_only=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     records = PostTrainingDataAdapter.load_records(config.dataset_path)
-    features = [
-        feature
-        for record in records
-        if (
-            feature := _preference_features(
-                record, tokenizer, config.max_length, config.max_prompt_length
-            )
+    features, usable_records = [], []
+    for record in records:
+        feature = _preference_features(
+            record, tokenizer, config.max_length, config.max_prompt_length
         )
-        is not None
-    ]
+        if feature is not None:
+            features.append(feature)
+            usable_records.append(record)
     if not features:
         raise ValueError("Native DPO dataset produced zero usable tokenized samples")
-    train_dataset, eval_dataset = _split_features(features, config.validation_split, config.seed)
+    if config.validation_dataset_path and config.validation_split:
+        raise ValueError(
+            "Use either validation_dataset_path or validation_split for native "
+            "DPO, not both."
+        )
+    if config.validation_dataset_path:
+        validation_records = PostTrainingDataAdapter.load_records(
+            config.validation_dataset_path
+        )
+        validation_features = [
+            feature
+            for record in validation_records
+            if (
+                feature := _preference_features(
+                    record, tokenizer, config.max_length, config.max_prompt_length
+                )
+            )
+            is not None
+        ]
+        if not validation_features:
+            raise ValueError(
+                "Native DPO validation dataset produced zero usable tokenized samples"
+            )
+        train_dataset = _FeatureDataset(features)
+        eval_dataset = _FeatureDataset(validation_features)
+    else:
+        from ..data.GroupSplit import source_record_groups
+
+        feature_groups = source_record_groups(
+            usable_records,
+            prompts=[PostTrainingDataAdapter._prompt_from_record(record) for record in usable_records],
+        )
+        train_dataset, eval_dataset = _split_features(
+            features, config.validation_split, config.seed, groups=feature_groups
+        )
+    split_audit = None
+    if eval_dataset is not None:
+        from ..data.TrainingSplitAudit import audit_record_splits
+
+        # Split datasets retain the original feature objects. Recover their
+        # source records so the audit checks identities as well as tokens.
+        training_feature_ids = {id(feature) for feature in train_dataset.features}
+        source_train_records = [
+            record for feature, record in zip(features, usable_records)
+            if id(feature) in training_feature_ids
+        ]
+        if not config.validation_dataset_path:
+            validation_records = [
+                record for feature, record in zip(features, usable_records)
+                if id(feature) not in training_feature_ids
+            ]
+        split_audit = audit_record_splits(
+            source_train_records,
+            validation_records,
+            task="dpo",
+            train_features=train_dataset.features,
+            validation_features=eval_dataset.features,
+            report_path=os.path.join(config.output_path, "split_audit.json"),
+            protected_paths=(config.dataset_path, config.validation_dataset_path),
+        )
     model = adapter.load_model(config.model_path, map_location="cpu")
     reference_model = copy.deepcopy(model)
     trainer = NativeDPOTrainer(
@@ -413,10 +702,15 @@ def train_native_dpo(config: NativeDPOConfig) -> Dict[str, Any]:
         data_collator=NativeDPOCollator(tokenizer),
         processing_class=tokenizer,
     )
+    trainer.add_callback(LocalProgressCallback(config.output_path))
     result = trainer.train()
     trainer.save_model(config.output_path)
-    tokenizer.save_pretrained(config.output_path)
     trainer.save_state()
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(config.output_path)
+    from .DistributedRuntime import distributed_barrier
+
+    distributed_barrier()
     return {
         "output_path": os.path.abspath(config.output_path),
         "train_samples": len(train_dataset),
@@ -426,8 +720,12 @@ def train_native_dpo(config: NativeDPOConfig) -> Dict[str, Any]:
         "objective": "dpo",
         "backend": "saddle",
         "beta": config.beta,
+        "split_audit": split_audit,
         "use_lora": False,
         "use_qlora": False,
+        "validation_dataset_path": config.validation_dataset_path,
+        "best_model_checkpoint": getattr(trainer.state, "best_model_checkpoint", None),
+        "best_metric": getattr(trainer.state, "best_metric", None),
     }
 
 

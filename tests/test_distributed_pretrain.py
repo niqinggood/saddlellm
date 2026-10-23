@@ -291,3 +291,70 @@ def test_fsdp_configuration_constructs_without_gpu_runtime(tmp_path):
     assert payload["distributed_type"] == "FSDP"
     assert payload["num_processes"] == 2
     assert payload["fsdp_config"] == args["fsdp_config"]
+
+
+def test_deepspeed_zero_config_enables_communication_overlap_by_default():
+    zero2 = DistributedConfig(
+        strategy="deepspeed_zero2", bf16=False, fp16=False
+    ).to_deepspeed_config()["zero_optimization"]
+
+    assert zero2["stage"] == 2
+    assert zero2["overlap_comm"] is True
+    assert zero2["contiguous_gradients"] is True
+    assert zero2["reduce_scatter"] is True
+    assert zero2["allgather_partitions"] is True
+    assert "stage3_prefetch_bucket_size" not in zero2
+
+    zero3 = DistributedConfig(
+        strategy="deepspeed_zero3",
+        bf16=False,
+        fp16=False,
+        zero_stage3_prefetch_bucket_size=12_345,
+    ).to_deepspeed_config()["zero_optimization"]
+    assert zero3["stage"] == 3
+    assert zero3["stage3_prefetch_bucket_size"] == 12_345
+
+
+def test_deepspeed_offload_configs_pin_cpu_and_place_zero3_params_on_nvme():
+    cpu = DistributedConfig(
+        strategy="deepspeed_zero3",
+        bf16=False,
+        fp16=False,
+        zero_offload_to_cpu=True,
+    ).to_deepspeed_config()["zero_optimization"]
+    assert cpu["offload_optimizer"] == {"device": "cpu", "pin_memory": True}
+    assert cpu["offload_param"] == {"device": "cpu", "pin_memory": True}
+
+    nvme = DistributedConfig(
+        strategy="deepspeed_zero3",
+        bf16=False,
+        fp16=False,
+        zero_offload_to_nvme=True,
+        zero_nvme_path="D:/ds-cache",
+    ).to_deepspeed_config()["zero_optimization"]
+    assert nvme["offload_optimizer"]["device"] == "nvme"
+    assert nvme["offload_param"]["device"] == "nvme"
+    assert nvme["offload_optimizer"]["nvme_path"] == "D:/ds-cache"
+    assert nvme["offload_param"]["nvme_path"] == "D:/ds-cache"
+    assert nvme["offload_optimizer"]["pin_memory"] is False
+    assert nvme["offload_param"]["pin_memory"] is False
+
+    cpu_zero2 = DistributedConfig(
+        strategy="deepspeed_zero2",
+        bf16=False,
+        fp16=False,
+        zero_offload_to_cpu=True,
+    ).to_deepspeed_config()["zero_optimization"]
+    assert cpu_zero2["offload_optimizer"] == {"device": "cpu", "pin_memory": True}
+    assert cpu_zero2["offload_param"] == {"device": "none", "pin_memory": False}
+
+
+def test_deepspeed_bucket_sizes_must_be_non_negative():
+    with pytest.raises(ValueError, match="zero_reduce_bucket_size"):
+        DistributedConfig(zero_reduce_bucket_size=-1)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        DistributedConfig(
+            zero_offload_to_cpu=True,
+            zero_offload_to_nvme=True,
+        )

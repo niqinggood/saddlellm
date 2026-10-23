@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "task_type": "typed",
+  "source": "synthetic controlled signal fixture",
+  "purpose": "Training/inference integration; no claim of general decision quality",
+  "splits": {
+    "train": "train.jsonl",
+    "validation": "validation.jsonl",
+    "calibration": "calibration.jsonl",
+    "test": "test.jsonl"
+  }
+}

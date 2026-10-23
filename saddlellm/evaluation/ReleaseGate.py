@@ -229,3 +229,42 @@ def evaluate_release_gate(
         enabled=enabled,
         require_all=require_all,
     ).to_dict()
+
+
+def release_gate_accepted(payload: Any) -> bool:
+    """Read the explicit pass decision from any SaddleLLM gate schema.
+
+    Older metric gates use ``accepted``/``status`` while paired comparison
+    reports use ``decision``.  Consumers must fail closed when no explicit
+    decision exists instead of guessing from individual metrics.
+    """
+    if isinstance(payload, ReleaseGateResult):
+        return payload.enabled and payload.accepted
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("enabled") is False:
+        return False
+    accepted = payload.get("accepted")
+    if isinstance(accepted, bool):
+        return accepted
+    status = str(payload.get("status", "")).strip().lower()
+    if status in {"accepted", "promoted"}:
+        return True
+    if status in {"rejected", "not_promoted", "invalid"}:
+        return False
+    decision = str(payload.get("decision", "")).strip().lower()
+    if decision in {"accepted", "promote", "promoted"}:
+        return True
+    if decision in {"rejected", "not_promoted"}:
+        return False
+    nested = payload.get("gate")
+    return release_gate_accepted(nested) if isinstance(nested, Mapping) else False
+
+
+__all__ = [
+    "EvaluationReleaseGate",
+    "ReleaseGateCheck",
+    "ReleaseGateResult",
+    "evaluate_release_gate",
+    "release_gate_accepted",
+]

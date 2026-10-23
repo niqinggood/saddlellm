@@ -9,15 +9,20 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Iterable
 
-
 EXPECTED_BASE_DEPENDENCIES = {"packaging", "pyyaml"}
 EXPECTED_EXTRAS = {
     "data",
+    "deepspeed",
     "dev",
+    "embedding",
     "monitor",
     "posttrain",
+    "ptq",
+    "qat",
     "qlora",
+    "rollout",
     "serve",
+    "serve-vllm",
     "spatial",
     "text",
     "train",
@@ -25,6 +30,30 @@ EXPECTED_EXTRAS = {
 REQUIRED_FILES = {
     "saddlellm/__init__.py",
     "saddle_llm/__init__.py",
+    "saddlellm/utils/EnvironmentDiagnostics.py",
+    "saddlellm/runtime/ChatWebRoutes.py",
+    "saddlellm/runtime/InferenceLifecycle.py",
+    "saddlellm/models/NativeBatchDecode.py",
+    "saddlellm/runtime/NativeStreamBatcher.py",
+    "saddlellm/runtime/assets/chat.html",
+    "saddlellm/runtime/assets/chat.js",
+    "saddlellm/runtime/assets/chat.css",
+    "saddlellm/runtime/StudyWorkbench.py",
+    "saddlellm/runtime/WorkbenchAPI.py",
+    "saddlellm/runtime/assets/workbench.html",
+    "saddlellm/runtime/assets/workbench.js",
+    "saddlellm/runtime/assets/workbench.css",
+    "saddlellm/runtime/SaddleGuide.py",
+    "saddlellm/runtime/assets/saddle-intro.html",
+    "saddlellm/runtime/assets/saddle-intro.css",
+    "saddlellm/runtime/assets/saddle-intro.js",
+    "saddlellm/data/GroupSplit.py",
+    "saddlellm/evaluation/EvaluationRunner.py",
+    "saddlellm/evaluation/ModelIdentity.py",
+    "saddlellm/compression/QuantizationPipeline.py",
+    "saddlellm/compression/QuantizationStage.py",
+    "saddlellm/compression/CalibratedPTQ.py",
+    "saddlellm/compression/QuantizationAwareTraining.py",
     "saddlellm/spatial_studio_web/index.html",
     *(
         f"saddlellm/{package}/__init__.py"
@@ -135,12 +164,14 @@ def check_wheel(path: Path) -> list[str]:
         if base_dependencies != EXPECTED_BASE_DEPENDENCIES:
             issues.append(
                 "base dependencies must stay lightweight: "
-                f"expected {sorted(EXPECTED_BASE_DEPENDENCIES)}, got {sorted(base_dependencies)}"
+                f"expected {sorted(EXPECTED_BASE_DEPENDENCIES)}, "
+                f"got {sorted(base_dependencies)}"
             )
         extras = set(metadata.get_all("Provides-Extra", []))
         if extras != EXPECTED_EXTRAS:
             issues.append(
-                f"unexpected extras: expected {sorted(EXPECTED_EXTRAS)}, got {sorted(extras)}"
+                f"unexpected extras: expected {sorted(EXPECTED_EXTRAS)}, "
+                f"got {sorted(extras)}"
             )
     return issues
 

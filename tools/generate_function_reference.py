@@ -17,7 +17,7 @@ from typing import Iterable, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOTS = (ROOT / "saddlellm", ROOT / "saddle_llm")
 FRONTEND_ROOT = ROOT / "spatial-studio" / "src"
-DEFAULT_OUTPUT = ROOT / "docs" / "FUNCTION_REFERENCE.md"
+DEFAULT_OUTPUT = ROOT / "outputs" / "FUNCTION_REFERENCE.md"
 
 
 @dataclass(frozen=True)
@@ -478,7 +478,7 @@ def render(records: Sequence[CallableRecord]) -> str:
             "python tools/generate_function_reference.py --check",
             "```",
             "",
-            "`--check` 不改文件；当生成结果与已提交文档不一致时返回非零退出码。",
+            "`--check` 不改文件；当生成结果与本地报告不一致时返回非零退出码。报告位于 `outputs/FUNCTION_REFERENCE.md`，不提交到仓库。",
             "",
         ]
     )

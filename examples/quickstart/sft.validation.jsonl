@@ -1,0 +1,4 @@
+{"instruction":"提取字符串 ticket-482 中的数字。","output":"482"}
+{"instruction":"为一封会议延期通知写一个简短标题。","output":"会议延期通知"}
+{"instruction":"把两句话合并为一句：今天下雨。我们带伞出门。","output":"今天下雨，我们带伞出门。"}
+{"instruction":"判断“太阳从西边升起”是否正确。","output":"不正确，太阳从东边升起。"}

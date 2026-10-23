@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 PIPELINE_STATE_API_VERSION = "saddlellm.io/pipeline-state/v1alpha1"
+_UNSUCCESSFUL_STAGE_STATUSES = frozenset({"failed", "rejected", "blocked"})
 
 
 class PipelinePlanError(ValueError):
@@ -278,16 +279,23 @@ class PipelineStateStore:
         if resume and self.path.is_file():
             self.state = self._load()
             self._validate_loaded_state()
-            invalidated = set(self.plan.descendants(rerun)) if rerun else set()
+            records = self.state.get("stages", {})
+            retry = [
+                stage for stage in self.plan.stages
+                if not self._can_restore(records.get(stage, {}))
+            ]
+            explicitly_invalidated = set(self.plan.descendants(rerun)) if rerun else set()
+            invalidated = explicitly_invalidated | set(self.plan.descendants(retry))
             restored = tuple(
                 stage
                 for stage in self.plan.stages
-                if self.state.get("stages", {}).get(stage, {}).get("status")
-                in {"completed", "skipped"}
+                if self._can_restore(records.get(stage, {}))
                 and stage not in invalidated
             )
             for stage in invalidated:
-                self.state.setdefault("stages", {}).pop(stage, None)
+                # Keep failed attempt counters; discard stale downstream results.
+                if stage in explicitly_invalidated or self._can_restore(records.get(stage, {})):
+                    self.state.setdefault("stages", {}).pop(stage, None)
             if invalidated:
                 self.state["artifacts"] = {
                     name: value
@@ -319,6 +327,18 @@ class PipelineStateStore:
         if write:
             self._write()
         return restored
+
+    @staticmethod
+    def _can_restore(record: Mapping[str, Any]) -> bool:
+        if record.get("status") not in {"completed", "skipped"}:
+            return False
+        result = record.get("result")
+        result_status = result.get("status") if isinstance(result, Mapping) else None
+        # Older files marked a returned failure as completed. Check both forms.
+        return all(
+            str(status).strip().lower() not in _UNSUCCESSFUL_STAGE_STATUSES
+            for status in (record.get("result_status"), result_status)
+        )
 
     def should_skip(self, stage: str) -> bool:
         return stage in set(self.state.get("restored_stages", ()))
@@ -357,8 +377,12 @@ class PipelineStateStore:
     ) -> None:
         previous = self.state.setdefault("stages", {}).get(stage, {})
         result_payload = _json_safe(dict(result or {}))
-        result_status = str(result_payload.get("status", "completed")).lower()
-        state_status = "skipped" if result_status == "skipped" else "completed"
+        result_status = str(result_payload.get("status", "completed")).strip().lower()
+        state_status = (
+            result_status
+            if result_status in _UNSUCCESSFUL_STAGE_STATUSES or result_status == "skipped"
+            else "completed"
+        )
         self.state["stages"][stage] = {
             **previous,
             "status": state_status,
@@ -486,6 +510,24 @@ def normalized_run_fingerprint(config: Any) -> str:
         payload = deepcopy(dict(config))
     else:
         raise TypeError("config must be a dataclass or mapping")
+    # Adding the optional decision config must not invalidate existing runs
+    # which never scheduled that stage.
+    if "decision" not in payload.get("stages", ()):
+        payload.pop("decision", None)
+    if "quantize" not in payload.get("stages", ()):
+        payload.pop("quantization", None)
+    data = payload.get("data")
+    if isinstance(data, Mapping) and data.get("packing_attention") == "auto":
+        # Auto preserves the previous native/HF attention behavior.
+        data = dict(data)
+        data.pop("packing_attention", None)
+        payload["data"] = data
+    evaluation = payload.get("eval")
+    if isinstance(evaluation, Mapping) and not evaluation.get("checkpoint_candidates"):
+        evaluation = dict(evaluation)
+        for key in ("checkpoint_candidates", "selection_task", "selection_metric", "selection_higher_is_better"):
+            evaluation.pop(key, None)
+        payload["eval"] = evaluation
     pipeline = payload.get("pipeline")
     if isinstance(pipeline, Mapping):
         pipeline = dict(pipeline)
@@ -499,6 +541,7 @@ def _stage_family(name: str, tags: Sequence[str]) -> str:
     known = {
         "tokenizer": "data",
         "pretrain": "foundation",
+        "decision": "decision",
         "sft": "post_training",
         "preference": "post_training",
         "rlhf": "post_training",
@@ -511,6 +554,7 @@ def _stage_family(name: str, tags: Sequence[str]) -> str:
         "music_generation": "generative",
         "video_generation": "generative",
         "world_model": "world_model",
+        "quantize": "compression",
         "eval": "evaluation",
         "export": "release",
         "operator": "extension",

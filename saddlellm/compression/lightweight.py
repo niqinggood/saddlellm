@@ -338,148 +338,236 @@ class Lightweight:
         max_new_tokens: int = 256,
         temperature: float = 0.0,
         num_draft_tokens: int = 5,  # 草稿模型一次预测几个 token
-    ) -> Dict:
+        *,
+        generator=None,
+        eos_token_id=None,
+    ) -> Dict:  # noqa: UP006
+        """Exact greedy or rejection-sampled speculative causal generation.
+
+        This reference path uses full-context forwards, a shared token-ID
+        vocabulary, and temperature alone (zero means greedy). It does not
+        inherit ``generate`` processors, top-k/top-p, or repetition penalties.
+        Each model must expose full causal logits for one unpadded sequence on
+        a single device; encoder-decoder and sharded/offloaded models are not
+        supported. A separate draft tokenizer must have the exact same vocab.
+
+        Sampling accepts draft token x with min(1, p(x)/q(x)); rejection draws
+        from normalized positive(p-q). If every draft token is accepted, the
+        target supplies one bonus token. Only accepted draft tokens count as
+        accepted. ``generator`` is an optional CPU torch.Generator: probability
+        arithmetic and sampling use CPU float64 for device-independent control.
+
+        EOS comes from the target generation/model config, then tokenizer;
+        pass an empty list to disable it. Contexts are never silently truncated.
+        Timing synchronizes model CUDA devices and measures generation work,
+        excluding tokenization/decoding. No speedup is claimed without a timed
+        target-only baseline; ``estimated_speedup`` remains None for compatibility.
+        Full-context draft work can make this path slower than normal generate.
         """
-        投机解码 — 用小模型打草稿, 大模型审阅。
+        import math
+        import time
 
-        原理:
-          1. 小模型 (draft) 快速生成 N 个候选 token
-          2. 大模型 (target) 一次 forward 验证所有候选
-          3. 如果验证通过: 一次性接受 N 个 token (快!)
-          4. 如果验证失败: 丢弃, 用大模型的输出
-
-        加速比: 通常 1.5x-3x (取决于 draft 和 target 的匹配度)
-
-        用法:
-            result = Lightweight.speculative_generate(
-                model=my_1b_model,      # 目标模型 (审阅者)
-                tokenizer=tokenizer,
-                prompt="解释反函数",
-                draft_model=my_150m_model,  # 草稿模型 (speed)
-            )
-        """
         import torch
 
-        device = next(model.parameters()).device
+        from ..distillation._model_compat import inputs_requiring_logits
 
-        # 如果没有草稿模型, 尝试用目标模型自身的部分层
-        if draft_model is None:
-            logger.info("无草稿模型, 使用标准生成")
-            return Lightweight._standard_generate(
-                model, tokenizer, prompt, max_new_tokens, temperature
-            )
+        if type(max_new_tokens) is not int or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a non-negative integer")
+        if type(num_draft_tokens) is not int or num_draft_tokens < 1:
+            raise ValueError("num_draft_tokens must be a positive integer")
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("temperature must be a finite non-negative number")
+        if not isinstance(prompt, str):
+            raise TypeError("prompt must be a string")
+        if generator is not None and (not isinstance(generator, torch.Generator) or generator.device.type != "cpu"):
+            raise ValueError("generator must be a CPU torch.Generator")
+        if (draft_tokenizer is not None and draft_tokenizer is not tokenizer
+                and (not callable(getattr(tokenizer, "get_vocab", None))
+                     or not callable(getattr(draft_tokenizer, "get_vocab", None))
+                     or tokenizer.get_vocab() != draft_tokenizer.get_vocab())):
+            raise ValueError("speculative decoding requires identical target/draft token-ID vocabularies")
 
-        draft_device = next(draft_model.parameters()).device
-        if draft_tokenizer is None:
-            draft_tokenizer = tokenizer
+        def model_device(instance):
+            if getattr(getattr(instance, "config", None), "is_encoder_decoder", False):
+                raise ValueError("speculative decoding requires a causal decoder-only model")
+            devices = {value.device for values in (instance.parameters(), instance.buffers()) for value in values}
+            if len(devices) != 1 or next(iter(devices)).type not in {"cpu", "cuda"}:
+                raise ValueError("speculative decoding requires each model on one CPU or CUDA device, without meta/offload")
+            device_map = getattr(instance, "hf_device_map", None)
+            if device_map and (len({str(value) for value in device_map.values()}) != 1
+                               or any(str(value) in {"disk", "meta"} for value in device_map.values())):
+                raise ValueError("speculative decoding does not support sharding or disk/meta offload")
+            if any(getattr(getattr(module, "_hf_hook", None), "offload", False) for module in instance.modules()):
+                raise ValueError("speculative decoding does not support model offload hooks")
+            return next(iter(devices))
 
-        model.eval()
-        draft_model.eval()
-
-        # 编码 prompt
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        input_ids = inputs["input_ids"]
-        generated_ids = []
-
-        total_accepted = 0
-        total_drafted = 0
-
-        while len(generated_ids) < max_new_tokens:
-            # ---- 草稿阶段: 小模型快速生成候选 ----
-            current_ids = (
-                torch.cat(
-                    [
-                        input_ids,
-                        torch.tensor([generated_ids], device=device).T
-                        if generated_ids
-                        else input_ids[:, :0],
-                    ],
-                    dim=1,
-                )
-                if generated_ids
-                else input_ids
-            )
-            if current_ids.shape[1] > 2048:
-                current_ids = current_ids[:, -2048:]
-
-            with torch.no_grad():
-                draft_inputs = current_ids.to(draft_device)
-                draft_outputs = draft_model.generate(
-                    draft_inputs,
-                    max_new_tokens=num_draft_tokens,
-                    temperature=temperature if temperature > 0 else 1.0,
-                    do_sample=temperature > 0,
-                    pad_token_id=draft_tokenizer.pad_token_id
-                    or draft_tokenizer.eos_token_id,
-                    output_scores=False,
-                    return_dict_in_generate=True,
-                )
-
-            draft_new_tokens = draft_outputs.sequences[0, current_ids.shape[1] :]
-            if len(draft_new_tokens) == 0:
-                break
-
-            # ---- 验证阶段: 大模型一次 forward 验证全部候选 ----
-            verify_ids = torch.cat([current_ids, draft_new_tokens.unsqueeze(0)], dim=1)
-
-            with torch.no_grad():
-                outputs = model(verify_ids)
-                logits = outputs.logits[0]  # (seq_len, vocab)
-
-            # 逐个 token 验证
-            accepted = 0
-            for i in range(len(draft_new_tokens)):
-                pos = current_ids.shape[1] + i - 1  # 预测位置
-                if pos >= logits.shape[0] - 1:
+        target_device = model_device(model)
+        draft_device = model_device(draft_model) if draft_model is not None else None
+        encoded = tokenizer(prompt, return_tensors="pt")
+        input_ids = encoded.get("input_ids")
+        if (not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2
+                or input_ids.shape[0] != 1 or input_ids.shape[1] < 1
+                or input_ids.dtype not in {torch.int32, torch.int64}):
+            raise ValueError("tokenizer must return one nonempty integer input_ids sequence")
+        if set(encoded) - {"input_ids", "attention_mask"}:
+            raise ValueError("speculative decoding supports only input_ids and an unpadded attention_mask")
+        mask = encoded.get("attention_mask")
+        if mask is not None and (not isinstance(mask, torch.Tensor) or mask.shape != input_ids.shape or not bool((mask == 1).all())):
+            raise ValueError("speculative decoding requires an unpadded all-ones attention_mask")
+        prompt_ids = input_ids[0].tolist()
+        if min(prompt_ids) < 0:
+            raise ValueError("input token IDs must be non-negative")
+        for instance in (model, draft_model):
+            if instance is None:
+                continue
+            config = getattr(instance, "config", None)
+            limits = [getattr(config, name, None) for name in ("max_position_embeddings", "n_positions", "max_seq_length")]
+            limits = [value for value in limits if type(value) is int and value > 0]
+            if limits and len(prompt_ids) + max_new_tokens > min(limits):
+                raise ValueError("prompt plus output budget exceeds model context limit; contexts are never truncated")
+        if eos_token_id is None:
+            for owner in (getattr(model, "generation_config", None), getattr(model, "config", None), tokenizer):
+                eos_token_id = getattr(owner, "eos_token_id", None)
+                if eos_token_id is not None:
                     break
+        if eos_token_id is None:
+            eos_ids = set()
+        else:
+            values = [eos_token_id] if type(eos_token_id) is int else eos_token_id
+            if (not isinstance(values, (list, tuple, set))
+                    or any(type(value) is not int or value < 0 for value in values)):
+                raise ValueError("eos_token_id must be a non-negative integer or a sequence of integers")
+            eos_ids = set(values)
 
-                target_logits = logits[pos]
-                draft_token = draft_new_tokens[i].item()
+        def logits(instance, ids, device, start):
+            values = torch.tensor([ids], dtype=torch.long, device=device)
+            output = instance(**inputs_requiring_logits(instance, {"input_ids": values}))
+            scores = getattr(output, "logits", None)
+            if (not isinstance(scores, torch.Tensor) or scores.ndim != 3
+                    or scores.shape[:2] != values.shape or scores.shape[2] < 1):
+                raise ValueError("model must return full [1, sequence_length, vocabulary] causal logits")
+            scores = scores[0, start:].detach().to(device="cpu", dtype=torch.float64)
+            if bool(torch.isnan(scores).any() or torch.isposinf(scores).any()) or not bool(torch.isfinite(scores).any(dim=-1).all()):
+                raise ValueError("causal logits must define a finite nonempty probability distribution")
+            return scores
 
-                if temperature == 0:
-                    # 贪心: 检查是否一致
-                    target_token = target_logits.argmax().item()
-                    if target_token == draft_token:
-                        accepted += 1
-                    else:
-                        generated_ids.append(target_token)
-                        accepted += 1  # 接受 target 的
-                        break
-                else:
-                    # 采样: 概率接受
-                    # 简化: 总是接受 (实际应做 rejection sampling)
-                    accepted += 1
+        def distribution(scores):
+            # Center before division so a small positive temperature cannot
+            # overflow the largest logit and corrupt the categorical law.
+            scaled = (scores - scores.max(dim=-1, keepdim=True).values) / temperature
+            return torch.softmax(scaled, dim=-1)
 
-            generated_ids.extend(draft_new_tokens[:accepted].tolist())
-            total_accepted += accepted
-            total_drafted += len(draft_new_tokens)
+        def choose(probabilities):
+            return int(torch.multinomial(probabilities, 1, generator=generator).item())
 
-            # 如果完全匹配, 说明 draft 很好, 可以增大 draft tokens
-            if accepted == len(draft_new_tokens):
-                num_draft_tokens = min(num_draft_tokens + 1, 10)
-            else:
-                num_draft_tokens = max(num_draft_tokens - 1, 2)
+        cuda_devices = {device for device in (target_device, draft_device) if device is not None and device.type == "cuda"}
 
-        acceptance_rate = total_accepted / max(total_drafted, 1)
-        full_ids = torch.cat([input_ids[0], torch.tensor(generated_ids, device=device)])
-        full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
-        response = full_text[
-            len(tokenizer.decode(input_ids[0], skip_special_tokens=True)) :
-        ]
+        def synchronize():
+            for device in cuda_devices:
+                torch.cuda.synchronize(device)
 
-        logger.info(
-            f"投机解码: {total_accepted}/{total_drafted} tokens accepted ({acceptance_rate:.1%})"
-        )
+        states = {module: module.training for instance in (model, draft_model) if instance is not None for module in instance.modules()}
+        generated_ids = []
+        total_accepted = total_drafted = target_forwards = draft_forwards = 0
+        stopped_on_eos = False
+        elapsed = None
+        try:
+            model.eval()
+            if draft_model is not None:
+                draft_model.eval()
+            synchronize()
+            started = time.perf_counter()
+            with torch.inference_mode():
+                # Establish the target vocabulary before passing any proposed
+                # ID to its embedding lookup. Reject incompatible drafts even
+                # when they propose IDs outside the target vocabulary.
+                target_vocabulary = None
+                if draft_model is not None and max_new_tokens:
+                    target_vocabulary = logits(model, prompt_ids, target_device, len(prompt_ids) - 1).shape[-1]
+                    target_forwards += 1
+                while len(generated_ids) < max_new_tokens and not stopped_on_eos:
+                    context = prompt_ids + generated_ids
+                    if draft_model is None:
+                        scores = logits(model, context, target_device, len(context) - 1)[0]
+                        target_forwards += 1
+                        token = int(scores.argmax()) if temperature == 0 else choose(distribution(scores))
+                        generated_ids.append(token)
+                        stopped_on_eos = token in eos_ids
+                        continue
+                    candidates, draft_probabilities = [], []
+                    remaining = max_new_tokens - len(generated_ids)
+                    for _ in range(min(num_draft_tokens, remaining)):
+                        scores = logits(draft_model, context + candidates, draft_device, len(context) + len(candidates) - 1)[0]
+                        draft_forwards += 1
+                        if scores.numel() != target_vocabulary:
+                            raise ValueError("target and draft logits must have the same token-ID vocabulary size")
+                        if temperature == 0:
+                            token = int(scores.argmax())
+                            draft_probabilities.append(scores)
+                        else:
+                            probabilities = distribution(scores)
+                            token = choose(probabilities)
+                            draft_probabilities.append(probabilities)
+                        candidates.append(token)
+                        total_drafted += 1
+                        if token in eos_ids:
+                            break
+                    target_scores = logits(model, context + candidates, target_device, len(context) - 1)
+                    target_forwards += 1
+                    if any(values.numel() != target_scores.shape[-1] for values in draft_probabilities):
+                        raise ValueError("target and draft logits must have the same token-ID vocabulary size")
+                    probabilities = distribution(target_scores) if temperature > 0 else None
+                    rejected = False
+                    for index, token in enumerate(candidates):
+                        if temperature == 0:
+                            replacement = int(target_scores[index].argmax())
+                            accepted = token == replacement
+                        else:
+                            p, q = probabilities[index], draft_probabilities[index]
+                            ratio = min(1.0, float(p[token] / q[token]))
+                            accepted = float(torch.rand((), dtype=torch.float64, generator=generator)) < ratio
+                            if not accepted:
+                                residual = (p - q).clamp_min(0)
+                                mass = residual.sum()
+                                if not bool(torch.isfinite(mass)) or float(mass) <= 0:
+                                    raise RuntimeError("rejected draft has no valid residual distribution")
+                                replacement = choose(residual / mass)
+                        if accepted:
+                            generated_ids.append(token)
+                            total_accepted += 1
+                        else:
+                            generated_ids.append(replacement)
+                            token = replacement
+                            rejected = True
+                        stopped_on_eos = token in eos_ids
+                        if rejected or stopped_on_eos or len(generated_ids) == max_new_tokens:
+                            break
+                    if not rejected and not stopped_on_eos and len(generated_ids) < max_new_tokens:
+                        bonus = int(target_scores[-1].argmax()) if temperature == 0 else choose(probabilities[-1])
+                        generated_ids.append(bonus)
+                        stopped_on_eos = bonus in eos_ids
+            synchronize()
+            elapsed = time.perf_counter() - started
+        finally:
+            for module, training in states.items():
+                module.training = training
 
         return {
-            "text": response.strip(),
+            "text": tokenizer.decode(generated_ids, skip_special_tokens=True),
+            "token_ids": generated_ids,
             "generated_tokens": len(generated_ids),
             "draft_tokens": total_drafted,
             "accepted_tokens": total_accepted,
-            "acceptance_rate": round(acceptance_rate, 3),
-            "estimated_speedup": round(
-                1 + acceptance_rate * (num_draft_tokens - 1) * 0.5, 1
-            ),
+            "acceptance_rate": total_accepted / total_drafted if total_drafted else 0.0,
+            "target_forwards": target_forwards,
+            "draft_forwards": draft_forwards,
+            "finish_reason": "eos" if stopped_on_eos else "length",
+            "elapsed_seconds": elapsed,
+            "tokens_per_second": len(generated_ids) / elapsed if elapsed > 0 else None,
+            "timing_scope": "generation including draft, target verification, CPU sampling and CUDA synchronization; excludes tokenization and text decoding",
+            "estimated_speedup": None,
+            "baseline_measured": False,
+            "mode": "speculative" if draft_model is not None else "target-only",
         }
 
     @staticmethod

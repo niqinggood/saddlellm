@@ -20,6 +20,7 @@ class TrainingConfigValidation:
     warnings: List[str] = field(default_factory=list)
     data_inspections: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     training_estimates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    architecture_analysis: Dict[str, Any] = field(default_factory=dict)
     normalized_config: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -45,6 +46,7 @@ class TrainingConfigValidator:
         warnings: List[str] = []
         data_inspections: Dict[str, Dict[str, Any]] = {}
         training_estimates: Dict[str, Dict[str, Any]] = {}
+        architecture_analysis: Dict[str, Any] = {}
         safe_raw = _json_safe(raw)
         if not isinstance(safe_raw, dict):
             safe_raw = {}
@@ -96,8 +98,68 @@ class TrainingConfigValidator:
             except Exception as exc:
                 issues.append(f"Stage plugin {stage!r} is invalid: {exc}")
 
+        from ..runtime.BackendConfig import validate_runtime_backends
+        from ..compression.QuantizationStage import validate_quantization_stage
+
+        try:
+            validate_quantization_stage(cfg)
+        except (ValueError, TypeError, OSError) as exc:
+            issues.append(f"Quantization configuration is invalid: {exc}")
+        if "decision" in stages:
+            from ..decision.config import decision_plan
+
+            try:
+                decision = decision_plan(cfg, inspect_data=inspect_data)
+                training_estimates["decision"] = decision
+                if inspect_data and cfg.decision.enabled:
+                    data_inspections["decision"] = {"counts": decision["counts"], "dataset_hashes": decision["dataset_hashes"]}
+            except Exception as exc:
+                issues.append(f"Decision training configuration is invalid: {exc}")
+        try:
+            validate_runtime_backends(cfg)
+        except Exception as exc:
+            issues.append(f"Runtime backend configuration is invalid: {exc}")
+        if cfg.backends.training == "megatron":
+            if cfg.sft.retention_kl_weight > 0:
+                issues.append("SFT reference KL is not implemented by Megatron recipes.")
+            if cfg.sft.replay_data_path or cfg.sft.replay_ratio or cfg.sft.replay_count is not None:
+                issues.append("SFT replay requires a native or Hugging Face trainer; Megatron recipes must implement it explicitly.")
+            warnings.append(
+                "Megatron Bridge recipes/overrides own model, dataset and hyperparameters; "
+                "native training/SFT settings are not translated. GPU execution requires Linux."
+            )
+            return TrainingConfigValidation(
+                valid=not issues, stages=stages, issues=issues, warnings=warnings,
+                architecture_analysis={"source": "megatron_bridge_recipe"},
+                normalized_config=safe_raw,
+            )
+
         if cfg.distributed.bf16 and cfg.distributed.fp16:
             issues.append("distributed.bf16 and distributed.fp16 cannot both be enabled.")
+        if (
+            cfg.distributed.zero_offload_to_cpu
+            and cfg.distributed.zero_offload_to_nvme
+        ):
+            issues.append(
+                "distributed.zero_offload_to_cpu and zero_offload_to_nvme "
+                "are mutually exclusive."
+            )
+        if cfg.distributed.zero_offload_to_nvme and not str(
+            cfg.distributed.zero_nvme_path
+        ).strip():
+            issues.append(
+                "distributed.zero_nvme_path must not be empty when NVMe offload is enabled."
+            )
+        for field_name in (
+            "zero_stage3_prefetch_bucket_size",
+            "zero_reduce_bucket_size",
+            "zero_allgather_bucket_size",
+        ):
+            value = getattr(cfg.distributed, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                issues.append(
+                    f"distributed.{field_name} must be a non-negative integer."
+                )
         if cfg.distributed.num_gpus < 1:
             issues.append("distributed.num_gpus must be >= 1.")
         if cfg.distributed.num_nodes < 1:
@@ -121,10 +183,164 @@ class TrainingConfigValidator:
                 issues.append("Distributed pretraining is currently verified for model.backend='saddle' only.")
         if cfg.training.max_steps == 0 or cfg.training.max_steps < -1:
             issues.append("training.max_steps must be -1 (use stage epochs) or a positive integer.")
+        if (
+            isinstance(cfg.training.loss_chunk_size, bool)
+            or not isinstance(cfg.training.loss_chunk_size, int)
+            or cfg.training.loss_chunk_size < 0
+        ):
+            issues.append("training.loss_chunk_size must be a non-negative integer.")
+        if (
+            isinstance(cfg.training.dataloader_num_workers, bool)
+            or not isinstance(cfg.training.dataloader_num_workers, int)
+            or cfg.training.dataloader_num_workers < 0
+        ):
+            issues.append("training.dataloader_num_workers must be a non-negative integer.")
+        prefetch_factor = cfg.training.dataloader_prefetch_factor
+        if (
+            prefetch_factor is not None
+            and (
+                isinstance(prefetch_factor, bool)
+                or not isinstance(prefetch_factor, int)
+                or prefetch_factor <= 0
+            )
+        ):
+            issues.append(
+                "training.dataloader_prefetch_factor must be null or a positive integer."
+            )
         has_upstream_model = "pretrain" in stages
 
         if "pretrain" in stages and not cfg.data.sources:
             issues.append("pretrain stage requires data.sources.")
+        if "pretrain" in stages:
+            if cfg.pretrain_mode not in {"scratch", "continue"}:
+                issues.append("pretrain_mode must be 'scratch' or 'continue'.")
+            elif cfg.pretrain_mode == "continue":
+                if not cfg.model_name_or_path:
+                    issues.append(
+                        "Continue pretraining requires model.name_or_path."
+                    )
+                architecture_analysis = {
+                    "mode": "continue",
+                    "source": "checkpoint",
+                    "model_name_or_path": cfg.model_name_or_path,
+                    "structure_inherited": True,
+                }
+            else:
+                try:
+                    blueprint = TrainingOrchestrator.resolve_architecture_blueprint(
+                        cfg.model_config, cfg.model_blueprint
+                    )
+                    architecture_analysis = {
+                        "mode": "scratch",
+                        "source": (
+                            "model.config + model.blueprint"
+                            if cfg.model_blueprint
+                            else "model.config preset"
+                        ),
+                        "name": blueprint.name,
+                        "family": blueprint.family,
+                        **blueprint.analyze(),
+                    }
+                except Exception as exc:
+                    issues.append(f"Pretraining architecture is invalid: {exc}")
+            from .PackingPolicy import resolve_packing_attention
+
+            try:
+                packing_backend = (
+                    "megatron" if cfg.backends.training == "megatron" else cfg.model_backend
+                )
+                packing_policy = resolve_packing_attention(
+                    cfg.data.packing_attention,
+                    packing_backend,
+                    cfg.data.pack_sequences,
+                )
+                if packing_policy == "concat":
+                    warnings.append("Packed pretraining uses concat attention: earlier documents in a block are visible.")
+            except ValueError as exc:
+                issues.append(str(exc))
+            if not 0 <= cfg.data.validation_split < 1:
+                issues.append("data.validation_split must be in the range [0, 1).")
+            elif cfg.data.validation_split == 0:
+                warnings.append(
+                    "Pretraining validation is disabled; validation PPL and best-checkpoint "
+                    "selection will not be available."
+                )
+            elif cfg.training.eval_every_steps <= 0:
+                issues.append(
+                    "training.eval_every_steps must be positive when "
+                    "data.validation_split is enabled."
+                )
+            if cfg.training.per_device_batch_size <= 0:
+                issues.append("training.per_device_batch_size must be positive.")
+            if cfg.training.global_batch_size <= 0:
+                issues.append("training.global_batch_size must be positive.")
+            if cfg.training.learning_rate <= 0:
+                issues.append("training.learning_rate must be positive.")
+            if not 0 <= cfg.training.min_lr <= cfg.training.learning_rate:
+                issues.append(
+                    "training.min_lr must be between 0 and training.learning_rate."
+                )
+            world_size = max(1, cfg.distributed.num_gpus * cfg.distributed.num_nodes)
+            micro_global_batch = cfg.training.per_device_batch_size * world_size
+            grad_accum = cfg.distributed.gradient_accumulation_steps
+            if grad_accum is None:
+                if (
+                    micro_global_batch > 0
+                    and cfg.training.global_batch_size % micro_global_batch != 0
+                ):
+                    issues.append(
+                        "training.global_batch_size must be divisible by "
+                        "per_device_batch_size * num_gpus * num_nodes when gradient "
+                        "accumulation is derived automatically."
+                    )
+            elif grad_accum <= 0:
+                issues.append(
+                    "distributed.gradient_accumulation_steps must be positive."
+                )
+            elif micro_global_batch * grad_accum != cfg.training.global_batch_size:
+                issues.append(
+                    "Pretraining global_batch_size does not match per_device_batch_size "
+                    "* num_gpus * num_nodes * gradient_accumulation_steps."
+                )
+            if (
+                cfg.data.validation_split > 0
+                and cfg.training.load_best_model_at_end
+                and cfg.training.eval_every_steps > 0
+                and cfg.training.save_every_steps
+                % cfg.training.eval_every_steps
+                != 0
+            ):
+                issues.append(
+                    "training.save_every_steps must be a multiple of "
+                    "training.eval_every_steps when load_best_model_at_end=true."
+                )
+
+        if cfg.eval.regression_suite:
+            try:
+                from ..evaluation.RegressionSuite import load_regression_suite
+
+                suite = load_regression_suite(cfg.eval.regression_suite)
+                if cfg.eval.checkpoint_candidates:
+                    selection_task = next(
+                        (task for task in suite["tasks"] if task["name"] == cfg.eval.selection_task),
+                        None,
+                    )
+                    if selection_task is None or cfg.eval.selection_metric not in selection_task["metrics"]:
+                        issues.append("Checkpoint selection task/metric must be declared in the regression suite.")
+                    else:
+                        metric_rule = selection_task["metrics"][cfg.eval.selection_metric]
+                        if metric_rule["higher_is_better"] != cfg.eval.selection_higher_is_better:
+                            issues.append("Checkpoint selection direction must match its regression-suite metric rule.")
+                if inspect_data:
+                    for task in suite["tasks"]:
+                        if not os.path.isfile(task["data"]):
+                            issues.append(f"Regression task {task['name']!r} data not found: {task['data']}")
+            except (ValueError, OSError, TypeError) as exc:
+                issues.append(f"Invalid regression suite: {exc}")
+            if not cfg.eval.enabled or "eval" not in stages:
+                issues.append("eval.regression_suite requires an enabled eval stage.")
+            if not (cfg.eval.regression_baseline or cfg.model_name_or_path):
+                issues.append("eval.regression_baseline is required without an original model.name_or_path.")
 
         if cfg.eval.gate.enabled:
             from ..evaluation.ReleaseGate import EvaluationReleaseGate
@@ -144,7 +360,8 @@ class TrainingConfigValidator:
                 issues.append("export.device must be one of: auto, cpu, cuda.")
             if cfg.export.dtype not in {"auto", "float32", "float16", "bfloat16"}:
                 issues.append("export.dtype must be one of: auto, float32, float16, bfloat16.")
-            has_model_source = bool(cfg.export.model_path or cfg.model_name_or_path or has_upstream_model)
+            has_model_source = bool(cfg.export.model_path or cfg.model_name_or_path or has_upstream_model
+                                    or cfg.quantization.model_path or cfg.eval.checkpoint_candidates)
             has_model_source = has_model_source or any(
                 stage in stages for stage in ("sft", "preference", "rlhf")
             )
@@ -152,12 +369,12 @@ class TrainingConfigValidator:
                 issues.append("Export requires export.model_path, model.name_or_path, or an upstream model stage.")
             export_index = stages.index("export") if "export" in stages else None
             eval_index = stages.index("eval") if "eval" in stages else None
-            if cfg.eval.gate.enabled and export_index is not None:
+            if (cfg.eval.gate.enabled or cfg.eval.regression_suite) and export_index is not None:
                 if eval_index is None or eval_index > export_index:
                     issues.append("An enabled evaluation gate requires eval before export.")
             if cfg.export.require_gate:
-                if not cfg.eval.gate.enabled:
-                    issues.append("export.require_gate=true requires eval.gate.enabled=true.")
+                if not (cfg.eval.gate.enabled or cfg.eval.regression_suite):
+                    issues.append("export.require_gate=true requires eval.gate.enabled=true or eval.regression_suite.")
                 if export_index is not None and (eval_index is None or eval_index > export_index):
                     issues.append("export.require_gate=true requires eval before export.")
 
@@ -203,6 +420,8 @@ class TrainingConfigValidator:
 
         sft_can_use_mopd = "mopd" in stages and "sft" in stages and stages.index("mopd") < stages.index("sft")
         if "sft" in stages or cfg.sft.enabled:
+            if cfg.sft.retention_kl_weight > 0 and cfg.distributed.strategy not in {"single", "ddp"}:
+                issues.append("SFT reference KL currently supports single-device/DDP, not FSDP/DeepSpeed.")
             if not cfg.model_name_or_path and not has_upstream_model:
                 issues.append("SFT requires model.name_or_path unless an upstream pretrain stage creates the model.")
             if not cfg.sft.enabled:
@@ -215,6 +434,40 @@ class TrainingConfigValidator:
                 cls._inspect(data_inspections, issues, warnings, "sft", cfg.sft.data_path, "sft", inspect_data)
             elif sft_can_use_mopd:
                 warnings.append("SFT has no data_path and will use the upstream MOPD output at runtime.")
+            if cfg.sft.replay_data_path:
+                cls._inspect(data_inspections, issues, warnings, "sft_replay", cfg.sft.replay_data_path, "sft", inspect_data)
+            if cfg.sft.validation_data_path and cfg.sft.validation_split:
+                issues.append(
+                    "SFT accepts either sft.validation_data_path or "
+                    "sft.validation_split, not both."
+                )
+            if cfg.sft.validation_data_path:
+                if (
+                    isinstance(cfg.sft.data_path, str)
+                    and os.path.isfile(cfg.sft.data_path)
+                    and os.path.isfile(cfg.sft.validation_data_path)
+                    and os.path.abspath(cfg.sft.data_path)
+                    == os.path.abspath(cfg.sft.validation_data_path)
+                ):
+                    issues.append("SFT training and validation files must be different.")
+                cls._inspect(
+                    data_inspections,
+                    issues,
+                    warnings,
+                    "sft_validation",
+                    cfg.sft.validation_data_path,
+                    "sft",
+                    inspect_data,
+                )
+                cls._audit_split(
+                    data_inspections,
+                    issues,
+                    warnings,
+                    "sft_split_leakage",
+                    cfg.sft.data_path,
+                    cfg.sft.validation_data_path,
+                    inspect_data,
+                )
             training_estimates["sft"] = cls._estimate(
                 cfg.sft.per_device_batch_size,
                 cfg.sft.gradient_accumulation_steps,
@@ -253,6 +506,41 @@ class TrainingConfigValidator:
                     cfg.preference.method,
                     inspect_data,
                 )
+            if cfg.preference.validation_data_path and cfg.preference.validation_split:
+                issues.append(
+                    "Preference training accepts either "
+                    "preference.validation_data_path or "
+                    "preference.validation_split, not both."
+                )
+            if cfg.preference.validation_data_path:
+                if (
+                    isinstance(cfg.preference.data_path, str)
+                    and os.path.isfile(cfg.preference.data_path)
+                    and os.path.isfile(cfg.preference.validation_data_path)
+                    and os.path.abspath(cfg.preference.data_path)
+                    == os.path.abspath(cfg.preference.validation_data_path)
+                ):
+                    issues.append(
+                        "Preference training and validation files must be different."
+                    )
+                cls._inspect(
+                    data_inspections,
+                    issues,
+                    warnings,
+                    "preference_validation",
+                    cfg.preference.validation_data_path,
+                    cfg.preference.method,
+                    inspect_data,
+                )
+                cls._audit_split(
+                    data_inspections,
+                    issues,
+                    warnings,
+                    "preference_split_leakage",
+                    cfg.preference.data_path,
+                    cfg.preference.validation_data_path,
+                    inspect_data,
+                )
             training_estimates["preference"] = cls._estimate(
                 cfg.preference.per_device_batch_size,
                 cfg.preference.gradient_accumulation_steps,
@@ -272,7 +560,11 @@ class TrainingConfigValidator:
             if cfg.rlhf.method not in {"dpo", "ppo"}:
                 issues.append(f"Unsupported rlhf.method: {cfg.rlhf.method}.")
             if cfg.rlhf.method == "ppo":
-                warnings.append("PPO is planned only; current orchestrator has no PPO trainer integration.")
+                issues.append(
+                    "PPO execution is not wired into the stable pipeline; an explicit "
+                    "reward model, value model, rollout policy, and safety-tested reward "
+                    "contract are required."
+                )
             if not cfg.rlhf.data_path:
                 issues.append("RLHF requires rlhf.data_path.")
             else:
@@ -294,6 +586,8 @@ class TrainingConfigValidator:
                 issues.append("MOPD requires mopd.prompts_path.")
             if not cfg.mopd.teachers:
                 warnings.append("MOPD has no teacher specs; dry-run can pass, but real distillation needs teachers.")
+            if cfg.mopd.teacher_concurrency < 1:
+                issues.append("mopd.teacher_concurrency must be at least 1.")
 
         if "world_model" in stages or cfg.world_model.enabled:
             if not cfg.world_model.enabled:
@@ -476,6 +770,7 @@ class TrainingConfigValidator:
             warnings=warnings,
             data_inspections=data_inspections,
             training_estimates=training_estimates,
+            architecture_analysis=architecture_analysis,
             normalized_config=safe_raw,
         )
 
@@ -518,6 +813,31 @@ class TrainingConfigValidator:
         if report.errors:
             issues.extend(f"{stage} data: {error}" for error in report.errors)
         warnings.extend(f"{stage} data: {warning}" for warning in report.warnings)
+
+    @staticmethod
+    def _audit_split(
+        data_inspections: Dict[str, Dict[str, Any]],
+        issues: List[str],
+        warnings: List[str],
+        stage: str,
+        train_path: Optional[str],
+        validation_path: Optional[str],
+        inspect_data: bool,
+    ) -> None:
+        if (
+            not inspect_data
+            or not isinstance(train_path, str)
+            or not isinstance(validation_path, str)
+            or not os.path.isfile(train_path)
+            or not os.path.isfile(validation_path)
+        ):
+            return
+        from ..data.TrainingDataInspector import audit_training_splits
+
+        report = audit_training_splits(train_path, validation_path)
+        data_inspections[stage] = report
+        issues.extend(f"{stage}: {issue}" for issue in report["issues"])
+        warnings.extend(f"{stage}: {warning}" for warning in report["warnings"])
 
 
 def validate_training_config(

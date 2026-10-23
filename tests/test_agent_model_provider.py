@@ -1,5 +1,8 @@
 import http.client
 import json
+import errno
+import ssl
+import urllib.error
 
 import pytest
 
@@ -172,3 +175,41 @@ def test_transient_retry_can_be_disabled(monkeypatch):
         )
 
     assert attempts == [1]
+
+
+def test_wrapped_tls_enoent_has_a_bounded_retry_and_preserves_unknown_attempt_usage(monkeypatch):
+    attempts = []
+    class Response:
+        def __enter__(self):return self
+        def __exit__(self,*_):return False
+        def read(self,_):
+            return json.dumps({'choices':[{'message':{'content':'Recovered'},'finish_reason':'stop'}],
+                'usage':{'prompt_tokens':10,'completion_tokens':4,'total_tokens':14,'unexpected_secret':'must not propagate'}}).encode()
+    def open_request(*_,**__):
+        attempts.append(1)
+        if len(attempts)==1:raise urllib.error.URLError(FileNotFoundError(errno.ENOENT,'TLS handshake failed'))
+        return Response()
+    monkeypatch.setattr(provider_module,'_open_provider_request',open_request)
+    monkeypatch.setattr(provider_module.time,'sleep',lambda _:None)
+    message=provider_module.chat_completion({'baseUrl':'http://127.0.0.1/v1','model':'fixture'}, {}, [])
+    assert len(attempts)==2
+    assert message['_provider_attempts']==[
+        {'attempt':1,'status':'transport_failed','usage':None},
+        {'attempt':2,'status':'response_received','usage':{'prompt_tokens':10,'completion_tokens':4,'total_tokens':14}}]
+    assert 'must not propagate' not in json.dumps(message)
+
+
+@pytest.mark.parametrize('error,expected_calls',[
+    (urllib.error.URLError(FileNotFoundError(errno.ENOENT,'handshake failed')),2),
+    (urllib.error.URLError(ssl.SSLCertVerificationError('invalid certificate')),1),
+    (urllib.error.HTTPError('http://127.0.0.1/v1/chat/completions',401,'unauthorized',{},None),1),
+], ids=['wrapped-handshake', 'certificate-verification', 'authentication'])
+def test_retry_exhaustion_and_nonretryable_tls_or_auth_failures_keep_attempt_records(monkeypatch,error,expected_calls):
+    attempts=[]
+    def open_request(*_,**__):attempts.append(1);raise error
+    monkeypatch.setattr(provider_module,'_open_provider_request',open_request)
+    monkeypatch.setattr(provider_module.time,'sleep',lambda _:None)
+    with pytest.raises(ModelProviderError) as failure:
+        provider_module.chat_completion({'baseUrl':'http://127.0.0.1/v1','model':'fixture'}, {}, [])
+    assert len(attempts)==len(failure.value.provider_attempts)==expected_calls
+    assert all(row['usage'] is None for row in failure.value.provider_attempts)

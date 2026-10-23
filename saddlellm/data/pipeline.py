@@ -8,13 +8,20 @@ import logging
 import hashlib
 import math
 import re
-from typing import List, Optional, Dict
+import unicodedata
+from typing import Any, List, Optional, Dict
 from dataclasses import dataclass, field, replace
 from collections import Counter
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DataMixConfig", "DataMixer", "DataPipeline", "PipelineConfig"]
+__all__ = [
+    "CausalLMDataCollator",
+    "DataMixConfig",
+    "DataMixer",
+    "DataPipeline",
+    "PipelineConfig",
+]
 
 
 @dataclass
@@ -37,6 +44,7 @@ class PipelineConfig:
     cache_dir: Optional[str] = None
     tokenizer_path: Optional[str] = None
     pack_sequences: bool = True
+    append_eos: bool = True
     remove_personal_info: bool = True
     filter_urls: bool = True
     filter_code_comments: bool = False
@@ -105,6 +113,58 @@ class DataPipeline:
     def _ensure_dataset(self):
         if self._dataset is None:
             raise RuntimeError("Dataset is empty. Call collect() before this step.")
+
+    @staticmethod
+    def dataset_size(dataset) -> Optional[int]:
+        """Return materialized cardinality without consuming a stream."""
+        num_rows = getattr(dataset, "num_rows", None)
+        if isinstance(num_rows, int):
+            return num_rows
+        try:
+            return len(dataset)
+        except (TypeError, AttributeError, NotImplementedError):
+            return None
+
+    def cardinality(self) -> Optional[int]:
+        self._ensure_dataset()
+        return self.dataset_size(self._dataset)
+
+    def _record_cardinality(self, name: str) -> None:
+        size = self.cardinality()
+        self._stats[name] = -1 if size is None else size
+
+    def _stateless_transform_kwargs(self, dataset=None) -> Dict[str, int]:
+        """Enable HF map-style multiprocessing for stateless transforms only.
+
+        ``datasets.IterableDataset`` does not accept ``num_proc`` and arbitrary
+        map/filter test doubles need not implement the full Hugging Face API.
+        Requiring a real ``datasets.Dataset`` keeps both cases on their serial,
+        backwards-compatible path.  Stateful deduplication deliberately does
+        not use this helper because worker-local ``seen`` sets would make its
+        result incorrect.
+        """
+        if self.config.num_proc <= 1:
+            return {}
+        dataset = self._dataset if dataset is None else dataset
+        try:
+            from datasets import Dataset
+        except (ImportError, AttributeError):
+            return {}
+        try:
+            from datasets import IterableDataset
+        except (ImportError, AttributeError):
+            IterableDataset = ()
+
+        try:
+            is_map_style = isinstance(dataset, Dataset)
+            is_streaming = isinstance(dataset, IterableDataset)
+        except TypeError:
+            # Some lightweight tests expose factories rather than dataset
+            # classes.  They should retain the legacy serial call signature.
+            return {}
+        if not is_map_style or is_streaming:
+            return {}
+        return {"num_proc": self.config.num_proc}
 
     def collect(self) -> "DataPipeline":
         """从多个数据源收集文本"""
@@ -225,7 +285,7 @@ class DataPipeline:
                 seed=self.config.shuffle_seed,
                 stopping_strategy="first_exhausted",
             )
-        self._stats["raw_samples"] = -1  # streaming 无法预知总数
+        self._record_cardinality("raw_samples")
 
         logger.info(f"数据收集完成, 数据源数: {len(all_splits)}")
         return self
@@ -267,10 +327,14 @@ class DataPipeline:
                 "valid": bool(text) and len(text) >= self.config.min_text_length,
             }
 
-        self._dataset = self._dataset.map(_clean)
-        self._dataset = self._dataset.filter(lambda x: x.get("valid", False))
+        transform_kwargs = self._stateless_transform_kwargs()
+        self._dataset = self._dataset.map(_clean, **transform_kwargs)
+        self._dataset = self._dataset.filter(
+            lambda x: x.get("valid", False), **transform_kwargs
+        )
         if "valid" in (getattr(self._dataset, "column_names", None) or []):
             self._dataset = self._dataset.remove_columns(["valid"])
+        self._record_cardinality("clean_samples")
         return self
 
     def _basic_clean_text(self, text: str) -> str:
@@ -302,6 +366,11 @@ class DataPipeline:
         if not 0 <= threshold <= 1:
             raise ValueError("deduplication threshold must be in the range [0, 1]")
 
+        self._stats["dedup_requested_method"] = method
+        self._stats["dedup_effective_method"] = method
+        self._stats.pop("dedup_fallback_reason", None)
+        self._stats.pop("dedup_normalization", None)
+
         if method == "none":
             return self
         elif method == "simhash":
@@ -313,13 +382,17 @@ class DataPipeline:
         else:
             raise ValueError(f"不支持的查重方法: {method}")
 
+        self._record_cardinality("deduplicated_samples")
         return self
 
     def _dedup_simhash(self, threshold):
         try:
             from simhash import Simhash
         except ImportError:
-            logger.warning("simhash 未安装,跳过去重")
+            logger.warning("simhash 未安装, SimHash 去重降级为 exact 去重")
+            self._stats["dedup_effective_method"] = "exact"
+            self._stats["dedup_fallback_reason"] = "simhash is not installed"
+            self._dedup_exact()
             return
 
         seen = set()
@@ -345,6 +418,8 @@ class DataPipeline:
             from datasketch import MinHash, MinHashLSH
         except ImportError:
             logger.warning("datasketch 未安装, MinHash 去重降级为 exact 去重")
+            self._stats["dedup_effective_method"] = "exact"
+            self._stats["dedup_fallback_reason"] = "datasketch is not installed"
             self._dedup_exact()
             return
 
@@ -380,12 +455,13 @@ class DataPipeline:
         logger.info("MinHash 去重完成, 保留签名数: %s", seen_count)
 
     def _dedup_exact(self):
+        """Hash the complete text after NFC, whitespace and case normalization."""
         seen = set()
+        self._stats["dedup_normalization"] = "NFC + collapse whitespace + casefold"
 
         def _is_dup(text):
-            key = hashlib.sha1(
-                text.strip().lower()[:2000].encode("utf-8", errors="ignore")
-            ).hexdigest()
+            normalized = re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip().casefold()
+            key = hashlib.sha256(normalized.encode("utf-8")).digest()
             if key in seen:
                 return True
             seen.add(key)
@@ -429,13 +505,15 @@ class DataPipeline:
 
             # 统计信息
             chars = len(text)
-            words = len(text.split())
-            if words == 0:
-                return False
+            has_cjk = bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+            if not has_cjk:
+                words = len(text.split())
+                if words == 0:
+                    return False
+                avg_word_len = chars / words
 
             # 过滤低质量: 太短的词平均长度, 过多的特殊字符
-            avg_word_len = chars / max(words, 1)
-            if avg_word_len > 30 or avg_word_len < 1.5:
+            if not has_cjk and (avg_word_len > 30 or avg_word_len < 1.5):
                 return False
 
             # 标点符号比例
@@ -463,8 +541,6 @@ class DataPipeline:
 
             # URL/邮箱/手机号过滤
             if self.config.filter_urls:
-                import re
-
                 if (
                     re.search(r"https?://\S+", text)
                     and len(re.findall(r"https?://\S+", text)) > 5
@@ -476,7 +552,10 @@ class DataPipeline:
 
             return True
 
-        self._dataset = self._dataset.filter(_filter)
+        self._dataset = self._dataset.filter(
+            _filter, **self._stateless_transform_kwargs()
+        )
+        self._record_cardinality("quality_samples")
         logger.info("质量过滤完成")
         return self
 
@@ -499,25 +578,59 @@ class DataPipeline:
         if pad_token_id is None:
             pad_token_id = 0
 
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
         def _tokenize(examples):
-            return tokenizer(
-                examples[text_column],
-                truncation=True,
-                max_length=max_len,
-                padding=False,
-                return_attention_mask=False,
-            )
+            # Packed pretraining must keep every token.  Truncating each source
+            # document here silently discards all content after max_len before
+            # the packer ever sees it.
+            tokenize_kwargs = {
+                "truncation": not self.config.pack_sequences,
+                "padding": False,
+                "return_attention_mask": False,
+            }
+            if not self.config.pack_sequences:
+                reserve_eos = bool(self.config.append_eos and eos_token_id is not None)
+                tokenize_kwargs["max_length"] = max(1, max_len - int(reserve_eos))
+            encoded = tokenizer(examples[text_column], **tokenize_kwargs)
+            input_ids = []
+            for raw_ids in encoded.get("input_ids", []):
+                ids = list(raw_ids)
+                if (
+                    self.config.append_eos
+                    and eos_token_id is not None
+                    and (not ids or ids[-1] != eos_token_id)
+                ):
+                    ids.append(eos_token_id)
+                if not self.config.pack_sequences:
+                    ids = ids[:max_len]
+                input_ids.append(ids)
+            return {"input_ids": input_ids}
 
         columns = getattr(self._dataset, "column_names", None) or []
         self._dataset = self._dataset.map(
             _tokenize,
             batched=True,
             remove_columns=[c for c in columns if c != "input_ids"],
+            **self._stateless_transform_kwargs(),
         )
 
         if self.config.pack_sequences:
             self._dataset = self._pack_sequences(self._dataset, max_len, pad_token_id)
+        else:
+            def _add_causal_fields(example):
+                ids = list(example.get("input_ids", []))
+                return {
+                    "input_ids": ids,
+                    "labels": list(ids),
+                    "attention_mask": [1] * len(ids),
+                }
 
+            self._dataset = self._dataset.map(
+                _add_causal_fields, **self._stateless_transform_kwargs()
+            )
+
+        self._record_cardinality("training_sequences")
         return self
 
     def _pack_sequences(self, dataset, max_len: int, pad_token_id: int = 0):
@@ -526,31 +639,72 @@ class DataPipeline:
         def _pack_generator():
             # Keep generator state local so retries/fingerprinting do not reuse
             # leftover tokens from an earlier iteration.
-            buffer = []
-            for example in dataset:
-                ids = example.get("input_ids", [])
-                buffer.extend(ids)
-                while len(buffer) >= max_len:
+            token_buffer = []
+            label_buffer = []
+            document_buffer = []
+            position_buffer = []
+            for document_id, example in enumerate(dataset):
+                ids = list(example.get("input_ids", []))
+                offset = 0
+                while offset < len(ids):
+                    available = max_len - len(token_buffer)
+                    take = min(available, len(ids) - offset)
+                    piece = ids[offset : offset + take]
+                    piece_labels = list(piece)
+
+                    # Labels are shifted by the model. Mask the first token of
+                    # every later document so the preceding document's final
+                    # token does not learn an artificial cross-document target.
+                    # A document-ending EOS itself remains a training target.
+                    if offset == 0 and token_buffer:
+                        piece_labels[0] = -100
+
+                    token_buffer.extend(piece)
+                    label_buffer.extend(piece_labels)
+                    document_buffer.extend([document_id] * take)
+                    # A document fragment crossing a training block starts a
+                    # fresh context in the next block, including RoPE position.
+                    position_buffer.extend(range(take))
+                    offset += take
+
+                    if len(token_buffer) != max_len:
+                        continue
                     yield {
-                        "input_ids": buffer[:max_len],
-                        "labels": buffer[:max_len],
+                        "input_ids": token_buffer,
+                        "labels": label_buffer,
                         "attention_mask": [1] * max_len,
+                        "document_ids": document_buffer,
+                        "position_ids": position_buffer,
                     }
-                    buffer[:max_len] = []
-            if len(buffer) >= 10:
-                original_len = len(buffer)
+                    token_buffer = []
+                    label_buffer = []
+                    document_buffer = []
+                    position_buffer = []
+            if len(token_buffer) >= 10:
+                original_len = len(token_buffer)
                 padding = max_len - original_len
-                packed = buffer[:max_len] + [pad_token_id] * padding
-                labels = buffer[:max_len] + [-100] * padding
                 yield {
-                    "input_ids": packed,
-                    "labels": labels,
+                    "input_ids": token_buffer + [pad_token_id] * padding,
+                    "labels": label_buffer + [-100] * padding,
                     "attention_mask": [1] * original_len + [0] * padding,
+                    "document_ids": document_buffer + [-1] * padding,
+                    "position_ids": position_buffer + [0] * padding,
                 }
 
+        # Keep an IterableDataset iterable.  Materializing a streaming corpus
+        # here defeats --streaming and can exhaust memory before training.
         from datasets import Dataset
 
-        return Dataset.from_generator(_pack_generator)
+        try:
+            from datasets import IterableDataset
+        except ImportError:  # Small test doubles and old datasets versions.
+            IterableDataset = ()
+        if isinstance(dataset, IterableDataset):
+            return IterableDataset.from_generator(_pack_generator)
+        generator_kwargs = {}
+        if self.config.cache_dir:
+            generator_kwargs["cache_dir"] = self.config.cache_dir
+        return Dataset.from_generator(_pack_generator, **generator_kwargs)
 
     def to_iterable_dataset(self):
         """转换为 HuggingFace IterableDataset (用于流式训练)"""
@@ -601,14 +755,32 @@ class DataPipeline:
         ):
             raise ValueError("ratios must contain two positive values")
 
-        if self.config.streaming:
-            logger.warning("流式模式下 split 仅用于记录,不实际切分")
-            return {"train": self._dataset, "val": self._dataset}
+        validation_fraction = ratios[1] / sum(ratios)
+        if hasattr(self._dataset, "train_test_split"):
+            split_dataset = self._dataset.train_test_split(
+                test_size=validation_fraction, seed=seed, shuffle=True
+            )
+            return {"train": split_dataset["train"], "val": split_dataset["test"]}
 
-        split_dataset = self._dataset.train_test_split(
-            test_size=ratios[1] / sum(ratios), seed=seed, shuffle=True
-        )
-        return {"train": split_dataset["train"], "val": split_dataset["test"]}
+        if not hasattr(self._dataset, "filter"):
+            raise TypeError("streaming dataset must provide filter() for a leakage-free split")
+
+        # IterableDataset has no random-access train_test_split.  Partition by
+        # a stable content hash instead of returning the same stream as both
+        # train and validation, which would make validation loss meaningless.
+        boundary = int(validation_fraction * (1 << 64))
+
+        def _is_validation(example: Dict[str, Any]) -> bool:
+            text = str(example.get("text", ""))
+            digest = hashlib.sha1(
+                f"{seed}\0{text}".encode("utf-8", errors="ignore")
+            ).digest()
+            return int.from_bytes(digest[:8], "big") < boundary
+
+        return {
+            "train": self._dataset.filter(lambda example: not _is_validation(example)),
+            "val": self._dataset.filter(_is_validation),
+        }
 
     @property
     def stats(self) -> Dict:
@@ -627,6 +799,145 @@ class DataPipeline:
         if os.path.isdir(path):
             return "text"
         return "json"
+
+
+@dataclass
+class CausalLMDataCollator:
+    """Pad causal-LM batches without masking real EOS tokens.
+
+    Hugging Face's generic language-modeling collator masks every token whose
+    id equals ``pad_token_id``.  Many decoder-only tokenizers intentionally use
+    EOS as PAD, so that behaviour also masks genuine document-ending EOS tokens.
+    This collator masks only padding positions introduced for this batch.
+    """
+
+    tokenizer: Any
+    pad_to_multiple_of: Optional[int] = None
+    omit_all_one_attention_mask: bool = True
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not features:
+            raise ValueError("features must not be empty")
+        import torch
+
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        max_length = max(len(feature.get("input_ids", [])) for feature in features)
+        if self.pad_to_multiple_of:
+            multiple = int(self.pad_to_multiple_of)
+            if multiple <= 0:
+                raise ValueError("pad_to_multiple_of must be positive")
+            max_length = int(math.ceil(max_length / multiple) * multiple)
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+
+        has_document_ids = any("document_ids" in feature for feature in features)
+        # Document boundaries imply reset positions even when a custom dataset
+        # supplies only document_ids.
+        has_position_ids = has_document_ids or any(
+            "position_ids" in feature for feature in features
+        )
+        batch = {"input_ids": [], "labels": [], "attention_mask": []}
+        if has_document_ids:
+            batch["document_ids"] = []
+        if has_position_ids:
+            batch["position_ids"] = []
+        mask_has_padding = False
+        has_document_boundaries = False
+        has_nonstandard_positions = False
+        for feature in features:
+            input_ids = list(feature.get("input_ids", []))
+            labels = list(feature.get("labels", input_ids))
+            attention_mask = list(
+                feature.get("attention_mask", [1] * len(input_ids))
+            )
+            if len(labels) != len(input_ids) or len(attention_mask) != len(input_ids):
+                raise ValueError("input_ids, labels, and attention_mask lengths must match")
+            document_ids = None
+            if has_document_ids:
+                document_ids = list(
+                    feature.get("document_ids", [0] * len(input_ids))
+                )
+                if len(document_ids) != len(input_ids):
+                    raise ValueError("document_ids and input_ids lengths must match")
+            position_ids = None
+            if has_position_ids:
+                if "position_ids" in feature:
+                    position_ids = list(feature["position_ids"])
+                elif document_ids is not None:
+                    position_ids = []
+                    previous_document = object()
+                    offset = 0
+                    for document_id in document_ids:
+                        if document_id != previous_document:
+                            offset = 0
+                        position_ids.append(offset)
+                        offset += 1
+                        previous_document = document_id
+                else:
+                    position_ids = list(range(len(input_ids)))
+                if len(position_ids) != len(input_ids):
+                    raise ValueError("position_ids and input_ids lengths must match")
+
+            valid_indices = [
+                index for index, value in enumerate(attention_mask) if value != 0
+            ]
+            if document_ids is not None:
+                valid_documents = [document_ids[index] for index in valid_indices]
+                has_document_boundaries = has_document_boundaries or any(
+                    current != previous
+                    for previous, current in zip(
+                        valid_documents, valid_documents[1:]
+                    )
+                )
+            if position_ids is not None:
+                valid_positions = [position_ids[index] for index in valid_indices]
+                has_nonstandard_positions = (
+                    has_nonstandard_positions
+                    or valid_positions != list(range(len(valid_positions)))
+                )
+            padding = max_length - len(input_ids)
+            mask_has_padding = (
+                mask_has_padding
+                or padding > 0
+                or any(value != 1 for value in attention_mask)
+            )
+            if padding_side == "left":
+                batch["input_ids"].append([pad_token_id] * padding + input_ids)
+                batch["labels"].append([-100] * padding + labels)
+                batch["attention_mask"].append([0] * padding + attention_mask)
+                if document_ids is not None:
+                    batch["document_ids"].append([-1] * padding + document_ids)
+                if position_ids is not None:
+                    batch["position_ids"].append([0] * padding + position_ids)
+            else:
+                batch["input_ids"].append(input_ids + [pad_token_id] * padding)
+                batch["labels"].append(labels + [-100] * padding)
+                batch["attention_mask"].append(attention_mask + [0] * padding)
+                if document_ids is not None:
+                    batch["document_ids"].append(document_ids + [-1] * padding)
+                if position_ids is not None:
+                    batch["position_ids"].append(position_ids + [0] * padding)
+
+        if self.omit_all_one_attention_mask and not mask_has_padding:
+            # The native model can use SDPA's causal fast path directly.  Do
+            # this on CPU while collating instead of asking every rank to
+            # inspect an all-one CUDA tensor during each forward pass.
+            batch.pop("attention_mask")
+        if has_document_ids and not has_document_boundaries:
+            # A single document per row needs no block-diagonal mask. Keeping
+            # this metadata would disable SDPA's causal fast path for no gain.
+            batch.pop("document_ids")
+        if (
+            has_position_ids
+            and not has_document_boundaries
+            and not has_nonstandard_positions
+        ):
+            batch.pop("position_ids")
+        return {key: torch.tensor(value, dtype=torch.long) for key, value in batch.items()}
 
 
 # ============================================================

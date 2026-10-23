@@ -134,8 +134,14 @@ class ScalingLawAnalyzer:
         拟合缩放法则参数。
         使用最小二乘法拟合 E, A, B。
         """
+        self._fitted = False
         if len(self.runs) < 3:
-            logger.warning("至少需要 3 个数据点才能可靠拟合,结果仅供参考")
+            raise ValueError("At least three independent runs are required to fit E, A and B")
+        if any(not math.isfinite(value) or value <= 0 for value in (alpha, beta)):
+            raise ValueError("alpha and beta must be finite and positive")
+        if any(not math.isfinite(r.params) or not math.isfinite(r.tokens)
+               or r.params <= 0 or r.tokens <= 0 or not math.isfinite(r.loss) for r in self.runs):
+            raise ValueError("Run params/tokens must be positive and loss must be finite")
 
         self._alpha = alpha
         self._beta = beta
@@ -144,37 +150,23 @@ class ScalingLawAnalyzer:
         # 这是一个线性问题: L = E + A * x1 + B * x2
         # 其中 x1 = 1/N^alpha, x2 = 1/D^beta
 
-        n = len(self.runs)
         x1 = [1.0 / (r.params ** alpha) for r in self.runs]
         x2 = [1.0 / (r.tokens ** beta) for r in self.runs]
         y = [r.loss for r in self.runs]
 
-        # 正规方程求解
-        sx1 = sum(x1); sx2 = sum(x2); sy = sum(y)
-        sx1x1 = sum(a * a for a in x1)
-        sx1x2 = sum(a * b for a, b in zip(x1, x2))
-        sx2x2 = sum(b * b for b in x2)
-        sx1y = sum(a * b for a, b in zip(x1, y))
-        sx2y = sum(a * b for a, b in zip(x2, y))
+        # Scale the features before solving: raw N^-alpha and D^-beta are
+        # small enough that a fixed determinant tolerance falsely declares
+        # ordinary large-model experiments singular.
+        import numpy as np
 
-        det = n * (sx1x1 * sx2x2 - sx1x2 * sx1x2) - sx1 * (sx1 * sx2x2 - sx2 * sx1x2) + sx2 * (sx1 * sx1x2 - sx2 * sx1x1)
-        if abs(det) < 1e-10:
-            # 数据点不足,使用启发式默认值
-            self._E = min(y) * 0.8
-            self._A = (max(y) - self._E) * (min(r.params for r in self.runs) ** alpha)
-            self._B = 0
-        else:
-            self._E = (sy * (sx1x1 * sx2x2 - sx1x2 * sx1x2)
-                       - sx1 * (sx1y * sx2x2 - sx2y * sx1x2)
-                       + sx2 * (sx1y * sx1x2 - sx2y * sx1x1)) / det
-
-            self._A = (n * (sx1y * sx2x2 - sx2y * sx1x2)
-                       - sx1 * (sy * sx2x2 - sx2 * sx2y)
-                       + sx2 * (sy * sx1x2 - sx2 * sx1y)) / det
-
-            self._B = (n * (sx1x1 * sx2y - sx1x2 * sx1y)
-                       - sx1 * (sx1 * sx2y - sx2 * sx1y)
-                       + sy * (sx1 * sx1x2 - sx2 * sx1x1)) / det
+        scale1, scale2 = max(x1), max(x2)
+        design = np.column_stack((np.ones(len(y)), np.array(x1) / scale1, np.array(x2) / scale2))
+        coefficients, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
+        if rank < 3:
+            raise ValueError("Runs do not independently identify E, A and B; vary params and tokens")
+        self._E = float(coefficients[0])
+        self._A = float(coefficients[1] / scale1)
+        self._B = float(coefficients[2] / scale2)
 
         self._fitted = True
 
@@ -190,6 +182,8 @@ class ScalingLawAnalyzer:
 
     def predict_loss(self, params: int, tokens: int) -> float:
         """预测给定模型大小和训练量的 loss"""
+        if any(not math.isfinite(value) or value <= 0 for value in (params, tokens)):
+            raise ValueError("params and tokens must be finite and positive")
         if not self._fitted:
             self.fit()
         return self._E + self._A / (params ** self._alpha) + self._B / (tokens ** self._beta)
@@ -197,14 +191,25 @@ class ScalingLawAnalyzer:
     def predict_chinchilla_optimal(self, compute_budget_flops: float) -> Tuple[int, int]:
         """
         给定计算预算,返回 Chinchilla 最优的 (参数量, 训练 token 数)。
-        Chinchilla: N_opt ∝ C^0.5, D_opt ∝ C^0.5
+        Minimize the fitted L(N,D), with C = 6*N*D. The continuous
+        optimum is rounded down to positive integers within the budget.
         """
-        # 每个 token 的 FLOPs ≈ 6 * N
-        # C = 6 * N * D
-        # Chinchilla: N_opt ∝ C^0.5
-        ratio = self._alpha / self._beta if self._beta > 0 else 1.0
-        n_opt = int((compute_budget_flops / 6) ** (ratio / (1 + ratio)) * 0.1)
-        d_opt = int(compute_budget_flops / (6 * n_opt))
+        if not math.isfinite(compute_budget_flops) or compute_budget_flops < 6:
+            raise ValueError("compute_budget_flops must be finite and at least 6 for N,D >= 1")
+        if not self._fitted:
+            self.fit()
+        if any(value is None or not math.isfinite(value) or value <= 0
+               for value in (self._A, self._B, self._alpha, self._beta)):
+            raise ValueError("A, B, alpha and beta must be finite and positive for an interior optimum")
+        # N* = (alpha*A/(beta*B))^(1/(alpha+beta))
+        #      * (C/6)^(beta/(alpha+beta)). Evaluate in log space.
+        token_param_budget = compute_budget_flops / 6
+        log_budget = math.log(token_param_budget)
+        log_n = (math.log(self._alpha) + math.log(self._A)
+                 - math.log(self._beta) - math.log(self._B)
+                 + self._beta * log_budget) / (self._alpha + self._beta)
+        n_opt = max(1, min(int(token_param_budget), int(math.exp(min(log_budget, max(0.0, log_n))))))
+        d_opt = max(1, int(token_param_budget / n_opt))
         return n_opt, d_opt
 
     def recommend_next_run(self, budget_flops: float) -> Dict:

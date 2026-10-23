@@ -9,6 +9,7 @@ from saddlellm.models.ModelBlueprint import (
     AttentionBlueprint,
     FFNBlueprint,
     ModelBlueprint,
+    ModelBlueprintLab,
 )
 from saddlellm.runtime.ModelExporter import ModelExportRequest, ModelExporter
 from saddlellm.models.ModelLoader import (
@@ -36,6 +37,68 @@ def _tiny_saddle_model() -> SaddleForCausalLM:
         ffn=FFNBlueprint(kind="swiglu", intermediate_size=32),
     )
     return blueprint.build_model()
+
+
+def test_native_generation_stops_each_row_and_streams_tokens():
+    model = _tiny_saddle_model()
+    prompt = torch.tensor([[4, 5], [4, 5]])
+    pieces = []
+
+    class Streamer:
+        ended = False
+
+        def put(self, tokens):
+            pieces.append(tokens.clone())
+
+        def end(self):
+            self.ended = True
+
+    def stop_rows(ids, scores):
+        return torch.tensor([True, ids.shape[1] >= 5])
+
+    streamer = Streamer()
+    result = model.generate(
+        prompt, max_new_tokens=8, do_sample=False, eos_token_id=[],
+        stopping_criteria=stop_rows, streamer=streamer,
+    )
+    assert result.shape == (2, 5)
+    assert result[0, 3:].tolist() == [model.config.pad_token_id] * 2
+    assert len(pieces) == 4
+    assert torch.equal(pieces[0], prompt)
+    assert streamer.ended
+
+
+def test_request_stop_control_ignores_prompt_and_honors_cancellation():
+    import threading
+    from saddlellm.runtime.InferenceServer import _generation_control
+
+    class Tokenizer:
+        def decode(self, ids, **kwargs):
+            return ''.join({1: 'STOP', 2: 'hello', 3: 'ST', 4: 'OP'}[i] for i in ids)
+
+    event = threading.Event()
+    control = _generation_control(Tokenizer(), 1, 'STOP', event)
+    assert not control(torch.tensor([[1, 2, 3]]), None).item()
+    assert control(torch.tensor([[1, 2, 3, 4]]), None).item()
+    event.set()
+    assert control(torch.tensor([[1, 2]]), None).item()
+
+
+def test_native_model_streams_through_inference_engine(native_checkpoint):
+    from saddlellm.runtime.InferenceServer import (
+        InferenceServerSettings, LocalGenerationEngine,
+    )
+
+    _, model, tokenizer = native_checkpoint
+    engine = LocalGenerationEngine(model, tokenizer, InferenceServerSettings())
+    state = {}
+    pieces = list(engine._stream_generate(
+        'hello', max_tokens=3, temperature=0, top_p=1,
+        repetition_penalty=1, stop=None, stream_state=state,
+    ))
+    assert all(isinstance(piece, str) for piece in pieces)
+    assert 1 <= state['completion_tokens'] <= 3
+    assert state['worker_done'].is_set()
 
 
 def _save_tiny_tokenizer(path):
@@ -203,7 +266,8 @@ def test_evaluator_loads_native_checkpoint_and_computes_perplexity(
     assert score > 0 and torch.isfinite(torch.tensor(score))
 
 
-def test_inference_loader_and_engine_run_native_checkpoint(native_checkpoint, monkeypatch):
+@pytest.mark.parametrize("architecture", [None, "block", "full"])
+def test_inference_loader_and_engine_run_native_checkpoint(native_checkpoint, monkeypatch, tmp_path, architecture):
     from saddlellm.runtime.InferenceServer import (
         CompletionRequest,
         InferenceServerSettings,
@@ -213,6 +277,13 @@ def test_inference_loader_and_engine_run_native_checkpoint(native_checkpoint, mo
     import saddlellm.models.ModelLoader as model_loader
 
     path, _, _ = native_checkpoint
+    if architecture is not None:
+        path = tmp_path / "hybrid-serving-checkpoint"
+        ModelBlueprintLab.hybrid_kda(
+            hidden_size=16, layers=4, heads=4, kv_heads=2,
+            vocab_size=8, seq_length=32, attention_residuals=architecture,
+        ).build_model().eval().save_pretrained(path)
+        _save_tiny_tokenizer(path)
     calls = []
     original = model_loader.load_causal_lm
 
@@ -374,8 +445,17 @@ def test_saddle_stage_guard_allows_full_parameter_sft_and_dpo(tmp_path):
         TrainingOrchestrator.from_dict(orpo)
 
 
-def test_native_sft_dpo_pipeline_trains_reloadable_checkpoint(native_checkpoint, tmp_path):
+@pytest.mark.parametrize("architecture", [None, "block", "full"])
+def test_native_sft_dpo_pipeline_trains_reloadable_checkpoint(native_checkpoint, tmp_path, architecture):
     checkpoint, original, _ = native_checkpoint
+    if architecture is not None:
+        checkpoint = tmp_path / "hybrid-native-checkpoint"
+        original = ModelBlueprintLab.hybrid_kda(
+            hidden_size=16, layers=4, heads=4, kv_heads=2,
+            vocab_size=8, seq_length=32, attention_residuals=architecture,
+        ).build_model().eval()
+        original.save_pretrained(checkpoint)
+        _save_tiny_tokenizer(checkpoint)
     sft_data = tmp_path / "native-sft.jsonl"
     sft_data.write_text(
         '\n'.join([
@@ -443,6 +523,9 @@ def test_native_sft_dpo_pipeline_trains_reloadable_checkpoint(native_checkpoint,
     final_path = tmp_path / "native-posttrain" / "preference_checkpoints"
     assert is_saddle_checkpoint(final_path)
     reloaded = load_causal_lm(final_path, device="cpu").eval()
+    if architecture is not None:
+        assert reloaded.config.residual_attention_mode == architecture
+        assert [layer.config.attention_kind for layer in reloaded.layers] == ["kda", "kda", "kda", "gqa"]
     input_ids = torch.tensor([[1, 4, 5, 2]], dtype=torch.long)
     with torch.inference_mode():
         logits = reloaded(input_ids=input_ids).logits

@@ -206,17 +206,17 @@ def create_quickstart(
         encoding="utf-8",
     )
 
-    inspect_commands = [f'saddle-llm inspect-data "{data_config["sft"]}" --task sft']
+    inspect_commands = [f'saddlellm inspect-data "{data_config["sft"]}" --task sft']
     if preference_path is not None:
         task = preference_method
         inspect_commands.append(
-            f'saddle-llm inspect-data "{data_config["preference"]}" --task {task}'
+            f'saddlellm inspect-data "{data_config["preference"]}" --task {task}'
         )
     relative_steps = [
         *inspect_commands,
-        'saddle-llm validate-config "config.yaml"',
-        'saddle-llm train "config.yaml" --dry-run',
-        'saddle-llm train "config.yaml"',
+        'saddlellm validate-config "config.yaml"',
+        'saddlellm train "config.yaml" --dry-run',
+        'saddlellm train "config.yaml"',
     ]
     readme_path.write_text(
         _render_readme(stages, model, relative_steps),
@@ -277,7 +277,7 @@ def _render_readme(stages: list[str], model: str, steps: list[str]) -> str:
     commands = "\n".join(steps)
     return f"""# SaddleLLM 快速开始
 
-这个目录由 `saddle-llm quickstart` 创建。
+这个目录由 `saddlellm quickstart` 创建。
 
 - 阶段：`{", ".join(stages)}`
 - 基础模型：`{model}`

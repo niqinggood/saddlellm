@@ -246,30 +246,34 @@ class TokenizerTrainer:
         if hasattr(self._tokenizer, "save"):
             self._tokenizer.save(os.path.join(path, "tokenizer.json"))
 
+        special_token_map = {
+            token_name: token_value
+            for token_name, token_value in (
+                ("pad_token", "<pad>"),
+                ("unk_token", "<unk>"),
+                ("bos_token", "<bos>"),
+                ("eos_token", "<eos>"),
+                ("mask_token", "<mask>"),
+            )
+            if token_value in self.config.special_tokens
+        }
         config = {
             "vocab_size": self.config.vocab_size,
             "algorithm": self.config.algorithm,
             "special_tokens": self.config.special_tokens,
             "max_token_length": self.config.max_token_length,
             "byte_level": self.config.byte_level,
+            **special_token_map,
+            "model_max_length": self.config.max_token_length * 16,
+            "tokenizer_class": "PreTrainedTokenizerFast",
+            "clean_up_tokenization_spaces": False,
         }
         with open(os.path.join(path, "tokenizer_config.json"), "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
 
         # 同时生成 HuggingFace transformers 兼容的配置
-        hf_config = {
-            "add_prefix_space": False,
-            "added_tokens_decoder": {},
-            "bos_token": "<bos>",
-            "eos_token": "<eos>",
-            "unk_token": "<unk>",
-            "pad_token": "<pad>",
-            "model_max_length": self.config.max_token_length * 16,
-            "tokenizer_class": "PreTrainedTokenizerFast",
-            "clean_up_tokenization_spaces": False,
-        }
         with open(os.path.join(path, "special_tokens_map.json"), "w", encoding="utf-8") as f:
-            json.dump(hf_config, f, ensure_ascii=False, indent=2)
+            json.dump(special_token_map, f, ensure_ascii=False, indent=2)
 
         # 保存特殊 token 映射
         token_map = {}
@@ -344,26 +348,36 @@ class TokenizerTrainer:
         roundtrip_ok = 0
         unk_id = self._tokenizer.token_to_id("<unk>") if hasattr(self._tokenizer, "token_to_id") else None
 
-        for text in self._iter_eval_texts(corpus_files, texts, file_format, text_column):
-            text = text or ""
-            if not text.strip():
-                continue
-            encoded = self._tokenizer.encode(text)
-            ids = list(getattr(encoded, "ids", encoded))
-            samples += 1
-            char_count += len(text)
-            token_count += len(ids)
-            if unk_id is not None:
-                unk_count += sum(1 for idx in ids if idx == unk_id)
+        # Runtime truncation is useful for batches, but it biases tokenizer
+        # evaluation on long documents. Measure the lexical tokenizer itself,
+        # without injected BOS/EOS, then restore the configured limit.
+        truncation = getattr(self._tokenizer, "truncation", None)
+        if truncation is not None and hasattr(self._tokenizer, "no_truncation"):
+            self._tokenizer.no_truncation()
+        try:
+            for text in self._iter_eval_texts(corpus_files, texts, file_format, text_column):
+                text = text or ""
+                if not text.strip():
+                    continue
+                encoded = self._tokenizer.encode(text, add_special_tokens=False)
+                ids = list(getattr(encoded, "ids", encoded))
+                samples += 1
+                char_count += len(text)
+                token_count += len(ids)
+                if unk_id is not None:
+                    unk_count += sum(1 for idx in ids if idx == unk_id)
 
-            try:
-                decoded = self._tokenizer.decode(ids, skip_special_tokens=True)
-            except TypeError:
-                decoded = self._tokenizer.decode(ids)
-            if self._normalize_for_roundtrip(decoded) == self._normalize_for_roundtrip(text):
-                roundtrip_ok += 1
-            if samples >= max_samples:
-                break
+                try:
+                    decoded = self._tokenizer.decode(ids, skip_special_tokens=True)
+                except TypeError:
+                    decoded = self._tokenizer.decode(ids)
+                if self._normalize_for_roundtrip(decoded) == self._normalize_for_roundtrip(text):
+                    roundtrip_ok += 1
+                if samples >= max_samples:
+                    break
+        finally:
+            if truncation is not None:
+                self._tokenizer.enable_truncation(**truncation)
 
         term_stats = self._evaluate_domain_terms(domain_terms or [])
         result = TokenizerEvalResult(
@@ -439,7 +453,7 @@ class TokenizerTrainer:
         for term in domain_terms:
             if not term:
                 continue
-            encoded = self._tokenizer.encode(term)
+            encoded = self._tokenizer.encode(term, add_special_tokens=False)
             ids = list(getattr(encoded, "ids", encoded))
             lengths.append(len(ids))
         if not lengths:

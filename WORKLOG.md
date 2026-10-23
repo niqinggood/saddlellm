@@ -1613,3 +1613,174 @@ docs/FUNCTION_REFERENCE.md
 docs/ARCHITECTURE.md
 README.md
 ```
+
+## 2026-10-01 至 2026-10-02 源码导读与流水线缺陷修复
+
+本次先梳理项目框架和主要功能的代码实现流程，形成源码学习手册；随后针对阅读中发现的问题做最小复现，并修复四处流水线缺陷。工作基于当前工作区源码，包版本为 `2.40`，包含此前已有的未提交改动。本节只记录本次会话完成的工作，不将其他工作区改动归入本次成果。
+
+### 源码梳理与学习材料
+
+- 梳理 CLI 入口、配置解析、Stage 注册、依赖计划、执行编排、状态恢复和产物登记之间的关系。
+- 追踪数据与 Tokenizer、原生模型前向、预训练、SFT/DPO、蒸馏压缩、评测导出、推理服务及生成会话的主要调用链。
+- 补充多模态、世界模型、空间规划和 WorldAgent 的入口、数据流及当前实现边界。
+- 为主要功能整理关键代码、源码定位、断点建议、关联测试和自查题，配套 12 讲学习路线。
+
+交付文件：
+
+| 文件 | 内容 |
+|---|---|
+| [主要功能源码导读](docs/CORE_FEATURE_CODE_WALKTHROUGH_ZH.md) | 16 节功能实现流程与源码说明 |
+| [源码阅读路线](docs/SOURCE_READING_ROADMAP_ZH.md) | 12 讲学习顺序、练习和掌握标准 |
+| [Word 学习手册](SaddleLLM_主要功能源码解读与学习手册.docx) | 合并阅读路线与源码导读，含可跳转目录、源码索引和流程图 |
+| [手册生成脚本](tools/build_source_reading_handbook.py) | 从上述 Markdown 生成 Word 手册 |
+
+源码梳理时通过 AST 核对了 73 个类或函数定位，检查了 139 个本地链接。执行 TinyStories CLI dry-run 和纯 Python 计划示例，并运行编排及插件测试，结果为 `18 passed`；这些验证覆盖配置、计划和流程契约，不代表完整模型训练验收。
+
+Word 手册共 32 页，包含 73 个源码书签、92 个内部链接、13 张表和 2 张图。通过 Word 页面渲染与逐页检查，修正了一处孤立表头和一条流程图连接线。文档结构及书签检查通过，记录见 `outputs/source_handbook_20261001/final_qa.json`。
+
+### 四处已复现缺陷与修复
+
+| 问题 | 复现行为 | 修复后的行为 |
+|---|---|---|
+| 关闭的门禁被当作通过 | `export.require_gate=true` 且 `eval.gate.enabled=false` 时，流水线仍完成导出 | 导出阶段复用 `release_gate_accepted()`，关闭门禁不能满足强制门禁要求 |
+| 评测模型与导出模型不一致 | 评测 A，通过 `export.model_path` 导出 B，B 的发布清单仍携带 A 的通过结果 | 门禁记录评测模型来源；启用门禁时校验导出来源一致，同一本地模型的相对路径和绝对路径可匹配；非强制导出不携带不相关的通过结果 |
+| 失败阶段在恢复时被跳过 | `eval.fail_on_error=false` 时，评测结果为 `failed`，外层状态却是 `completed`，`resume` 不重试 | 保存 `failed`、`rejected`、`blocked` 状态；恢复时重试未成功阶段，并使其依赖下游的旧结果和产物失效，保留独立成功分支 |
+| `vision_alignment` 结果归属错误 | 执行该阶段却写入 `mllm_sft` 结果，自己的状态记录为空，产物登记缺失 | 增加对应阶段入口，按实际阶段名写结果、计划和规范化数据；与 `mllm_sft` 使用独立产物位置 |
+
+兼容性处理：恢复逻辑同时检查外层状态、`result_status` 和结果内的状态，能够识别旧文件中“外层 completed、内部 failed”的记录。导出也兼容旧评测结果把模型来源放在门禁对象旁边的格式。
+
+本次没有新增权限、审批流程、依赖或强制门禁配置。普通导出仍可在不运行评测的情况下执行。没有借此重构整个配置校验体系或改变所有 Stage 的状态协议。
+
+主要代码与测试改动：
+
+- [pipeline.py](saddlellm/framework/pipeline.py)：阶段状态、恢复选择及下游失效处理。
+- [stages.py](saddlellm/framework/stages.py)：`vision_alignment` 内置执行入口映射。
+- [TrainingOrchestrator.py](saddlellm/training/TrainingOrchestrator.py)：门禁判断、模型来源绑定、多模态阶段结果及产物归属。
+- [test_pipeline_reliability.py](tests/test_pipeline_reliability.py)：新增 18 项回归用例，覆盖错误路径、默认导出、路径别名、旧状态兼容及两个多模态阶段共存。
+- [FUNCTION_REFERENCE.md](docs/FUNCTION_REFERENCE.md)：重新生成函数签名和源码行号索引。
+
+### 修复后的验证结果
+
+执行以下相关测试集：
+
+```powershell
+python -m pytest tests/test_pipeline_reliability.py tests/test_unified_pipeline.py tests/test_framework_plugins.py tests/test_release_pipeline.py tests/test_cli_output.py -q --tb=short
+```
+
+结果为 **80 passed，0 failed，6 warnings**，耗时约 38 秒。警告来自 pynvml、PEFT 和 AnyIO 依赖，不影响本次用例通过。该结果是定向回归，不是仓库全量测试结果。
+
+其他检查通过：
+
+- 对修改的生产代码及新增测试执行 Ruff 的 `F601,F821,F822,F823` 检查；新增测试文件的默认 Ruff 检查也通过。
+- `python tools/check_release_consistency.py` 确认版本元数据一致，版本仍为 `2.40`。
+- `python tools/generate_function_reference.py --check` 确认函数索引与源码一致。
+- 对修改的已跟踪文件执行 `git diff --check`，未发现补丁空白格式问题。
+
+复现与验证记录保存在本地工作区：
+
+- `outputs/review_findings_20261001/reproduction_results.json`：修复前四处问题的最小复现结果。
+- `outputs/bugfix_20261002/validation.json`：修复范围、测试结果和相关文件哈希。
+- `outputs/bugfix_20261002/baseline/` 及同目录差异文件：本次修复前的文件副本与任务内差异，便于区分此前已有改动。
+
+### 验证范围与后续接续点
+
+- 本次验证侧重流程、恢复和发布契约，没有执行完整大模型训练或 GPU 性能验收。
+- 模型绑定比较规范化后的本地来源路径或远程模型标识，没有全量读取权重计算哈希；不能据此保证同一路径下被替换的权重或同名远程模型版本未变化。
+- 已在旧状态文件中保存为空字典的 `vision_alignment` 结果没有做历史数据迁移；遇到这类旧记录时，可通过 `pipeline.rerun: [vision_alignment]` 重新生成结果。
+- `planned` 等计划状态以及 `stages_completed` 摘要字段的整体表达尚未统一；DAG 仍负责依赖排序、串行执行，`consumes/produces` 仍主要是能力声明。这些未纳入本次四处缺陷修复。
+- Word 手册是 2026-10-01 修复前的源码基线。后续精读时以当前源码、本节修复说明及更新后的函数索引为准；本次未重新生成 Word 手册，旧行号和恢复状态说明可能需要更新。
+- 本次未执行 Git 提交、推送或发布。按用户要求先结束本轮工作；后续源码讲解可从 `train` 命令、配置解析和阶段编排开始。
+
+## 2026-10-02 推理性能优化、远程对照与决策模型可行性
+
+本轮基于已有脏工作区继续改进推理，没有将此前的原生合批、Qwen3 适配或其他未提交工作计为本轮新增。生产代码相对任务开始快照的差异保存在 `artifacts/inference_speed_20261002/task_production_changes.patch`。
+
+- 优化前缀缓存的模型状态扫描和 token 前缀比较，保留结构、权重版本、hook 与设备等失效检查。支持最短缓存门槛和显式延迟快照实验；未通过整体收益门槛的部分复用策略没有自动启用。
+- 对受支持的 CUDA 原生合批请求合并采样逐元素操作和 token 回传；保留逐行概率归约及采样顺序。自定义回调、采样/停止逻辑和 tokenizer decoder 回退到原路径。
+- 增加统一的 `performance=auto|latency|throughput` / `--performance` 入口。原有 auto 行为保留；显式配置优先，预设本身不修改精度、量化或数值模式，模型加载后检查支持条件并原子回退。
+- 本机真实 SSE 对照：1.5B 重复完整长提示的首个可见文本中位耗时从旧缓存 63.19 ms 降至 38.09 ms；28M 四并发流式交付的配对吞吐中位提升约 7.1%，7 轮中 6 轮更快。大模型单请求没有得到普遍提速结论。
+- 修复基准适配器的全局方法恢复竞态，作废旧 HTTP 记录，增加实际进入新路径和方法恢复检查。跨引擎客户端支持预热/正式阶段互不重复的提示，保留实际输出长度、原文、首字与完整响应耗时。
+- 相关推理与服务回归 676 passed、1 skipped；基准工具回归 25 passed。跳过项为上游 tokenizers 的 custom-decoder Sequence 构造 panic。所改文件静态检查、函数索引、发布元数据与 wheel 内容核对通过；全仓此前已有的重复 `RolloutSample` 导出键未在本轮修改。
+- 生成并核验 SaddleLLM 2.40 wheel，SHA256 为 `c1d7fd3b6921a516e1a8a5a63e33ccf774a566bfd54a80963d53308c2471088c`，部署到指定 L20 服务器的独立测试环境。完整部署参数、实测及证据边界见远程报告。
+- 按用户要求研究 Jev。结论为可以扩展训练自有决策模型；现有文本骨干、训练和部分评测可复用，但仍需决策头、动态候选数据/loss、独立概率校准、导出与服务闭环。本轮仅完成研究，没有声称已训练模型或复现厂商速度。
+
+文档与证据：
+
+- [本机优化与 A/B 结果](docs/INFERENCE_SPEED_20261002.md)
+- [L20 跨引擎部署比较](docs/REMOTE_INFERENCE_COMPARISON_20261002.md)
+- [Jev 可行性与实施路线](docs/FRONTIER_MODEL_ROADMAP.md)
+- [本地验收清单](artifacts/inference_speed_20261002/local_validation.json)
+- [远程结果独立审计](artifacts/inference_speed_20261002/remote_audit.json)
+
+## 2026-10-18 — 后训练能力保持与压缩恢复
+
+本轮在既有未提交修改上增量实现，不重置或归并此前工作。
+
+- HF/原生 SFT 支持确定性通用/历史数据回放、比例或显式数量、验证数据排除与来源指纹。HF 在实际 TRL 分词、EOS 和截断后按输入 token 审核回放；自动验证拆分按 prompt/content/group 关联分组，显式主任务验证集保持原分配契约。
+- 加入可选参考模型 KL：冻结教师，按移位后的有效监督 token 计算，验证仍使用任务 CE；单设备/DDP 支持，未适配的分片与 DataParallel 明确拒绝。
+- 新增统一多任务 `regression` 套件：绝对退化预算、min/max、数据/设置/模型内容绑定、离线重比与非零失败退出。训练 eval 可直接使用套件，未通过或导出内容已改变时阻止导出。
+- 新增 `recover`：实际加载 HF/原生学生检查点，以 CE 和可选教师 KL 恢复；梯度和优化后均施加剪枝掩码，保存精确掩码和恢复前后损失/稀疏率。独立验证按组/提示审核；拒绝直接训练打包量化产物。
+- 新增模板配置、最小样例和 [使用说明](docs/POSTTRAIN_RETENTION_AND_RECOVERY.md)。示例只验证流程，未宣称生产模型能力提升、GPU 加速或实现 AWQ/GPTQ/QAT。
+- 最终合并回归 **346 passed**（248.85 秒），包含独立损失/泄漏/身份边界测试、HF/native 真实 CPU 训练，以及 CLI 的 SFT→剪枝→恢复→量化→回归→受控导出。新增模块与测试 Ruff 通过，所改 Python 文件编译及 diff 空白检查通过。机器可读验收记录为 `outputs/lifecycle-validation/final.xml`。
+
+## 2026-10-18 — 通过函数配置启用 AWQ/GPTQ 或 QAT
+
+- 新增 `apply_quantization(model_or_path, tokenizer, config=..., output_dir=...)` 与 `QuantizationConfig`：`ptq.enabled`、`qat.enabled` 默认关闭，关闭路径保持输入对象、不导入模型运行时、不写文件；`dry_run` 只校验。当前两个后端的数值/导出格式不同，同时开启会在模型加载前报错。
+- PTQ 使用实际 LLM Compressor AWQ/GPTQ 校准，支持 INT4/INT8，导出并核验 compressed-tensors 整数权重。依赖固定为 Torch 2.6、Transformers 4.57.6、LLM Compressor 0.6.0、compressed-tensors 0.10.2；Windows 使用 Triton 3.2.0.post21。默认 basic pipeline 使用真实前向统计，明确遵守 CPU 设备配置；大模型校准内存仍须实际验证。
+- QAT 实现 `portable-int8-weight-only`：逐输出通道对称 INT8 权重、FP32 激活、STE fake quant、真实转换与重载，支持 HF 和原生模型、可选教师蒸馏与剪枝掩码。该参考后端用反量化后的浮点矩阵计算，未实现 INT8 加速内核。
+- 统一加载、评测与本地推理识别新格式；QAT 自动精度保持 FP32。PTQ 使用官方 compressed-tensors 解压 API，避开固定版本 HF 自动量化加载的 meta tensor 问题；解压加载不代表低比特显存/吞吐收益。未宣称 vLLM 压缩部署已打通。
+- CLI `quantize --config/--method` 复用函数入口，保留原 dynamic INT8 默认路径；提供两份配置和 [函数使用说明](docs/QUANTIZATION_FUNCTION_API.md)。扩展 wheel 依赖/模块契约，保护已有模型、数据和配置不被输出覆盖。
+- 主环境定向回归 **323 passed、4 skipped**（65.76 秒）；4 个真实 PTQ 用例因主环境未安装可选后端而跳过，已在独立环境完整运行 PTQ 套件，结果 **47 passed、0 skipped**（38.96 秒），覆盖 AWQ/GPTQ × INT4/INT8 的实际 CPU 校准、整数打包、加载和生成。两组测试有重叠，不相加作为独立用例数。证据：`outputs/quantization-validation/final.xml`、`outputs/quantization-validation/real-ptq-final.xml`。
+- 新模块与测试 Ruff、修改文件编译、diff 空白检查通过；最终 2.42 wheel 构建及内容检查通过。本轮没有改动全局 Python 依赖，PTQ 验证依赖安装在 `outputs/quantization-validation/ptq-env`。
+
+## 2026-10-18 — 训练流水线中的量化交接与压缩产物导出
+
+- 在标准调度器注册单进程 `quantize` 阶段，新增 `QuantizationStageConfig`；训练配置的 `quantization.ptq/qat` 复用函数入口，两组开关默认关闭。关闭时不发布量化模型路径；未安排量化阶段的旧运行保留原配置指纹，不因新增字段失去断点恢复能力。
+- 开启时校验训练→量化→评测→导出的顺序；显式 DAG 同时检查传递依赖，防止重跑训练后恢复过期量化或评测结果。默认评测与导出使用量化产物，不再叠加 adapter；修复旧评测器在 CUDA 上给 QAT 强制选择 FP16 的问题。
+- LoRA 输入先合并成 FP32 浮点检查点，保存在量化目录同级的 `-float` 目录。记录 adapter、基座和合并产物的内容身份；量化失败后的重试仅复用可核验且未变化的浮点模型。禁止把量化输出或合并产物写进原 adapter 的本地基座目录。量化执行前释放旧模型缓存。
+- 导出器直接复制 PTQ/QAT 整数权重、量化 manifest 与 tokenizer；支持原生 QAT 的独立状态文件布局，导出前检查格式、分片与门禁身份。普通检查点/adapter 合并支持精确 `cuda:N`，不静默换设备。现有 dynamic INT8 路径保留。
+- 新增 `configs/posttrain_quantization_qat.yaml`，更新函数说明和生成式函数索引；README 当前版本标记与既有包元数据 `2.42` 对齐，没有另行升级版本。CLI 样例 dry-run、发布元数据、函数索引、最终 wheel 内容及无模型运行时的导入/关闭路径检查通过。
+- 主集成回归 **171 passed、3 skipped**（73.12 秒），函数/QAT/恢复等兼容回归 **115 passed**（47.17 秒），补充基座目录保护 **1 passed**。主环境跳过的 3 项真实 PTQ 已在独立后端环境验证为 **3 passed、0 skipped**（52.01 秒），覆盖 GPTQ 流水线与 AWQ/GPTQ 压缩产物导出重载。各测试组有重叠，不相加作全仓用例总数；未执行全仓测试，也未声称低比特部署加速验收。
+- 补充真实 LoRA 优化一步→FP32 合并→QAT→导出→重载验收 **1 passed、0 skipped**（37.38 秒），确认适配器已更新、合并模型与训练后适配器 logits 一致、准备记录身份可核验、最终 INT8 权重及重载 logits 保持一致。记录为 `outputs/quantization-stage-validation/adapter-real.xml`。
+- 本轮机器可读测试、构建日志及 wheel 位于 `outputs/quantization-stage-validation/`。
+
+## 2026-10-18 — 大模型面试知识笔记与框架采用情况审计
+
+- 整理 [40 个核心问答](docs/LLM_INTERVIEW_NOTES_ZH.md)，覆盖模型、数据、预训练、SFT/能力保持、偏好优化、蒸馏、量化剪枝、推理服务、RAG/Agent 与评测；技术解释使用论文或官方资料，面试题库只用于选题。
+- 新增 [框架源码对照](docs/LLM_INTERVIEW_FRAMEWORK_AUDIT_ZH.md)，区分原生实现、第三方集成、受限能力、错误/占位和缺少闭环，给出源码位置、复现证据、整改优先级及验收条件。README 增加两份文档入口。
+- 只读复现旧 benchmark 将 PPL 标成 GSM8K accuracy、投机解码输出错误、仅哈希前 2,000 字符导致不同全文被删、数据配比公开入口模拟训练，以及 Scaling 预测忽略拟合 A/B 系数等问题。发现均保留为待办，本轮没有修改生产训练、压缩或推理算法。
+- 定向测试分别为架构/数据 **71 passed**、训练运行时 **24 passed**、后训练 **90 passed**、推理/应用 **345 passed**；组间可能重叠，不相加作全仓唯一用例数。没有执行全仓测试，也没有宣称真实多 GPU 或低比特部署性能已验收。
+- 按用户要求生成根目录 `SaddleLLM_大模型面试知识与框架对照笔记.docx`，共 26 页，包含目录、源码/论文链接及 16 个原生可编辑公式。官方 Windows managed runtime 未携带 LibreOffice；保留标准渲染器失败日志，改用隐藏 Microsoft Word 16 原生导出与 managed Poppler 生成页面图。
+- 文档链接检查覆盖 91 个本地引用；Word 结构检查覆盖 Q01–Q40 顺序、内部锚点、重复表头和 ZIP 完整性，并核验 54 个审计源码文件与两份正文 Markdown 的 SHA256 未变。全部 26 页已按原尺寸逐页目视检查，修复目录后的意外空白页；原始测试、探针、构建与页面核验记录位于 `outputs/interview-audit/`。
+
+## 2026-10-19 — 正确性、训练契约与量化执行链路整改
+
+- 按用户授权落实上轮建议，保留既有未提交修改。修正旧 BenchmarkRunner 的 GSM8K/PPL 混标、样本数/科目范围和失败记录；HumanEval/未知任务在加载前明确拒绝。全文规范化 SHA256 去重保留尾部不同的长文，缺近似依赖时记录实际 exact fallback；停用随机 loss/空 checkpoint 的 BalancedPretrainer 公开原型；Scaling 拟合和预算最优解使用实际 A/B/alpha/beta。
+- 修复参考投机解码的 greedy 接受/拒绝、p/q 接受概率、残差分布、bonus/EOS/预算、拼接与固定截断问题；只报告实际生成计时和吞吐，没有 baseline 时不估算 speedup。
+- split、replay 与审计复用统一来源身份，HF preference 在归一化展开前按来源/prompt 分组；HF/native SFT、DPO 与 HF ORPO/KTO、公开蒸馏接入 raw/prepared 审计，覆盖 token 截断、padding、TRL completion/assistant masks 和不同偏好布局。新增 packing_attention 配置，显式区分 concat/isolated，不支持的隔离请求提前拒绝。
+- 公开蒸馏复用 causal shift/mask/tokenmean/T² loss，真实执行 batch 与独立验证，冻结并校验教师/词表/hidden；GRPO 保留真实 EOS，屏蔽其后 padding。补充独立 DPO/GRPO 目标、KL 与梯度数值对照。
+- 新增 select_checkpoint 函数及 eval.checkpoint_candidates 配置：候选通过完整能力门槛后才按指定新任务指标排序，保存各候选与最终报告；覆盖来源文件保护、路径冲突、内容身份变更、失败阻断与实际导出获选模型。默认未开启的新增选模/packing 配置保持旧运行指纹兼容。消除 RolloutSample 重复导出键，保留原生效指向并增加明确的 RLScalingRolloutSample 名称。
+- 为 portable QAT 增加显式 cuda-w8a16 加载，直接复用既有 Triton 核，保留原整数 codes/FP32 scales，不重新量化；默认 W8A32 参考加载保持原语义。真实 native/HF FP16/BF16 forward/generate/重载与非对齐 shape 已验证，训练/不兼容设备或 dtype/普通浮点导出明确拒绝。
+- 最终主环境合并回归 **563 passed、3 skipped**（28 文件，231.06 秒）；三项真实 PTQ 已在既有独立后端环境补测 **3 passed、0 skipped**（35.41 秒），汇总核对了 testcase ID 完全对应主环境跳过项。没有执行全仓、业务封存数据或真实多 GPU 验收。
+- RTX 4090 Laptop 的两组微型 GPU 夹具计时显示分配峰值下降，部分场景速度下降；当前不宣称普遍提速或生产质量达标。原始计时、实际内核计数、重载/文件身份及源码 SHA256 保存于 `outputs/correctness-hardening/`。
+- 仓库必检 Ruff F601/F821/F822/F823、新模块/测试 Ruff、diff 空白、版本元数据与函数索引检查通过。使用声明的隔离构建依赖生成 2.42 wheel，内容检查、无 torch 的隔离 API 导入及全部 25 个修改生产文件与 wheel 字节一致性核对通过；没有修改全局 Python 依赖。
+- [整改说明与配置示例](docs/CORRECTNESS_HARDENING_20261019.md)、[最终验证汇总](outputs/correctness-hardening/validation.json)。2026-10-18 的 Word 和原审计保留为整改前快照，并增加当前实施状态链接。
+
+## 2026-10-19 — 主流程可读性整理
+
+- 按用户要求，对刚修改的 12 个生产文件做可读性整理，不增加功能或配置。数据审计按收集、比较、报告、落盘/阻断排列；选模按验证、身份快照、评测、复查、排序、保存排列；量化入口按校验、加载、执行方式排列。
+- 展开密集条件、嵌套三元和字典构造，区分原始数据、训练数据、验证数据的命名。只提取完整职责的报告路径校验、报告写入、产物加载和推理保护安装，不增加策略类或新的框架层；投机解码的数学循环保持不动。
+- 后续编码要求：主流程按执行顺序展开，命名直接说明用途，注释解释原因与边界；减少嵌套和重复，仅在职责完整、便于阅读时提取函数。修改时核对公开接口、默认行为和相关回归，持续保证代码逻辑顺畅、容易阅读和维护。
+- 相关 18 个测试文件合并回归 **343 passed、0 skipped**（169.39 秒）。额外核对 96 项公开签名/数据类字段与上一轮 wheel 一致；选模 10 个前后差分场景、量化加载 12 项结构核验和局部格式化 AST 核验通过。各专项结果与合并回归有重叠，不相加作唯一用例总数。
+- 必检 Ruff 规则、修改的辅助模块 Ruff、diff 空白、函数索引和版本元数据通过；新 2.42 wheel 的内容、源码字节一致性及无 torch 的隔离 API 导入通过。未重测性能，之前的微型 GPU 计时保留为上一轮数值实现的证据。
+- 记录位于 [readability-refinement/validation.json](outputs/readability-refinement/validation.json)，旧正确性验收与审计证据保留为历史快照。本轮没有执行全仓测试。
+
+## 2026-10-20 — 恢复数据审计、精确剪枝保存与导出门槛
+
+- 按用户“继续”的要求，沿后训练→压缩→回归→导出检查实际缺口，增量修改 5 个生产文件，保留此前未提交工作。主流程保持顺序清楚，不新增算法、配置开关或框架层。
+- Recovery 与 QAT 复用统一切分审计，同时比较准备后的完整输入与有效提示；修复 padding 标签或分词归一化使相同提示漏检的情况。拒绝发生在优化及 fake-quant 替换前；成功报告增加 `data.split_audit`，不保存原始提示。
+- ModelPruner 保存使用当前 `orig × mask`，修复优化后立即保存遗漏最后一次更新的问题。持久化精确 `pruning_masks.pt` 和参数清单，加载、二次剪枝、切换目标和同目录重存均保留并刷新掩码；天然零值仍可训练。Recovery/QAT 对已声明但缺失、不完整或与实体权重不一致的掩码拒绝，旧产物未声明精确掩码时仍允许注明来源的零值推断。
+- 普通 metric gate 与 regression suite 均强制核对导出来源内容；adapter 评测与默认导出指向实际适配器。导出先在临时目录构建，核对复制内容、复查来源/adapter，再发布；失败保留旧产物，回滚失败保留备份并报告位置。正常合并、序列化、tokenizer 兼容转换及可选未绑定 gate 的既有语义保留。
+- 两组互不重叠的 18 文件回归为 **225 passed**（59.64 秒）与 **195 passed、3 skipped**（80.51 秒）；三项真实 PTQ 在既有独立环境补测 **3 passed、0 skipped**（55.59 秒），核对 testcase ID 恰好覆盖跳过项，共验证 423 个不同用例。专项结果有重叠，不另行累加。新增用例在上一轮 wheel 上复现 **8 项失败**，当前源码中全部通过。
+- 与上一轮 wheel 比较，541 项公开签名及带注解字段结构保持一致。新 2.42 wheel 构建、内容契约、5 个源码文件字节核验及无 torch/transformers 的隔离导入通过；仓库必检 Ruff、定向 Ruff、函数索引、版本元数据和 diff 空白检查通过。未执行全仓测试、生产能力评测或新的 GPU 性能验收。
+- 更新 [整改说明](docs/CORRECTNESS_HARDENING_20261019.md)、恢复/量化使用说明及函数索引；原始 JUnit、前后复现和 wheel 证据汇总于 [compression-contracts-20261020/validation.json](outputs/compression-contracts-20261020/validation.json)。

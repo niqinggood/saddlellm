@@ -27,10 +27,17 @@ class DistributedConfig:
     # DeepSpeed
     zero_offload_to_cpu: bool = False
     zero_offload_to_nvme: bool = False
+    zero_nvme_path: str = "./nvme_offload"
     deepspeed_config_path: Optional[str] = None
     zero_stage3_param_persistence_threshold: int = 100000
     zero_reduce_bucket_size: int = 500000000
     zero_allgather_bucket_size: int = 500000000
+    zero_stage3_prefetch_bucket_size: int = 50000000
+    zero_overlap_comm: bool = True
+    zero_contiguous_gradients: bool = True
+    zero_reduce_scatter: bool = True
+    zero_allgather_partitions: bool = True
+    zero_offload_pin_memory: bool = True
 
     # 通用
     bf16: bool = True
@@ -51,6 +58,20 @@ class DistributedConfig:
             raise ValueError(f"unsupported DDP backend: {self.ddp_backend!r}")
         if self.bf16 and self.fp16:
             raise ValueError("bf16 and fp16 cannot both be enabled")
+        if self.zero_offload_to_cpu and self.zero_offload_to_nvme:
+            raise ValueError(
+                "zero_offload_to_cpu and zero_offload_to_nvme are mutually exclusive"
+            )
+        if self.zero_offload_to_nvme and not str(self.zero_nvme_path).strip():
+            raise ValueError("zero_nvme_path must not be empty when NVMe offload is enabled")
+        for name in (
+            "zero_stage3_param_persistence_threshold",
+            "zero_reduce_bucket_size",
+            "zero_allgather_bucket_size",
+            "zero_stage3_prefetch_bucket_size",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be non-negative")
 
     def to_training_args(self) -> Dict:
         """转换为 HuggingFace TrainingArguments 可用的参数"""
@@ -95,11 +116,32 @@ class DistributedConfig:
             "fp16": {"enabled": self.fp16},
             "zero_optimization": {
                 "stage": zero_stage,
+                # These are DeepSpeed's standard overlap path.  Keeping them
+                # explicit makes generated configs auditable and avoids
+                # silently falling back to serialized gradient collectives.
+                "overlap_comm": self.zero_overlap_comm,
+                "contiguous_gradients": self.zero_contiguous_gradients,
+                "reduce_scatter": self.zero_reduce_scatter,
+                "allgather_partitions": self.zero_allgather_partitions,
                 "offload_optimizer": {
                     "device": "cpu" if self.zero_offload_to_cpu else "none",
+                    "pin_memory": bool(
+                        self.zero_offload_pin_memory and self.zero_offload_to_cpu
+                    ),
                 },
                 "offload_param": {
-                    "device": "cpu" if self.zero_offload_to_cpu else "none",
+                    # ZeRO-2 does not partition model parameters; parameter
+                    # offload is supported only by ZeRO-3.
+                    "device": (
+                        "cpu"
+                        if zero_stage == 3 and self.zero_offload_to_cpu
+                        else "none"
+                    ),
+                    "pin_memory": bool(
+                        zero_stage == 3
+                        and self.zero_offload_pin_memory
+                        and self.zero_offload_to_cpu
+                    ),
                 },
                 "stage3_gather_16bit_weights_on_model_save": True,
                 "stage3_param_persistence_threshold": self.zero_stage3_param_persistence_threshold,
@@ -128,7 +170,21 @@ class DistributedConfig:
 
         if self.zero_offload_to_nvme:
             config["zero_optimization"]["offload_optimizer"]["device"] = "nvme"
-            config["zero_optimization"]["offload_optimizer"]["nvme_path"] = "./nvme_offload"
+            config["zero_optimization"]["offload_optimizer"]["nvme_path"] = str(
+                self.zero_nvme_path
+            )
+            config["zero_optimization"]["offload_optimizer"]["pin_memory"] = False
+            if zero_stage == 3:
+                config["zero_optimization"]["offload_param"]["device"] = "nvme"
+                config["zero_optimization"]["offload_param"]["nvme_path"] = str(
+                    self.zero_nvme_path
+                )
+                config["zero_optimization"]["offload_param"]["pin_memory"] = False
+
+        if zero_stage == 3:
+            config["zero_optimization"][
+                "stage3_prefetch_bucket_size"
+            ] = self.zero_stage3_prefetch_bucket_size
 
         return config
 

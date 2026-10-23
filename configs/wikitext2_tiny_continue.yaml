@@ -1,0 +1,86 @@
+# Short weights-only continuation from the first 500-step scratch run.
+project: saddle-wikitext2
+experiment: tiny-7m-wikitext2-continued
+seed: 42
+stages: [pretrain]
+pretrain_mode: continue
+
+model:
+  backend: saddle
+  config: wikitext2-tiny-7m
+  name_or_path: outputs/wikitext2_saddle_tiny_20260923/run/final_model
+  tokenizer: outputs/wikitext2_saddle_tiny_20260923/tokenizer
+  local_files_only: true
+  blueprint:
+    name: wikitext2-tiny-7m
+    family: qwen
+    hidden_size: 256
+    vocab_size: 8192
+    num_layers: 6
+    max_position_embeddings: 256
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 4
+      num_kv_heads: 2
+      rope_theta: 10000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 704
+      fused_gate_up: true
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+data:
+  sources:
+    - type: local
+      path: outputs/wikitext2_saddle_tiny_20260923/assets/train.jsonl
+      text_column: text
+      streaming: false
+  output_dir: outputs/wikitext2_saddle_tiny_20260923/processed
+  max_seq_length: 256
+  min_text_length: 20
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 1
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.05
+
+training:
+  max_steps: 1500
+  per_device_batch_size: 4
+  global_batch_size: 8
+  learning_rate: 0.0001
+  min_lr: 0.00001
+  lr_scheduler: cosine
+  warmup_steps: 30
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+  eval_every_steps: 100
+  save_every_steps: 100
+  keep_last_n_checkpoints: 3
+  log_every_steps: 10
+  load_best_model_at_end: true
+  gradient_checkpointing: false
+  loss_chunk_size: 128
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+
+logging:
+  output_dir: outputs/wikitext2_saddle_tiny_20260923/continued
+  backend: local

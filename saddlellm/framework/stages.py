@@ -14,6 +14,7 @@ SINGLE_PROCESS_STRATEGIES = frozenset({"single"})
 PRETRAIN_STRATEGIES = frozenset(
     {"single", "ddp", "fsdp", "deepspeed_zero2", "deepspeed_zero3"}
 )
+POSTTRAIN_DATA_PARALLEL_STRATEGIES = frozenset({"single", "ddp"})
 STAGE_ENTRY_POINT_GROUP = "saddlellm.stages"
 
 
@@ -205,19 +206,21 @@ class StageRegistry(PluginRegistry[Any]):
 _BUILTIN_METHODS = {
     "tokenizer": "_run_tokenizer_stage",
     "pretrain": "_run_pretrain_stage",
+    "decision": "_run_decision_stage",
     "sft": "_run_sft_stage",
     "preference": "_run_preference_stage",
     "rlhf": "_run_rlhf_stage",
     "mopd": "_run_mopd_stage",
     "vla_sft": "_run_vla_stage",
     "mllm_sft": "_run_multimodal_stage",
-    "vision_alignment": "_run_multimodal_stage",
+    "vision_alignment": "_run_vision_alignment_stage",
     "media_cache": "_run_media_cache_stage",
     "image_generation": "_run_image_generation_stage",
     "music_generation": "_run_music_generation_stage",
     "video_generation": "_run_video_generation_stage",
     "world_model": "_run_world_model_stage",
     "eye_control": "_run_eye_control_stage",
+    "quantize": "_run_quantization_stage",
     "eval": "_run_eval_stage",
     "export": "_run_export_stage",
     "operator": "_run_operator_stage",
@@ -243,6 +246,7 @@ _MODEL_ADAPTER_STAGES = frozenset(
 _BUILTIN_CONTRACTS = {
     "tokenizer": ((), ("tokenizer",), "data"),
     "pretrain": (("dataset", "tokenizer"), ("language_model",), "foundation"),
+    "decision": (("decision_dataset", "text_backbone"), ("decision_model", "evaluation", "calibration"), "decision"),
     "sft": (("dataset", "language_model"), ("language_model",), "post_training"),
     "preference": (("dataset", "language_model"), ("language_model",), "post_training"),
     "rlhf": (("dataset", "language_model"), ("language_model",), "post_training"),
@@ -256,6 +260,7 @@ _BUILTIN_CONTRACTS = {
     "video_generation": (("encoded_media",), ("generative_model",), "generative"),
     "world_model": (("trajectory",), ("world_model",), "world_model"),
     "eye_control": (("world_model",), ("control_report",), "embodied_control"),
+    "quantize": (("language_model",), ("language_model",), "compression"),
     "eval": (("model",), ("evaluation",), "evaluation"),
     "export": (("model",), ("release",), "release"),
     "operator": ((), ("artifact",), "extension"),
@@ -264,7 +269,12 @@ _BUILTIN_CONTRACTS = {
 
 def register_builtin_stages(registry: StageRegistry) -> StageRegistry:
     for name, method_name in _BUILTIN_METHODS.items():
-        strategies = PRETRAIN_STRATEGIES if name == "pretrain" else SINGLE_PROCESS_STRATEGIES
+        if name == "pretrain":
+            strategies = PRETRAIN_STRATEGIES
+        elif name in {"sft", "preference"}:
+            strategies = POSTTRAIN_DATA_PARALLEL_STRATEGIES
+        else:
+            strategies = SINGLE_PROCESS_STRATEGIES
         consumes, produces, family = _BUILTIN_CONTRACTS[name]
         registry.register(
             name,
@@ -332,6 +342,7 @@ __all__ = [
     "FunctionStage",
     "OrchestratorMethodStage",
     "PRETRAIN_STRATEGIES",
+    "POSTTRAIN_DATA_PARALLEL_STRATEGIES",
     "SINGLE_PROCESS_STRATEGIES",
     "STAGE_ENTRY_POINT_GROUP",
     "StageCapabilities",

@@ -4,8 +4,18 @@
 !.env.example
 *.pem
 *.key
+*.p12
+*.pfx
+.ssh/
 secrets/
+.saddlellm/
 /config/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Python caches, environments, packaging, and test output
 __pycache__/
@@ -14,6 +24,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+.hypothesis/
 .coverage
 .coverage.*
 htmlcov/
@@ -26,6 +38,7 @@ env/
 build/
 dist/
 *.egg-info/
+*.whl
 
 # JavaScript dependencies and generated metadata
 node_modules/
@@ -36,12 +49,14 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Training runs, model artifacts, and experiment tracking
+/artifacts/
 outputs/
 checkpoints/
 **/checkpoints/
 runs/
 wandb/
 tensorboard/
+/sparse_logs/
 *.ckpt
 *.pt
 *.pth
@@ -68,7 +83,8 @@ data/spatial_world_model_v2.jsonl
 *.swp
 *~
 ~$*
-docs/*.docx
+*.docx
+/design/spatial-studio-concepts/*.png
 .idea/
 .vscode/
 .ipynb_checkpoints/

@@ -18,14 +18,13 @@ import logging
 import math
 import random
 import re
-from contextlib import nullcontext
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
-
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +199,8 @@ class GRPOTrainer:
         num_steps: int = 1000,
         reward_model: Optional[RewardFn] = None,
         eval_prompts: Optional[List[str]] = None,
+        metrics_callback: Optional[Callable[[Dict], None]] = None,
+        rollout_callback: Optional[Callable[[Dict], None]] = None,
     ) -> List[Dict[str, float]]:
         """Train on text prompts using a deterministic/verifiable reward.
 
@@ -225,7 +226,9 @@ class GRPOTrainer:
         accumulated_gradient_steps = 0
 
         for local_step in range(num_steps):
+            step_started = time.perf_counter()
             losses: List[torch.Tensor] = []
+            loss_lengths: List[int] = []
             kl_values: List[float] = []
             sampled_rewards: List[float] = []
             accepted_rewards: List[float] = []
@@ -250,9 +253,7 @@ class GRPOTrainer:
                     break
                 sampling_attempts += 1
                 all_prompts = [
-                    prompt
-                    for prompt in batch_prompts
-                    for _ in range(group_size)
+                    prompt for prompt in batch_prompts for _ in range(group_size)
                 ]
                 (
                     responses,
@@ -270,16 +271,28 @@ class GRPOTrainer:
                     if not math.isfinite(reward):
                         raise ValueError("reward_fn returned a non-finite value")
                     rewards.append(reward)
+                rewards = self._shape_rollout_rewards(rewards, rollout_ids)
                 sampled_rewards.extend(rewards)
                 sampled_responses.extend(responses)
+                if rollout_callback is not None:
+                    rollout_callback(
+                        {
+                            "step": self._step + 1,
+                            "prompts": all_prompts,
+                            "responses": responses,
+                            "rewards": rewards,
+                            "completion_tokens": [
+                                len(ids) if ids is not None else None
+                                for ids in rollout_ids
+                            ],
+                        }
+                    )
 
                 for group_index, group_prompt in enumerate(batch_prompts):
                     start = group_index * group_size
                     group_responses = responses[start : start + group_size]
                     group_rewards = rewards[start : start + group_size]
-                    reward_std = float(
-                        torch.tensor(group_rewards).std(unbiased=False)
-                    )
+                    reward_std = float(torch.tensor(group_rewards).std(unbiased=False))
                     group_reward_stds.append(reward_std)
                     sampled_groups += 1
                     informative = (
@@ -311,10 +324,16 @@ class GRPOTrainer:
                             continue
                         loss, kl = result
                         losses.append(loss)
+                        ids = rollout_ids[seq_index]
+                        loss_lengths.append(len(ids) if ids is not None else 1)
                         kl_values.append(kl)
 
             if losses:
-                total_loss = torch.stack(losses).mean()
+                total_loss = self._aggregate_sequence_losses(losses, loss_lengths)
+                if not bool(torch.isfinite(total_loss)):
+                    raise FloatingPointError(
+                        f"Non-finite GRPO loss at micro-step {self._step + 1}"
+                    )
                 scaled_loss = total_loss / self.config.gradient_accumulation_steps
                 scaled_loss.backward()
                 accumulated_gradient_steps += 1
@@ -334,6 +353,10 @@ class GRPOTrainer:
                     self.config.max_grad_norm,
                 )
                 grad_norm = float(grad_norm_t.detach().cpu())
+                if not math.isfinite(grad_norm):
+                    raise FloatingPointError(
+                        f"Non-finite GRPO gradient at micro-step {self._step + 1}"
+                    )
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 accumulated_gradient_steps = 0
@@ -349,15 +372,14 @@ class GRPOTrainer:
                 "loss": float(total_loss.detach().cpu()),
                 "kl_divergence": sum(kl_values) / max(1, len(kl_values)),
                 "reward_mean": sum(sampled_rewards) / max(1, len(sampled_rewards)),
-                "reward_std": float(
-                    torch.tensor(sampled_rewards).std(unbiased=False)
-                ) if sampled_rewards else 0.0,
+                "reward_std": float(torch.tensor(sampled_rewards).std(unbiased=False))
+                if sampled_rewards
+                else 0.0,
                 "accepted_reward_mean": sum(accepted_rewards)
                 / max(1, len(accepted_rewards)),
                 "group_reward_std_mean": sum(group_reward_stds)
                 / max(1, len(group_reward_stds)),
-                "informative_group_rate": informative_groups
-                / max(1, sampled_groups),
+                "informative_group_rate": informative_groups / max(1, sampled_groups),
                 "sampled_groups": sampled_groups,
                 "accepted_groups": accepted_groups,
                 "discarded_groups": sampled_groups - accepted_groups,
@@ -368,8 +390,15 @@ class GRPOTrainer:
                 / max(1, len(sampled_responses)),
                 "grad_norm": grad_norm,
                 "lr": self.optimizer.param_groups[0]["lr"],
+                "duration_s": time.perf_counter() - step_started,
+                "peak_cuda_allocated_gib": torch.cuda.max_memory_allocated(self.device)
+                / 1024**3
+                if self.device.type == "cuda"
+                else 0.0,
             }
             self._metrics_history.append(metrics)
+            if metrics_callback is not None:
+                metrics_callback(metrics)
 
             if self._step % self.config.log_every_n_steps == 0:
                 logger.info(
@@ -385,10 +414,7 @@ class GRPOTrainer:
                     metrics["sampled_groups"],
                 )
 
-            if (
-                eval_prompts
-                and self._step % (self.config.log_every_n_steps * 5) == 0
-            ):
+            if eval_prompts and self._step % (self.config.log_every_n_steps * 5) == 0:
                 logger.info("Eval: %s", self.evaluate(eval_prompts, reward_fn))
 
         logger.info("GRPO training complete")
@@ -405,6 +431,17 @@ class GRPOTrainer:
             for parameter in self.model.parameters():
                 if parameter.requires_grad and parameter.grad is not None:
                     parameter.grad.mul_(correction)
+
+    def _shape_rollout_rewards(self, rewards, rollout_ids):
+        """Algorithm hook; GRPO uses the verifier's unmodified rewards."""
+        return rewards
+
+    def _aggregate_sequence_losses(self, losses, lengths):
+        """GRPO gives each completion equal weight, regardless of length."""
+        return torch.stack(losses).mean()
+
+    def _clip_policy_ratio(self, ratio):
+        return ratio.clamp(1.0 - self.config.epsilon, 1.0 + self.config.epsilon)
 
     def _generate_responses(self, prompts: Sequence[str]) -> List[str]:
         responses, *_ = self._generate_responses_with_log_probs(prompts)
@@ -443,6 +480,7 @@ class GRPOTrainer:
                 "repetition_penalty": self.config.repetition_penalty,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "eos_token_id": self.tokenizer.eos_token_id,
+                "use_cache": True,
             }
             if self.config.temperature > 0:
                 generation_kwargs.update(
@@ -454,40 +492,55 @@ class GRPOTrainer:
                     **inputs, return_dict_in_generate=True, **generation_kwargs
                 )
 
+            generated_tokens = outputs.sequences[:, prompt_width:]
+            pad_id = self.tokenizer.pad_token_id
+            eos_id = self.tokenizer.eos_token_id
+            eos_ids = set(eos_id if isinstance(eos_id, (tuple, list)) else [eos_id]) - {None}
+            completion_lengths = []
+            for generated in generated_tokens:
+                length = len(generated)
+                for position, token in enumerate(generated.tolist()):
+                    # EOS was sampled and must participate in the objective,
+                    # including when EOS doubles as the padding token. Only
+                    # subsequent positions are generation-time padding.
+                    if token in eos_ids:
+                        length = position + 1
+                        break
+                    if pad_id is not None and token == pad_id:
+                        length = position
+                        break
+                completion_lengths.append(length)
+            completion_mask = torch.arange(generated_tokens.shape[1], device=self.device)[None, :] < torch.tensor(
+                completion_lengths, device=self.device
+            )[:, None]
             with torch.inference_mode():
                 scored = self.model(
                     input_ids=outputs.sequences,
                     attention_mask=torch.cat(
                         [
                             inputs["attention_mask"],
-                            torch.ones_like(outputs.sequences[:, prompt_width:]),
+                            completion_mask.to(inputs["attention_mask"].dtype),
                         ],
                         dim=1,
                     ),
                     use_cache=False,
                 ).logits
-            completion_log_probs = F.log_softmax(
-                scored[:, prompt_width - 1 : -1, :].float(), dim=-1
-            ).gather(
-                dim=-1,
-                index=outputs.sequences[:, prompt_width:].unsqueeze(-1),
-            ).squeeze(-1)
+            completion_log_probs = (
+                F.log_softmax(scored[:, prompt_width - 1 : -1, :].float(), dim=-1)
+                .gather(
+                    dim=-1,
+                    index=outputs.sequences[:, prompt_width:].unsqueeze(-1),
+                )
+                .squeeze(-1)
+            )
 
-            pad_id = self.tokenizer.pad_token_id
             responses = []
             rollout_ids = []
             rollout_log_probs = []
-            for seq_idx, generated in enumerate(outputs.sequences[:, prompt_width:]):
-                # Left-padded batches pad already-finished sequences; those
-                # positions were never sampled, so trim at the first pad.
-                if pad_id is not None:
-                    pad_positions = (generated == pad_id).nonzero()
-                    if len(pad_positions):
-                        generated = generated[: int(pad_positions[0])]
+            for seq_idx, generated in enumerate(generated_tokens):
+                generated = generated[:completion_lengths[seq_idx]]
                 responses.append(
-                    self.tokenizer.decode(
-                        generated, skip_special_tokens=True
-                    ).strip()
+                    self.tokenizer.decode(generated, skip_special_tokens=True).strip()
                 )
                 rollout_ids.append(generated)
                 rollout_log_probs.append(
@@ -637,12 +690,17 @@ class GRPOTrainer:
             advantage, dtype=policy_log_probs.dtype, device=self.device
         )
         unclipped = ratio * advantage_t
-        clipped = torch.clamp(
-            ratio, 1.0 - self.config.epsilon, 1.0 + self.config.epsilon
-        ) * advantage_t
+        clipped = (
+            self._clip_policy_ratio(ratio)
+            * advantage_t
+        )
         policy_loss = -torch.minimum(unclipped, clipped).mean()
 
-        reference_logits = self._reference_logits(input_ids, attention_mask)
+        reference_logits = (
+            self._reference_logits(input_ids, attention_mask)
+            if self.config.beta
+            else None
+        )
         if reference_logits is None or self.config.beta == 0:
             kl = torch.zeros((), dtype=policy_loss.dtype, device=self.device)
         else:
@@ -696,16 +754,20 @@ class GRPOTrainer:
         logger.debug("Reference model updated")
 
     @torch.no_grad()
-    def evaluate(self, eval_prompts: List[str], reward_fn: RewardFn) -> Dict[str, float]:
+    def evaluate(
+        self, eval_prompts: List[str], reward_fn: RewardFn
+    ) -> Dict[str, float]:
         if not eval_prompts:
-            return {"eval_best_of_g_reward": 0.0, "eval_avg_reward": 0.0, "num_samples": 0}
+            return {
+                "eval_best_of_g_reward": 0.0,
+                "eval_avg_reward": 0.0,
+                "num_samples": 0,
+            }
         sample = eval_prompts[:20]
         best_rewards = []
         all_rewards = []
         for prompt in sample:
-            responses = self._generate_responses(
-                [prompt] * self.config.num_generations
-            )
+            responses = self._generate_responses([prompt] * self.config.num_generations)
             rewards = [float(reward_fn(prompt, response)) for response in responses]
             best_rewards.append(max(rewards))
             all_rewards.extend(rewards)
@@ -734,9 +796,7 @@ class GRPOTrainer:
             selected = selected[:max_prompts]
         profiles: List[Dict[str, object]] = []
         for prompt in selected:
-            responses = self._generate_responses(
-                [prompt] * self.config.num_generations
-            )
+            responses = self._generate_responses([prompt] * self.config.num_generations)
             rewards = [float(reward_fn(prompt, response)) for response in responses]
             reward_tensor = torch.tensor(rewards, dtype=torch.float32)
             reward_std = float(reward_tensor.std(unbiased=False))

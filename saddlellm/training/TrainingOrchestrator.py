@@ -3,10 +3,21 @@
 import os
 import json
 import logging
+import math
 import time
 from typing import List, Optional, Literal, Dict, Any, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ..decision.config import DecisionStageConfig
+from ..compression.QuantizationStage import QuantizationStageConfig
+from ..runtime.BackendConfig import RuntimeBackendConfig, validate_runtime_backends
+from .PostTrainingCompatibility import (
+    latest_train_metrics,
+    metric_snapshot,
+    resolve_trainer_resume_checkpoint,
+    validate_resume_training_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +67,11 @@ class DataConfig:
     quality_min_score: float = 0.3
     num_proc: int = 4
     pack_sequences: bool = True
+    packing_attention: Literal["auto", "concat", "isolated"] = "auto"
+    append_eos: bool = True
+    validation_split: float = 0.01
     output_dir: str = "./processed_data"
+    cache_dir: Optional[str] = None
 
 
 @dataclass
@@ -78,11 +93,18 @@ class TrainingHyperparams:
     keep_last_n_checkpoints: int = 5
     resume_from_checkpoint: Any = False
     dataloader_num_workers: int = 4
+    dataloader_pin_memory: bool = True
+    dataloader_persistent_workers: bool = True
+    dataloader_prefetch_factor: Optional[int] = 2
+    # Saddle's training-only linear/CE path processes this many tokens at a
+    # time.  Zero preserves the legacy full-logits path.
+    loss_chunk_size: int = 1024
     stability_monitor: bool = True
     stability_loss_window: int = 50
     stability_spike_threshold: float = 2.5
     stability_stagnation_window: int = 200
     stability_output_dir: str = ""
+    load_best_model_at_end: bool = True
     dry_run: bool = False
     preflight_only: bool = False
 
@@ -94,10 +116,21 @@ class DistributedTrainingConfig:
     )
     num_gpus: int = 1
     num_nodes: int = 1
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: Optional[int] = None
     bf16: bool = True
     fp16: bool = False
+    tf32: bool = False
     zero_offload_to_cpu: bool = False
+    zero_offload_to_nvme: bool = False
+    zero_nvme_path: str = "./nvme_offload"
+    zero_overlap_comm: bool = True
+    zero_contiguous_gradients: bool = True
+    zero_reduce_scatter: bool = True
+    zero_allgather_partitions: bool = True
+    zero_offload_pin_memory: bool = True
+    zero_stage3_prefetch_bucket_size: int = 50_000_000
+    zero_reduce_bucket_size: int = 500_000_000
+    zero_allgather_bucket_size: int = 500_000_000
     deepspeed_config_path: Optional[str] = None
     ddp_backend: str = "auto"
 
@@ -140,7 +173,7 @@ class SFTConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(
+    lora_target_modules: Any = field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
     epochs: int = 3
@@ -153,11 +186,27 @@ class SFTConfig:
     eval_steps: int = 0
     logging_steps: int = 10
     validation_split: float = 0.0
+    validation_data_path: Optional[str] = None
+    load_best_model_at_end: bool = True
     response_template: Optional[str] = "### Answer:"
     local_files_only: bool = False
     trust_remote_code: bool = True
     gradient_checkpointing: bool = True
     optim: Optional[str] = None
+    precision: Literal["auto", "bf16", "fp16", "fp32"] = "auto"
+    replay_data_path: str | None = None
+    replay_ratio: float = 0.0
+    replay_count: int | None = None
+    reference_model_path: str | None = None
+    retention_kl_weight: float = 0.0
+    retention_temperature: float = 1.0
+
+    def __post_init__(self):
+        from ..data.ReplayData import validate_replay_config
+        from .Retention import validate_retention_config
+
+        validate_replay_config(self.replay_data_path, self.replay_ratio, self.replay_count)
+        validate_retention_config(self.reference_model_path, self.retention_kl_weight, self.retention_temperature)
 
 
 @dataclass
@@ -197,16 +246,22 @@ class PreferenceConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
+    lora_target_modules: Any = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    )
     gradient_accumulation_steps: int = 4
     warmup_steps: int = 100
     save_steps: int = 200
     logging_steps: int = 10
     validation_split: float = 0.0
+    validation_data_path: Optional[str] = None
+    load_best_model_at_end: bool = True
     eval_steps: int = 0
     local_files_only: bool = False
     trust_remote_code: bool = True
     gradient_checkpointing: bool = True
     report_to: str = "none"
+    precision: Literal["auto", "bf16", "fp16", "fp32"] = "auto"
 
 
 @dataclass
@@ -368,7 +423,9 @@ class MOPDTrainingConfig:
     max_new_tokens: int = 1024
     student_temperature: float = 0.9
     teacher_temperature: float = 0.3
+    teacher_concurrency: int = 4
     aggregation: str = "best_score"
+    requires_review: bool = False
     dry_run: bool = True
 
 
@@ -426,6 +483,97 @@ class EvalConfig:
     max_samples: int = 1000
     fail_on_error: bool = True
     gate: EvaluationGateConfig = field(default_factory=EvaluationGateConfig)
+    task: Optional[str] = None
+    split: str = "validation"
+    adapter: Optional[str] = None
+    prompt_field: str = "instruction"
+    question_field: str = "question"
+    answer_field: str = "answer"
+    completion_field: str = "output"
+    rubric_field: str = "rubric"
+    reference_field: str = "reference"
+    id_field: str = "id"
+    group_field: Optional[str] = None
+    case_field: Optional[str] = None
+    variant_field: Optional[str] = None
+    prompt_variants: Optional[str] = None
+    choices: str = "ABCDE"
+    batch_size: int = 16
+    max_length: int = 512
+    max_new_tokens: int = 96
+    generation_samples: int = 0
+    generation_all: bool = False
+    generation_indices: List[int] = field(default_factory=list)
+    device: str = "auto"
+    dtype: str = "auto"
+    enable_thinking: bool = False
+    trust_remote_code: bool = False
+    local_files_only: bool = False
+    endpoint: Optional[str] = None
+    api_key_env: Optional[str] = None
+    pass_threshold: float = 0.8
+    request_timeout: float = 120.0
+    repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
+    output_path: Optional[str] = None
+    markdown_output: Optional[str] = None
+    regression_suite: str | None = None
+    regression_baseline: str | None = None
+    regression_baseline_adapter: str | None = None
+    regression_fail_on_rejection: bool = True
+    checkpoint_candidates: List[str] = field(default_factory=list)
+    selection_task: Optional[str] = None
+    selection_metric: Optional[str] = None
+    selection_higher_is_better: bool = True
+
+    def __post_init__(self):
+        if self.task not in {
+            None,
+            "legacy",
+            "multiple-choice",
+            "multiple_choice",
+            "completion",
+            "rubric",
+        }:
+            raise ValueError(
+                "eval.task must be multiple-choice, completion, rubric, or legacy"
+            )
+        if not isinstance(self.split, str) or not self.split.strip():
+            raise ValueError("eval.split must be a nonempty name")
+        if type(self.fail_on_error) is not bool:
+            raise ValueError("eval.fail_on_error must be boolean")
+        if type(self.regression_fail_on_rejection) is not bool:
+            raise ValueError("eval.regression_fail_on_rejection must be boolean")
+        if self.regression_suite and self.gate.enabled:
+            raise ValueError(
+                "Configure metric rules inside eval.regression_suite instead of also enabling eval.gate."
+            )
+        if (
+            not isinstance(self.checkpoint_candidates, list)
+            or any(
+                not isinstance(path, str) or not path.strip()
+                for path in self.checkpoint_candidates
+            )
+            or len(set(self.checkpoint_candidates)) != len(self.checkpoint_candidates)
+        ):
+            raise ValueError(
+                "eval.checkpoint_candidates must be a list of distinct nonempty checkpoint paths"
+            )
+        if type(self.selection_higher_is_better) is not bool:
+            raise ValueError("eval.selection_higher_is_better must be boolean")
+        if self.checkpoint_candidates:
+            if (
+                not self.regression_suite
+                or not self.selection_task
+                or not self.selection_metric
+            ):
+                raise ValueError(
+                    "checkpoint selection requires regression_suite, selection_task and selection_metric"
+                )
+            if self.adapter or self.regression_baseline_adapter:
+                raise ValueError(
+                    "checkpoint selection requires merged/full artifacts; adapter overrides are unsupported"
+                )
 
 
 @dataclass
@@ -468,6 +616,7 @@ class TrainingConfig:
     model_name_or_path: Optional[str] = None
     tokenizer_name_or_path: Optional[str] = None
     model_backend: Literal["hf", "saddle"] = "hf"
+    model_local_files_only: bool = False
     model_blueprint: Optional[Dict] = None
     pretrain_mode: Literal["scratch", "continue"] = "scratch"
 
@@ -477,6 +626,7 @@ class TrainingConfig:
     data: DataConfig = field(default_factory=DataConfig)
     tokenizer_training: Optional[TokenizerTrainingConfig] = None
     training: TrainingHyperparams = field(default_factory=TrainingHyperparams)
+    backends: RuntimeBackendConfig = field(default_factory=RuntimeBackendConfig)
     distributed: DistributedTrainingConfig = field(
         default_factory=DistributedTrainingConfig
     )
@@ -504,7 +654,9 @@ class TrainingConfig:
     vla: VLATrainingConfig = field(default_factory=VLATrainingConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     export: ExportConfig = field(default_factory=ExportConfig)
+    quantization: QuantizationStageConfig = field(default_factory=QuantizationStageConfig)
     operator: OperatorStageConfig = field(default_factory=OperatorStageConfig)
+    decision: DecisionStageConfig = field(default_factory=DecisionStageConfig)
 
 
 # ============================================================
@@ -600,6 +752,10 @@ class TrainingOrchestrator:
         )
 
     def _validate_config(self):
+        if "decision" in self.config.stages:
+            from ..decision.config import decision_plan
+
+            decision_plan(self.config)
         valid_stages = set(self.available_stages())
         unknown = [stage for stage in self.config.stages if stage not in valid_stages]
         if unknown:
@@ -617,13 +773,155 @@ class TrainingOrchestrator:
         for stage in self.config.stages:
             plugin = self._get_stage_plugin(stage)
             plugin.validate(self._stage_context(stage))
+        from ..compression.QuantizationStage import validate_quantization_stage
+
+        validate_quantization_stage(self.config)
+        validate_runtime_backends(self.config)
+        if "pretrain" in self.config.stages:
+            from .PackingPolicy import resolve_packing_attention
+
+            packing_backend = (
+                "megatron" if self.config.backends.training == "megatron" else self.config.model_backend
+            )
+            resolve_packing_attention(
+                self.config.data.packing_attention,
+                packing_backend,
+                self.config.data.pack_sequences,
+            )
+        if self.config.sft.retention_kl_weight > 0 and (
+            self.config.backends.training == "megatron" or self.config.distributed.strategy not in {"single", "ddp"}
+        ):
+            raise ValueError("SFT reference KL currently supports single-device/DDP native or Hugging Face training.")
+        if self.config.eval.regression_suite:
+            from ..evaluation.RegressionSuite import load_regression_suite
+
+            suite = load_regression_suite(self.config.eval.regression_suite)
+            if self.config.eval.checkpoint_candidates:
+                selection_task = next(
+                    (task for task in suite["tasks"] if task["name"] == self.config.eval.selection_task),
+                    None,
+                )
+                if selection_task is None or self.config.eval.selection_metric not in selection_task["metrics"]:
+                    raise ValueError("Checkpoint selection task/metric must be declared in the regression suite.")
+
+                metric_rule = selection_task["metrics"][self.config.eval.selection_metric]
+                if metric_rule["higher_is_better"] != self.config.eval.selection_higher_is_better:
+                    raise ValueError("Checkpoint selection direction must match its regression-suite metric rule.")
+            if not self.config.eval.enabled or "eval" not in self.config.stages:
+                raise ValueError("eval.regression_suite requires an enabled eval stage.")
+            if "export" in self.config.stages and self.config.stages.index("eval") > self.config.stages.index("export"):
+                raise ValueError("Capability regression must run before export.")
+        if self.config.backends.training == "megatron":
+            if self.config.sft.replay_data_path or self.config.sft.replay_ratio or self.config.sft.replay_count is not None:
+                raise ValueError("SFT replay is supported by native and Hugging Face trainers; Megatron recipes must implement replay explicitly.")
+            # The selected Bridge recipe owns architecture, data and training
+            # settings. Native Trainer checks must not reinterpret that config.
+            return
         if "pretrain" in self.config.stages and not self.config.data.sources:
             raise ValueError("pretrain stage requires data.sources")
+        if not 0 <= self.config.data.validation_split < 1:
+            raise ValueError("data.validation_split must be in the range [0, 1)")
+        if (
+            "pretrain" in self.config.stages
+            and self.config.data.validation_split > 0
+            and self.config.training.eval_every_steps <= 0
+        ):
+            raise ValueError(
+                "training.eval_every_steps must be positive when "
+                "data.validation_split is enabled"
+            )
+        if (
+            "pretrain" in self.config.stages
+            and self.config.training.learning_rate <= 0
+        ):
+            raise ValueError("training.learning_rate must be positive")
+        if (
+            "pretrain" in self.config.stages
+            and not 0
+            <= self.config.training.min_lr
+            <= self.config.training.learning_rate
+        ):
+            raise ValueError(
+                "training.min_lr must be between 0 and training.learning_rate"
+            )
+        if (
+            "pretrain" in self.config.stages
+            and self.config.training.per_device_batch_size <= 0
+        ):
+            raise ValueError("training.per_device_batch_size must be positive")
+        if (
+            "pretrain" in self.config.stages
+            and self.config.training.global_batch_size <= 0
+        ):
+            raise ValueError("training.global_batch_size must be positive")
+        pretrain_world_size = max(
+            1,
+            self.config.distributed.num_gpus * self.config.distributed.num_nodes,
+        )
+        pretrain_micro_global_batch = (
+            self.config.training.per_device_batch_size * pretrain_world_size
+        )
+        if self.config.distributed.gradient_accumulation_steps is not None:
+            if self.config.distributed.gradient_accumulation_steps <= 0:
+                raise ValueError(
+                    "distributed.gradient_accumulation_steps must be positive"
+                )
+            if "pretrain" in self.config.stages:
+                world_size = max(
+                    1,
+                    self.config.distributed.num_gpus
+                    * self.config.distributed.num_nodes,
+                )
+                actual_global_batch = (
+                    self.config.training.per_device_batch_size
+                    * world_size
+                    * self.config.distributed.gradient_accumulation_steps
+                )
+                if actual_global_batch != self.config.training.global_batch_size:
+                    raise ValueError(
+                        "Pretraining batch configuration is inconsistent: "
+                        f"global_batch_size={self.config.training.global_batch_size}, "
+                        f"but per_device_batch_size={self.config.training.per_device_batch_size} "
+                        f"* world_size={world_size} * gradient_accumulation_steps="
+                        f"{self.config.distributed.gradient_accumulation_steps} gives "
+                        f"{actual_global_batch}. Remove gradient_accumulation_steps to "
+                        "derive it automatically, or make the values match."
+                    )
+        elif (
+            "pretrain" in self.config.stages
+            and self.config.training.global_batch_size
+            % pretrain_micro_global_batch
+            != 0
+        ):
+            raise ValueError(
+                "training.global_batch_size must be divisible by "
+                "per_device_batch_size * num_gpus * num_nodes when gradient "
+                "accumulation is derived automatically"
+            )
+        if (
+            "pretrain" in self.config.stages
+            and self.config.data.validation_split > 0
+            and self.config.training.load_best_model_at_end
+            and self.config.training.save_every_steps
+            % self.config.training.eval_every_steps
+            != 0
+        ):
+            raise ValueError(
+                "training.save_every_steps must be a multiple of "
+                "training.eval_every_steps when load_best_model_at_end=true"
+            )
         sft_can_use_mopd = (
             "mopd" in self.config.stages
             and "sft" in self.config.stages
             and self.config.stages.index("mopd") < self.config.stages.index("sft")
         )
+        if "mopd" in self.config.stages and self.config.mopd.enabled:
+            if self.config.mopd.teacher_concurrency < 1:
+                raise ValueError("mopd.teacher_concurrency must be at least 1")
+            if not self.config.mopd.dry_run and not self.config.mopd.teachers:
+                raise ValueError(
+                    "Real MOPD distillation requires at least one configured teacher."
+                )
         if (
             self.config.sft.enabled
             and not self.config.sft.data_path
@@ -632,6 +930,18 @@ class TrainingOrchestrator:
             raise ValueError("SFT is enabled but sft.data_path is empty")
         if self.config.rlhf.enabled and not self.config.rlhf.data_path:
             raise ValueError("RLHF is enabled but rlhf.data_path is empty")
+        if (
+            "rlhf" in self.config.stages
+            and self.config.rlhf.enabled
+            and self.config.rlhf.method == "ppo"
+            and not self.config.training.dry_run
+            and not self.config.training.preflight_only
+        ):
+            raise NotImplementedError(
+                "PPO execution is not wired into the stable SaddleLLM pipeline. "
+                "It requires an explicit reward model, value model, rollout policy, "
+                "and safety-tested reward contract. No earlier or later stage was run."
+            )
         if self.config.preference.enabled and not self.config.preference.data_path:
             raise ValueError("preference is enabled but preference.data_path is empty")
         if self.config.media_cache.enabled and not self.config.media_cache.jobs:
@@ -709,17 +1019,22 @@ class TrainingOrchestrator:
                 raise ValueError(
                     f"Unsupported preference.method: {self.config.preference.method}"
                 )
-            preference_actual_batch_size = (
-                self.config.preference.per_device_batch_size
-                * max(1, self.config.distributed.num_gpus)
-            )
             if (
                 self.config.preference.method == "kto"
-                and preference_actual_batch_size <= 1
+                and self.config.preference.per_device_batch_size <= 1
             ):
                 raise ValueError(
-                    "KTO preference training requires actual train batch size > 1; "
-                    "increase preference.per_device_batch_size or distributed.num_gpus."
+                    "KTO preference training requires per-device train batch size > 1; "
+                    "increase preference.per_device_batch_size. Additional DDP workers "
+                    "do not change the local KTO batch."
+                )
+        for stage_name, precision in (
+            ("sft", self.config.sft.precision),
+            ("preference", self.config.preference.precision),
+        ):
+            if precision not in {"auto", "bf16", "fp16", "fp32"}:
+                raise ValueError(
+                    f"{stage_name}.precision must be auto, bf16, fp16, or fp32"
                 )
         if self.config.distributed.bf16 and self.config.distributed.fp16:
             raise ValueError(
@@ -932,7 +1247,8 @@ class TrainingOrchestrator:
                         f"support_level={support.support_level}; notes={support.notes}"
                     )
 
-    def _default_blueprint_for_spec(self, spec):
+    @staticmethod
+    def _default_blueprint_for_spec(spec):
         if spec is None:
             return None
         from ..models.ModelBlueprint import (
@@ -958,6 +1274,8 @@ class TrainingOrchestrator:
                 kind=attention_kind,
                 num_heads=spec.num_attention_heads,
                 num_kv_heads=spec.num_kv_heads or spec.num_attention_heads,
+                qk_norm=getattr(spec, "qk_norm", False),
+                fused_qkv=getattr(spec, "fused_qkv", False),
                 q_lora_rank=spec.q_lora_rank,
                 kv_lora_rank=spec.kv_lora_rank,
                 rope_theta=spec.rope_theta,
@@ -966,6 +1284,7 @@ class TrainingOrchestrator:
             ffn=FFNBlueprint(
                 kind="moe" if spec.num_experts > 0 else "swiglu",
                 intermediate_size=spec.intermediate_size,
+                fused_gate_up=getattr(spec, "fused_gate_up", False),
                 num_experts=spec.num_experts,
                 experts_per_token=spec.num_experts_per_tok,
                 expert_intermediate_size=spec.expert_intermediate_size,
@@ -979,14 +1298,22 @@ class TrainingOrchestrator:
             ),
         )
 
-    def _resolve_model_blueprint(self, spec=None):
+    @classmethod
+    def resolve_architecture_blueprint(
+        cls, model_config: str, model_blueprint: Optional[Dict] = None
+    ):
+        """Resolve a preset plus optional overrides into one validated blueprint.
+
+        This is deliberately usable without constructing an orchestrator so
+        config validation and user interfaces can preview the exact network
+        before allocating a model or touching training data.
+        """
         from ..models.ModelBlueprint import ModelBlueprint
         from ..models.ModelRegistry import MODEL_SPECS
 
+        spec = MODEL_SPECS.get(model_config)
         if spec is None:
-            spec = MODEL_SPECS.get(self.config.model_config)
-        if spec is None:
-            raw = self.config.model_blueprint or {}
+            raw = model_blueprint or {}
             required = {
                 "name",
                 "hidden_size",
@@ -1003,8 +1330,15 @@ class TrainingOrchestrator:
                     "A blueprint without a known model.config must explicitly "
                     "define: " + ", ".join(missing)
                 )
-        defaults = self._default_blueprint_for_spec(spec)
-        return ModelBlueprint.from_dict(self.config.model_blueprint, defaults=defaults)
+        defaults = cls._default_blueprint_for_spec(spec)
+        return ModelBlueprint.from_dict(model_blueprint, defaults=defaults)
+
+    def _resolve_model_blueprint(self, spec=None):
+        # ``spec`` is accepted for backward compatibility; the public resolver
+        # intentionally takes the serializable config values as its source of truth.
+        return self.resolve_architecture_blueprint(
+            self.config.model_config, self.config.model_blueprint
+        )
 
     def _create_saddle_model(self, spec):
         if not self.config.model_blueprint:
@@ -1020,6 +1354,83 @@ class TrainingOrchestrator:
         blueprint = self._resolve_model_blueprint(spec)
         logger.info(f"Using SaddleLLM blueprint model: {blueprint.name}")
         return blueprint.build_model()
+
+    @staticmethod
+    def validate_pretrain_tokenizer_contract(model, tokenizer, append_eos: bool) -> Dict:
+        """Validate token IDs against model embeddings before reading the corpus."""
+        bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if append_eos and eos_token_id is None:
+            raise ValueError(
+                "data.append_eos=true requires a tokenizer with eos_token_id"
+            )
+
+        tokenizer_vocab_size = None
+        try:
+            tokenizer_vocab_size = len(tokenizer)
+        except (TypeError, AttributeError, NotImplementedError):
+            pass
+
+        model_vocab_size = getattr(getattr(model, "config", None), "vocab_size", None)
+        get_embeddings = getattr(model, "get_input_embeddings", None)
+        if callable(get_embeddings):
+            embeddings = get_embeddings()
+            embedding_rows = getattr(embeddings, "num_embeddings", None)
+            if isinstance(embedding_rows, int):
+                model_vocab_size = embedding_rows
+
+        if isinstance(model_vocab_size, int):
+            for label, token_id in (
+                ("bos_token_id", bos_token_id),
+                ("eos_token_id", eos_token_id),
+                ("pad_token_id", pad_token_id),
+            ):
+                if token_id is not None and not 0 <= int(token_id) < model_vocab_size:
+                    raise ValueError(
+                        f"Tokenizer {label}={token_id} is outside model vocab_size="
+                        f"{model_vocab_size}. Use the tokenizer that belongs to this model."
+                    )
+            if (
+                isinstance(tokenizer_vocab_size, int)
+                and tokenizer_vocab_size > model_vocab_size
+            ):
+                raise ValueError(
+                    f"Tokenizer vocabulary ({tokenizer_vocab_size}) exceeds model "
+                    f"embedding rows ({model_vocab_size}). Resize the model explicitly "
+                    "or use a compatible tokenizer before pretraining."
+                )
+
+        # Native scratch models are created before their tokenizer is loaded,
+        # so their config initially contains generic special-token defaults.
+        # Synchronize the validated IDs before checkpoints are written; this
+        # makes model.generate() use the correct stopping and padding tokens.
+        model_config = getattr(model, "config", None)
+        for field_name, token_id in (
+            ("bos_token_id", bos_token_id),
+            ("eos_token_id", eos_token_id),
+            ("pad_token_id", pad_token_id),
+        ):
+            if (
+                token_id is not None
+                and model_config is not None
+                and hasattr(model_config, field_name)
+            ):
+                setattr(model_config, field_name, int(token_id))
+
+        return {
+            "tokenizer_vocab_size": tokenizer_vocab_size,
+            "model_vocab_size": model_vocab_size,
+            "bos_token_id": bos_token_id,
+            "eos_token_id": eos_token_id,
+            "pad_token_id": pad_token_id,
+            "unused_embedding_rows": (
+                model_vocab_size - tokenizer_vocab_size
+                if isinstance(model_vocab_size, int)
+                and isinstance(tokenizer_vocab_size, int)
+                else None
+            ),
+        }
 
     def _resolve_exact_resume_checkpoint(self) -> Optional[str]:
         """Resolve and validate an exact Trainer checkpoint for native resume."""
@@ -1210,6 +1621,8 @@ class TrainingOrchestrator:
     def _pipeline_state_path(self) -> Path:
         requested = self.config.pipeline.state_path
         if not requested:
+            if self.config.backends.training == "megatron" and self.config.backends.megatron.nnodes > 1:
+                return Path(self._output_dir) / f"pipeline_state.node-{self.config.backends.megatron.node_rank}.json"
             return Path(self._output_dir) / "pipeline_state.json"
         path = Path(requested).expanduser()
         return path if path.is_absolute() else Path(self._output_dir) / path
@@ -1305,6 +1718,106 @@ class TrainingOrchestrator:
     # ========================================
     # Stage implementations
     # ========================================
+
+    def _run_decision_stage(self):
+        """Train, calibrate and evaluate a structured Choice model."""
+        from ..decision.config import decision_plan
+
+        plan = decision_plan(self.config)
+        if self.config.decision.task_type == "typed":
+            return self._run_typed_decision_stage(plan)
+        if not self.config.decision.enabled:
+            self._stage_results["decision"] = {"status": "skipped"}
+            return
+        if self.config.training.dry_run or self.config.training.preflight_only:
+            self._stage_results["decision"] = plan
+            return
+        import contextlib
+        import sys
+
+        import torch
+
+        from ..decision.training import ChoiceTrainingConfig, train_choice
+
+        cfg = self.config.decision
+        decision_plan(self.config, inspect_data=True)
+        device = cfg.encoder_device
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = cfg.encoder_dtype
+        if dtype == "auto":
+            dtype = "bfloat16" if device == "cuda" and torch.cuda.is_bf16_supported() else "float32"
+        root = Path(cfg.output_dir).expanduser()
+        if not root.is_absolute():
+            root = Path(self._output_dir) / root
+        # Completed runs can be skipped by pipeline.resume. Failed/repeated
+        # attempts get fresh directories, preserving existing trained artifacts.
+        root.mkdir(parents=True, exist_ok=True)
+        attempt = 1
+        destination = root / f"attempt-{attempt:03d}"
+        while destination.exists():
+            attempt += 1
+            destination = root / f"attempt-{attempt:03d}"
+        fields = ChoiceTrainingConfig.__dataclass_fields__
+        settings = ChoiceTrainingConfig(**{name: self.config.seed if name == "seed" else getattr(cfg, name) for name in fields})
+        with contextlib.redirect_stdout(sys.stderr):
+            report = train_choice(cfg.dataset_dir, plan["backbone"], destination,
+                                  config=settings, encoder_device=device, encoder_dtype=dtype)
+        model_path = str((destination / "model").resolve())
+        report_path = str((destination / "report.json").resolve())
+        self._stage_results["decision"] = {
+            "status": "completed", "type": "Choice", "method": "supervised",
+            "model_path": model_path, "report_path": report_path,
+            "output_dir": str(destination.resolve()), "backbone_bundled": False,
+            "counts": report["counts"], "best_epoch": report["selection"]["best_epoch"],
+            "metrics": {name: report["test"]["trained_calibrated"][name]
+                        for name in ("accuracy", "nll", "multiclass_brier", "top_label_ece")},
+            "artifacts": {
+                "model": {"kind": "decision_model", "path": model_path},
+                "evaluation": {"kind": "evaluation", "path": report_path},
+                "calibration": {"kind": "calibration", "path": str((destination / "model/calibration.json").resolve())},
+            },
+        }
+
+    def _run_typed_decision_stage(self, plan):
+        """Independent multitype decision stage; preserves the legacy Choice path."""
+        cfg = self.config.decision
+        if not cfg.enabled or self.config.training.dry_run or self.config.training.preflight_only:
+            self._stage_results["decision"] = plan
+            return
+        import contextlib
+        import sys
+        from ..decision.config import decision_plan
+        from ..decision.TypedSchema import TypedDecisionConfig
+        from ..decision.TypedTraining import TypedTrainingConfig, train_typed
+
+        decision_plan(self.config, inspect_data=True)
+        root = Path(cfg.output_dir).expanduser()
+        if not root.is_absolute():
+            root = Path(self._output_dir) / root
+        root.mkdir(parents=True, exist_ok=True)
+        attempt = 1
+        while (root / f"attempt-{attempt:03d}").exists():
+            attempt += 1
+        destination = root / f"attempt-{attempt:03d}"
+        fields = TypedTrainingConfig.__dataclass_fields__
+        settings = TypedTrainingConfig(**{name: self.config.seed if name == "seed" else getattr(cfg, name) for name in fields})
+        with contextlib.redirect_stdout(sys.stderr):
+            report = train_typed(cfg.dataset_dir, destination, model_config=TypedDecisionConfig(**plan["model_config"]),
+                                 config=settings, device=cfg.encoder_device, initial_model=cfg.initial_model)
+        model_path, report_path = str((destination / "model").resolve()), str((destination / "report.json").resolve())
+        metrics_split = "test" if cfg.evaluate_test else "validation"
+        metrics = report[metrics_split]["trained_calibrated" if cfg.evaluate_test else "trained_uncalibrated"]
+        self._stage_results["decision"] = {
+            "status": "completed", "type": "Typed", "supported_types": plan["supported_types"], "method": cfg.method,
+            "model_path": model_path, "report_path": report_path, "output_dir": str(destination.resolve()),
+            "backbone_bundled": True, "counts": report["counts"], "best_epoch": report["selection"]["best_epoch"],
+            "metrics": {key: metrics[key] for key in ("accuracy", "nll", "multiclass_brier", "top_label_ece")},
+            "metrics_split": metrics_split, "test_evaluated": cfg.evaluate_test,
+            "artifacts": {"model": {"kind": "decision_model", "path": model_path},
+                          "evaluation": {"kind": "evaluation", "path": report_path},
+                          "calibration": {"kind": "calibration", "path": str((destination / "model/calibration.json").resolve())}},
+        }
 
     def _run_media_cache_stage(self):
         """Build resumable raw-media caches for downstream generation stages."""
@@ -1485,14 +1998,29 @@ class TrainingOrchestrator:
 
     def _run_pretrain_stage(self):
         """Stage 2: pretrain model."""
+        from .PackingPolicy import apply_packing_attention, resolve_packing_attention
+
+        packing_backend = (
+            "megatron" if self.config.backends.training == "megatron" else self.config.model_backend
+        )
+        packing_attention = resolve_packing_attention(
+            self.config.data.packing_attention,
+            packing_backend,
+            self.config.data.pack_sequences,
+        )
+        if self.config.backends.training == "megatron":
+            return self._run_megatron_stage("pretrain")
         import torch
         from transformers import (
             TrainingArguments,
             Trainer,
-            DataCollatorForLanguageModeling,
         )
         from ..models.ModelRegistry import ModelRegistry, MODEL_SPECS
-        from ..data.pipeline import DataPipeline, PipelineConfig
+        from ..data.pipeline import (
+            CausalLMDataCollator,
+            DataPipeline,
+            PipelineConfig,
+        )
         from .DistributedConfig import DistributedConfig as DistCfg
         from .DistributedRuntime import distributed_barrier
 
@@ -1510,7 +2038,23 @@ class TrainingOrchestrator:
                 f"Unknown model config: {self.config.model_config}. Available: {list(MODEL_SPECS.keys())}"
             )
 
-        if spec is not None:
+        if (
+            self.config.model_backend == "saddle"
+            and self.config.model_blueprint
+            and not exact_resume_path
+            and self.config.pretrain_mode != "continue"
+        ):
+            blueprint = self._resolve_model_blueprint(spec)
+            logger.info(
+                "Self-contained model blueprint: %s (%s estimated params)",
+                blueprint.name,
+                blueprint.analyze()["total_params_human"],
+            )
+        elif (
+            spec is not None
+            and not exact_resume_path
+            and self.config.pretrain_mode != "continue"
+        ):
             logger.info(
                 f"Model spec: {spec.name} ({spec.human_params()} params, {spec.human_tokens()} target tokens)"
             )
@@ -1543,6 +2087,7 @@ class TrainingOrchestrator:
                 self.config.model_name_or_path,
                 dtype=continue_dtype,
                 trust_remote_code=True,
+                local_files_only=self.config.model_local_files_only,
             )
         else:
             logger.info(
@@ -1563,6 +2108,27 @@ class TrainingOrchestrator:
         logger.info(
             f"Parameters: total={total_params / 1e6:.1f}M, trainable={trainable_params / 1e6:.1f}M"
         )
+        if self.config.model_backend == "saddle" and hasattr(
+            getattr(self._model, "config", None), "loss_chunk_size"
+        ):
+            self._model.config.loss_chunk_size = int(
+                self.config.training.loss_chunk_size
+            )
+            if self.config.distributed.strategy == "deepspeed_zero3":
+                # Chunked CE accesses lm_head.weight directly, bypassing the
+                # module hooks ZeRO-3 uses to gather sharded parameters.
+                if self._model.config.loss_chunk_size:
+                    logger.warning(
+                        "Disabling chunked CE for DeepSpeed ZeRO-3 until its "
+                        "parameter-gather hooks are supported"
+                    )
+                self._model.config.loss_chunk_size = 0
+            if self._model.config.loss_chunk_size:
+                logger.info(
+                    "Training-only chunked linear cross entropy enabled: "
+                    "token_chunk_size=%d",
+                    self._model.config.loss_chunk_size,
+                )
 
         # 2. Load or create tokenizer
         if exact_resume_path:
@@ -1573,6 +2139,10 @@ class TrainingOrchestrator:
             )
         else:
             self._load_tokenizer()
+
+        tokenizer_contract = self.validate_pretrain_tokenizer_contract(
+            self._model, self._tokenizer, self.config.data.append_eos
+        )
 
         # 3. Prepare data
         if self._distributed_runtime.is_distributed and any(
@@ -1600,29 +2170,80 @@ class TrainingOrchestrator:
             ],
             source_weights=self.config.data.source_weights,
             output_dir=self.config.data.output_dir,
+            cache_dir=self.config.data.cache_dir,
             max_seq_length=self.config.data.max_seq_length,
             min_text_length=self.config.data.min_text_length,
             dedup_method=self.config.data.dedup_method,
             dedup_threshold=self.config.data.dedup_threshold,
+            quality_min_score=self.config.data.quality_min_score,
             lang_filter=self.config.data.lang_filter,
+            shuffle_seed=self.config.seed,
             num_proc=self.config.data.num_proc,
             pack_sequences=self.config.data.pack_sequences,
+            append_eos=self.config.data.append_eos,
+            split_ratios=[
+                1.0 - self.config.data.validation_split,
+                self.config.data.validation_split,
+            ]
+            if self.config.data.validation_split > 0
+            else [0.99, 0.01],
         )
 
         pipeline = DataPipeline(pipe_cfg)
         pipeline.collect().clean().deduplicate().filter_quality()
-        pipeline.tokenize_and_pack(self._tokenizer)
-        dataset = pipeline.to_iterable_dataset()
+        eval_dataset = None
+        if self.config.data.validation_split > 0:
+            raw_splits = pipeline.split(seed=self.config.seed)
+            train_pipeline = DataPipeline(pipe_cfg)
+            train_pipeline._dataset = raw_splits["train"]
+            train_pipeline.tokenize_and_pack(self._tokenizer)
+            dataset = train_pipeline.to_iterable_dataset()
+
+            eval_pipeline = DataPipeline(pipe_cfg)
+            eval_pipeline._dataset = raw_splits["val"]
+            eval_pipeline.tokenize_and_pack(self._tokenizer)
+            eval_dataset = eval_pipeline.to_iterable_dataset()
+            train_sequences = train_pipeline.cardinality()
+            validation_sequences = eval_pipeline.cardinality()
+        else:
+            pipeline.tokenize_and_pack(self._tokenizer)
+            dataset = pipeline.to_iterable_dataset()
+            train_sequences = pipeline.cardinality()
+            validation_sequences = None
+
+        if train_sequences == 0:
+            raise ValueError(
+                "No pretraining sequences remain after cleaning, filtering, "
+                "tokenization, and packing. Inspect the corpus thresholds and text column."
+            )
+        dataset = apply_packing_attention(dataset, packing_attention)
+        if eval_dataset is not None:
+            eval_dataset = apply_packing_attention(eval_dataset, packing_attention)
+        logger.info("Pretraining packing attention policy: %s", packing_attention)
+        if eval_dataset is not None and validation_sequences == 0:
+            raise ValueError(
+                "The validation split produced no tokenized pretraining sequences. "
+                "Increase the corpus or validation_split, or reduce max_seq_length."
+            )
 
         # 4. Build training arguments
-        grad_accum = self.config.distributed.gradient_accumulation_steps or max(
+        world_size = max(
             1,
-            self.config.training.global_batch_size
-            // (
-                self.config.training.per_device_batch_size
-                * max(1, self.config.distributed.num_gpus)
-            ),
+            self.config.distributed.num_gpus * self.config.distributed.num_nodes,
         )
+        micro_global_batch = self.config.training.per_device_batch_size * world_size
+        explicit_grad_accum = self.config.distributed.gradient_accumulation_steps
+        if explicit_grad_accum is None:
+            if self.config.training.global_batch_size % micro_global_batch != 0:
+                raise ValueError(
+                    "training.global_batch_size must be divisible by "
+                    "per_device_batch_size * num_gpus * num_nodes; got "
+                    f"{self.config.training.global_batch_size} and {micro_global_batch}"
+                )
+            grad_accum = self.config.training.global_batch_size // micro_global_batch
+        else:
+            grad_accum = explicit_grad_accum
+        actual_global_batch = micro_global_batch * grad_accum
         dist_cfg = DistCfg(
             strategy=self.config.distributed.strategy,
             num_gpus=self.config.distributed.num_gpus,
@@ -1630,7 +2251,30 @@ class TrainingOrchestrator:
             gradient_accumulation_steps=grad_accum,
             bf16=self.config.distributed.bf16,
             fp16=self.config.distributed.fp16,
+            tf32=self.config.distributed.tf32,
             zero_offload_to_cpu=self.config.distributed.zero_offload_to_cpu,
+            zero_offload_to_nvme=self.config.distributed.zero_offload_to_nvme,
+            zero_nvme_path=self.config.distributed.zero_nvme_path,
+            zero_overlap_comm=self.config.distributed.zero_overlap_comm,
+            zero_contiguous_gradients=(
+                self.config.distributed.zero_contiguous_gradients
+            ),
+            zero_reduce_scatter=self.config.distributed.zero_reduce_scatter,
+            zero_allgather_partitions=(
+                self.config.distributed.zero_allgather_partitions
+            ),
+            zero_offload_pin_memory=(
+                self.config.distributed.zero_offload_pin_memory
+            ),
+            zero_stage3_prefetch_bucket_size=(
+                self.config.distributed.zero_stage3_prefetch_bucket_size
+            ),
+            zero_reduce_bucket_size=(
+                self.config.distributed.zero_reduce_bucket_size
+            ),
+            zero_allgather_bucket_size=(
+                self.config.distributed.zero_allgather_bucket_size
+            ),
             deepspeed_config_path=self.config.distributed.deepspeed_config_path,
             ddp_backend=self.config.distributed.ddp_backend,
         )
@@ -1643,12 +2287,33 @@ class TrainingOrchestrator:
         ):
             dist_args.pop(duplicate_key, None)
 
+        scheduler_type = self.config.training.lr_scheduler
+        scheduler_kwargs = None
+        if scheduler_type == "cosine" and self.config.training.min_lr > 0:
+            scheduler_type = "cosine_with_min_lr"
+            scheduler_kwargs = {"min_lr": self.config.training.min_lr}
+
+        has_eval = eval_dataset is not None
+        load_best = bool(
+            has_eval and self.config.training.load_best_model_at_end
+        )
+        if load_best and (
+            self.config.training.save_every_steps
+            % self.config.training.eval_every_steps
+            != 0
+        ):
+            raise ValueError(
+                "training.save_every_steps must be a multiple of "
+                "training.eval_every_steps when load_best_model_at_end=true"
+            )
+
         training_args = TrainingArguments(
             output_dir=os.path.join(self._output_dir, "checkpoints"),
             per_device_train_batch_size=self.config.training.per_device_batch_size,
             gradient_accumulation_steps=grad_accum,
             learning_rate=self.config.training.learning_rate,
-            lr_scheduler_type=self.config.training.lr_scheduler,
+            lr_scheduler_type=scheduler_type,
+            lr_scheduler_kwargs=scheduler_kwargs,
             warmup_steps=self.config.training.warmup_steps,
             max_steps=self.config.training.max_steps,
             weight_decay=self.config.training.weight_decay,
@@ -1657,12 +2322,31 @@ class TrainingOrchestrator:
             logging_steps=self.config.training.log_every_steps,
             save_steps=self.config.training.save_every_steps,
             eval_steps=self.config.training.eval_every_steps,
+            eval_strategy="steps" if has_eval else "no",
+            per_device_eval_batch_size=self.config.training.per_device_batch_size,
+            prediction_loss_only=True,
+            load_best_model_at_end=load_best,
+            metric_for_best_model="eval_loss" if load_best else None,
+            greater_is_better=False if load_best else None,
             save_total_limit=self.config.training.keep_last_n_checkpoints,
             bf16=self.config.distributed.bf16,
             fp16=self.config.distributed.fp16,
             gradient_checkpointing=self.config.training.gradient_checkpointing,
             dataloader_num_workers=self.config.training.dataloader_num_workers,
+            dataloader_pin_memory=self.config.training.dataloader_pin_memory,
+            dataloader_persistent_workers=bool(
+                self.config.training.dataloader_persistent_workers
+                and self.config.training.dataloader_num_workers > 0
+            ),
+            dataloader_prefetch_factor=(
+                self.config.training.dataloader_prefetch_factor
+                if self.config.training.dataloader_num_workers > 0
+                else None
+            ),
             seed=self.config.seed,
+            data_seed=self.config.seed,
+            include_num_input_tokens_seen=True,
+            include_tokens_per_second=True,
             report_to=[self.config.logging.logging_backend]
             if self.config.logging.logging_backend != "local"
             else ["none"],
@@ -1671,9 +2355,7 @@ class TrainingOrchestrator:
         )
 
         # 5. Train
-        data_collator = DataCollatorForLanguageModeling(
-            tokenizer=self._tokenizer, mlm=False
-        )
+        data_collator = CausalLMDataCollator(tokenizer=self._tokenizer)
         callbacks = []
         if self.config.training.stability_monitor:
             from ..experiments.PretrainStability import PretrainStabilityCallback, StabilityConfig
@@ -1711,6 +2393,7 @@ class TrainingOrchestrator:
             model=self._model,
             args=training_args,
             train_dataset=dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             callbacks=callbacks,
         )
@@ -1718,12 +2401,30 @@ class TrainingOrchestrator:
         logger.info(
             f"Starting pretraining: {self.config.training.max_steps} steps, "
             f"batch_size={self.config.training.per_device_batch_size}, "
-            f"grad_accum={grad_accum}"
+            f"grad_accum={grad_accum}, global_batch={actual_global_batch}, "
+            f"validation_split={self.config.data.validation_split:.2%}"
         )
 
-        trainer.train(
-            resume_from_checkpoint=self.config.training.resume_from_checkpoint
+        trainer_resume_checkpoint = exact_resume_path
+        if self.config.model_backend != "saddle":
+            trainer_resume_checkpoint = resolve_trainer_resume_checkpoint(
+                self.config.training.resume_from_checkpoint,
+                os.path.join(self._output_dir, "checkpoints"),
+            )
+        validate_resume_training_args(trainer_resume_checkpoint, training_args)
+        train_output = trainer.train(
+            resume_from_checkpoint=trainer_resume_checkpoint
         )
+
+        eval_metrics = trainer.evaluate() if has_eval else {}
+        eval_loss = eval_metrics.get("eval_loss")
+        validation_perplexity = None
+        if eval_loss is not None:
+            validation_perplexity = (
+                math.exp(float(eval_loss))
+                if float(eval_loss) < math.log(float("1e308"))
+                else float("inf")
+            )
 
         # 6. Save
         final_path = os.path.join(self._output_dir, "final_model")
@@ -1738,15 +2439,40 @@ class TrainingOrchestrator:
             "model_path": final_path,
             "steps": self.config.training.max_steps,
             "global_step": int(trainer.state.global_step),
+            "gradient_accumulation_steps": grad_accum,
+            "actual_global_batch_size": actual_global_batch,
+            "validation_split": self.config.data.validation_split,
+            "train_sequences": train_sequences,
+            "validation_sequences": validation_sequences,
+            "data_pipeline_stats": pipeline.stats,
+            "packing_attention": packing_attention,
+            "tokenizer_contract": tokenizer_contract,
+            "validation_loss": float(eval_loss) if eval_loss is not None else None,
+            "validation_perplexity": validation_perplexity,
+            "best_model_checkpoint": trainer.state.best_model_checkpoint,
+            "best_validation_loss": trainer.state.best_metric,
+            "precision": "bf16"
+            if training_args.bf16
+            else "fp16"
+            if training_args.fp16
+            else "fp32",
+            "train_metrics": metric_snapshot(train_output.metrics),
+            "latest_train_metrics": latest_train_metrics(
+                getattr(trainer.state, "log_history", [])
+            ),
+            "eval_metrics": metric_snapshot(eval_metrics),
+            "scheduler": scheduler_type,
+            "min_lr": self.config.training.min_lr,
             "continuation": "weights_only"
             if self.config.pretrain_mode == "continue"
             else "scratch_or_exact_resume",
             "resume_from_checkpoint": self.config.training.resume_from_checkpoint
             or None,
+            "resumed_from_checkpoint": trainer_resume_checkpoint,
             "total_params": total_params,
-            "estimated_params": spec.estimated_params
-            if spec is not None
-            else total_params,
+            # The constructed model is authoritative.  A model blueprint can
+            # deliberately override every size field of a registry preset.
+            "estimated_params": total_params,
         }
         distributed_barrier()
 
@@ -1770,10 +2496,15 @@ class TrainingOrchestrator:
 
     def _write_stage_plan(self, stage: str, payload: Dict) -> Dict:
         stage_dir = os.path.join(self._output_dir, "plans")
-        os.makedirs(stage_dir, exist_ok=True)
         path = os.path.join(stage_dir, f"{stage}_plan.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        runtime = getattr(self, "_distributed_runtime", None)
+        if runtime is None or runtime.is_main_process:
+            os.makedirs(stage_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        from .DistributedRuntime import distributed_barrier
+
+        distributed_barrier()
         return {"path": path, "payload": payload}
 
     def _estimate_stage_training(
@@ -1800,6 +2531,9 @@ class TrainingOrchestrator:
             logger.info("SFT is disabled; skipping")
             return
 
+        if self.config.backends.training == "megatron":
+            return self._run_megatron_stage("sft")
+
         logger.info("Starting SFT stage")
 
         model_path = (
@@ -1815,6 +2549,15 @@ class TrainingOrchestrator:
         dataset_path = sft_cfg.data_path or self._stage_results.get("mopd", {}).get(
             "data_path"
         )
+        if (
+            not sft_cfg.data_path
+            and dataset_path
+            and self.config.mopd.requires_review
+        ):
+            raise ValueError(
+                "MOPD teacher data is marked requires_review; have a domain expert "
+                "correct it, then pass the reviewed file as sft.data_path."
+            )
         if not dataset_path:
             raise ValueError(
                 "SFT requires sft.data_path or a completed upstream MOPD stage with data_path"
@@ -1868,11 +2611,25 @@ class TrainingOrchestrator:
                         eval_steps=sft_cfg.eval_steps,
                         logging_steps=sft_cfg.logging_steps,
                         validation_split=sft_cfg.validation_split,
+                        validation_dataset_path=sft_cfg.validation_data_path,
+                        replay_data_path=sft_cfg.replay_data_path,
+                        replay_ratio=sft_cfg.replay_ratio,
+                        replay_count=sft_cfg.replay_count,
+                        reference_model_path=sft_cfg.reference_model_path,
+                        retention_kl_weight=sft_cfg.retention_kl_weight,
+                        retention_temperature=sft_cfg.retention_temperature,
+                        load_best_model_at_end=sft_cfg.load_best_model_at_end,
+                        save_total_limit=self.config.logging.save_total_limit,
                         gradient_checkpointing=sft_cfg.gradient_checkpointing,
                         report_to=self.config.logging.logging_backend
                         if self.config.logging.logging_backend != "local"
                         else "none",
                         seed=self.config.seed,
+                        ddp_backend=(
+                            None
+                            if self.config.distributed.ddp_backend == "auto"
+                            else self.config.distributed.ddp_backend
+                        ),
                     )
                 )
             else:
@@ -1899,6 +2656,16 @@ class TrainingOrchestrator:
                     eval_steps=sft_cfg.eval_steps,
                     logging_steps=sft_cfg.logging_steps,
                     validation_split=sft_cfg.validation_split,
+                    validation_dataset_path=sft_cfg.validation_data_path,
+                    replay_data_path=sft_cfg.replay_data_path,
+                    replay_ratio=sft_cfg.replay_ratio,
+                    replay_count=sft_cfg.replay_count,
+                    reference_model_path=sft_cfg.reference_model_path,
+                    retention_kl_weight=sft_cfg.retention_kl_weight,
+                    retention_temperature=sft_cfg.retention_temperature,
+                    seed=self.config.seed,
+                    load_best_model_at_end=sft_cfg.load_best_model_at_end,
+                    save_total_limit=self.config.logging.save_total_limit,
                     response_template=sft_cfg.response_template,
                     gradient_checkpointing=sft_cfg.gradient_checkpointing,
                     optim=sft_cfg.optim,
@@ -1908,6 +2675,12 @@ class TrainingOrchestrator:
                     if self.config.logging.logging_backend != "local"
                     else "none",
                     resume_from_checkpoint=self.config.training.resume_from_checkpoint,
+                    precision=sft_cfg.precision,
+                    ddp_backend=(
+                        None
+                        if self.config.distributed.ddp_backend == "auto"
+                        else self.config.distributed.ddp_backend
+                    ),
                 )
             self._stage_results["sft"] = {
                 "status": "completed",
@@ -1944,7 +2717,8 @@ class TrainingOrchestrator:
         )
 
         model_path = (
-            self._stage_results.get("sft", {}).get("model_path")
+            self._stage_results.get("rlhf", {}).get("model_path")
+            or self._stage_results.get("sft", {}).get("model_path")
             or self._stage_results.get("pretrain", {}).get("model_path")
             or self.config.model_name_or_path
         )
@@ -2005,12 +2779,20 @@ class TrainingOrchestrator:
                     save_steps=pref_cfg.save_steps,
                     logging_steps=pref_cfg.logging_steps,
                     validation_split=pref_cfg.validation_split,
+                    validation_dataset_path=pref_cfg.validation_data_path,
+                    load_best_model_at_end=pref_cfg.load_best_model_at_end,
+                    save_total_limit=self.config.logging.save_total_limit,
                     eval_steps=pref_cfg.eval_steps,
                     gradient_checkpointing=pref_cfg.gradient_checkpointing,
                     report_to=pref_cfg.report_to
                     if pref_cfg.report_to != "local"
                     else "none",
                     seed=self.config.seed,
+                    ddp_backend=(
+                        None
+                        if self.config.distributed.ddp_backend == "auto"
+                        else self.config.distributed.ddp_backend
+                    ),
                 )
             )
         else:
@@ -2034,11 +2816,15 @@ class TrainingOrchestrator:
                     lora_r=pref_cfg.lora_r,
                     lora_alpha=pref_cfg.lora_alpha,
                     lora_dropout=pref_cfg.lora_dropout,
+                    lora_target_modules=pref_cfg.lora_target_modules,
                     gradient_accumulation_steps=pref_cfg.gradient_accumulation_steps,
                     warmup_steps=pref_cfg.warmup_steps,
                     save_steps=pref_cfg.save_steps,
                     logging_steps=pref_cfg.logging_steps,
                     validation_split=pref_cfg.validation_split,
+                    validation_dataset_path=pref_cfg.validation_data_path,
+                    load_best_model_at_end=pref_cfg.load_best_model_at_end,
+                    save_total_limit=self.config.logging.save_total_limit,
                     eval_steps=pref_cfg.eval_steps,
                     local_files_only=pref_cfg.local_files_only,
                     trust_remote_code=pref_cfg.trust_remote_code,
@@ -2047,6 +2833,12 @@ class TrainingOrchestrator:
                     if pref_cfg.report_to != "local"
                     else "none",
                     resume_from_checkpoint=self.config.training.resume_from_checkpoint,
+                    precision=pref_cfg.precision,
+                    ddp_backend=(
+                        None
+                        if self.config.distributed.ddp_backend == "auto"
+                        else self.config.distributed.ddp_backend
+                    ),
                 )
             )
         self._stage_results["preference"] = {
@@ -2169,23 +2961,34 @@ class TrainingOrchestrator:
             }
             return
 
+        reason = (
+            "PPO execution is not wired into the stable SaddleLLM pipeline. "
+            "It requires an explicit reward model, value model, rollout policy, "
+            "and safety-tested reward contract."
+        )
         self._stage_results["rlhf"] = {
             "status": "planned_unsupported",
             "method": rlhf_cfg.method,
             "data_path": rlhf_cfg.data_path,
             "plan_path": plan["path"],
             "data_inspection": data_inspection,
-            "reason": "PPO requires reward-model scoring and rollout-specific TRL wiring; use preference/dpo for stable offline RLHF.",
+            "reason": reason,
         }
-        return
+        raise NotImplementedError(reason)
 
-    def _run_multimodal_stage(self):
+    def _run_vision_alignment_stage(self):
+        """Keep alignment results and files under their actual stage name."""
+        self._run_multimodal_stage(stage="vision_alignment")
+
+    def _run_multimodal_stage(self, *, stage: str = "mllm_sft"):
         """Materialize multimodal/VLM training plans and normalized data."""
         cfg = self.config.multimodal
         output_dir = os.path.join(self._output_dir, "multimodal")
+        if stage != "mllm_sft":
+            output_dir = os.path.join(output_dir, stage)
         os.makedirs(output_dir, exist_ok=True)
         plan = {
-            "stage": cfg.stage,
+            "stage": stage,
             "status": "planned",
             "data_path": cfg.data_path,
             "image_root": cfg.image_root,
@@ -2209,12 +3012,12 @@ class TrainingOrchestrator:
         if cfg.data_path and os.path.exists(cfg.data_path):
             from ..multimodal.MultimodalData import MultimodalDataAdapter
 
-            normalized_path = os.path.join(output_dir, "mllm_sft_normalized.jsonl")
+            normalized_path = os.path.join(output_dir, f"{stage}_normalized.jsonl")
             report = MultimodalDataAdapter.normalize_file(
                 cfg.data_path,
                 normalized_path,
                 image_root=cfg.image_root,
-                task="mllm_sft",
+                task=stage,
             )
             plan["normalized_data_path"] = normalized_path
             plan["normalization_report"] = report.to_dict()
@@ -2226,7 +3029,7 @@ class TrainingOrchestrator:
         plan_path = os.path.join(output_dir, "multimodal_training_plan.json")
         with open(plan_path, "w", encoding="utf-8") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)
-        self._stage_results["mllm_sft"] = {
+        self._stage_results[stage] = {
             "status": plan["status"],
             "plan_path": plan_path,
             "normalized_data_path": plan.get("normalized_data_path"),
@@ -2866,6 +3669,33 @@ class TrainingOrchestrator:
             "train_result": train_result,
         }
 
+    def _run_megatron_stage(self, stage):
+        from .MegatronBackend import MegatronTrainingBackend
+
+        dataset = None
+        if stage == "sft":
+            dataset = self.config.sft.data_path or self._stage_results.get("mopd", {}).get("data_path")
+            if dataset and not self.config.sft.data_path and self.config.mopd.requires_review:
+                raise ValueError("MOPD data requires review; supply reviewed sft.data_path")
+        pretrain = self._stage_results.get("pretrain", {})
+        source = pretrain.get("model_path") or pretrain.get("checkpoint_path") or self.config.model_name_or_path
+        # A prior native rollout can hold a policy on the parent GPU. Drop the
+        # orchestrator's own reference before allocating distributed workers.
+        if self._model is not None and not (self.config.training.dry_run or self.config.training.preflight_only):
+            import gc
+            import torch
+            self._model = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        self._stage_results[stage] = MegatronTrainingBackend(self.config.backends.megatron).run(
+            stage, os.path.join(self._output_dir, f"megatron_{stage}"),
+            dry_run=self.config.training.dry_run or self.config.training.preflight_only,
+            pretrain_mode=self.config.pretrain_mode, model_path=source,
+            sft_data_path=dataset,
+            validation_data_path=self.config.sft.validation_data_path if stage == "sft" else None,
+        )
+
     def _run_mopd_stage(self):
         """Materialize or collect MOPD-style on-policy distillation data."""
         cfg = self.config.mopd
@@ -2876,7 +3706,9 @@ class TrainingOrchestrator:
         )
         os.makedirs(output_dir, exist_ok=True)
         prompts = self._load_mopd_prompts(cfg.prompts_path)
-        if not cfg.dry_run and prompts:
+        dry_run = cfg.dry_run or self.config.training.dry_run or self.config.training.preflight_only
+        use_sglang = self.config.backends.rollout == "sglang"
+        if not dry_run and prompts and not use_sglang:
             self._ensure_policy_model_loaded()
 
         from ..distillation.OnPolicyDistillation import (
@@ -2891,7 +3723,7 @@ class TrainingOrchestrator:
                 domain=t.get("domain", "general"),
                 weight=float(t.get("weight", 1.0)),
                 instruction=t.get("instruction", ""),
-                teacher=None if cfg.dry_run else self._build_mopd_teacher(t),
+                teacher=None if dry_run else self._build_mopd_teacher(t),
             )
             for idx, t in enumerate(cfg.teachers or [])
         ]
@@ -2907,30 +3739,72 @@ class TrainingOrchestrator:
             max_new_tokens=cfg.max_new_tokens,
             student_temperature=cfg.student_temperature,
             teacher_temperature=cfg.teacher_temperature,
+            teacher_max_tokens=cfg.max_new_tokens,
+            teacher_concurrency=cfg.teacher_concurrency,
             aggregation=cfg.aggregation,
             output_dir=output_dir,
+            requires_review=cfg.requires_review,
         )
+        backend = None
+        rollout_samples = []
+        rollout_fn = None
+        if use_sglang and not dry_run and prompts:
+            from ..runtime.RolloutBackend import create_rollout_backend
+            backend = create_rollout_backend(self.config.backends)
+
+            def rollout_fn(items, params):
+                collected = []
+                limit = backend.config.max_pending_requests
+                for start in range(0, len(items), limit):
+                    collected.extend(backend.generate(items[start:start + limit], params))
+                rollout_samples.extend(collected)
+                return [sample.text for sample in collected]
+
         distiller = MultiTeacherOnPolicyDistiller(
-            teachers=teacher_specs,
-            student_model=self._model,
-            student_tokenizer=self._tokenizer,
-            config=mopd_config,
+            teachers=teacher_specs, student_model=self._model,
+            student_tokenizer=self._tokenizer, rollout_fn=rollout_fn, config=mopd_config,
         )
         plan = distiller.planning_summary()
-        plan["dry_run"] = cfg.dry_run
+        plan["dry_run"] = dry_run
+        plan["rollout_backend"] = self.config.backends.rollout
         plan["prompts_path"] = cfg.prompts_path
+        plan["requires_review"] = cfg.requires_review
 
-        if cfg.dry_run or not prompts:
+        if dry_run or not prompts:
             plan["status"] = "planned_no_collection" if not prompts else "planned"
             if not prompts:
                 plan["warnings"] = [
                     "No prompts_path found; wrote planning artifacts only."
                 ]
         else:
-            records = distiller.collect(prompts)
-            data_path = distiller.save_jsonl(
-                os.path.join(output_dir, "mopd_on_policy.jsonl"), records
-            )
+            try:
+                if backend is not None:
+                    source = (
+                        self._stage_results.get("sft", {}).get("model_path")
+                        or self._stage_results.get("pretrain", {}).get("model_path")
+                        or backend.config.model_path or self.config.model_name_or_path
+                    )
+                    if backend.config.refresh_weights:
+                        version = backend.config.policy_version
+                        upstream = self._stage_results.get("sft", {}) or self._stage_results.get("pretrain", {})
+                        if upstream.get("run_id"):
+                            version = f"{version}:{upstream['run_id']}"
+                        backend.prepare_policy(source, version)
+                    elif backend.config.mode == "engine" and not backend.config.model_path:
+                        backend.config.model_path = source
+                records = distiller.collect(prompts)
+                if rollout_samples:
+                    from dataclasses import asdict
+                    for record, sample in zip(records, rollout_samples):
+                        record["student_rollout"] = asdict(sample)
+                        record["metadata"]["rollout_backend"] = sample.backend
+                        record["metadata"]["policy_version"] = sample.policy_version
+                data_path = distiller.save_jsonl(
+                    os.path.join(output_dir, "mopd_on_policy.jsonl"), records
+                )
+            finally:
+                if backend is not None:
+                    backend.close()
             plan["status"] = "completed"
             plan["num_records"] = len(records)
             plan["data_path"] = data_path
@@ -2942,6 +3816,7 @@ class TrainingOrchestrator:
             "status": plan["status"],
             "plan_path": plan_path,
             "data_path": plan.get("data_path"),
+            "rollout_backend": self.config.backends.rollout,
         }
 
     def _ensure_policy_model_loaded(self):
@@ -2996,6 +3871,7 @@ class TrainingOrchestrator:
             return TeacherInterface(
                 model_type="endpoint",
                 model_name=model,
+                api_key=api_key,
                 endpoint_url=raw.get("endpoint_url"),
             )
         raise ValueError(f"Unsupported MOPD teacher provider: {provider}")
@@ -3045,6 +3921,11 @@ class TrainingOrchestrator:
                 prompts = [line.strip() for line in f if line.strip()]
         return prompts
 
+    def _run_quantization_stage(self):
+        from ..compression.QuantizationStage import run_quantization_stage
+
+        run_quantization_stage(self)
+
     def _run_eval_stage(self):
         """Stage 5: evaluate model."""
         if not self.config.eval.enabled:
@@ -3052,30 +3933,57 @@ class TrainingOrchestrator:
 
         logger.info("Starting evaluation stage")
 
-        from ..evaluation.LLModelEvalute import Evaluator
+        from ..compression.QuantizationStage import latest_language_model_path
 
-        model_path = (
-            self._stage_results.get("rlhf", {}).get("model_path")
-            or self._stage_results.get("preference", {}).get("model_path")
-            or self._stage_results.get("sft", {}).get("model_path")
-            or self._stage_results.get("pretrain", {}).get("model_path")
-            or self.config.model_name_or_path
-        )
+        model_path = latest_language_model_path(self) or next(iter(self.config.eval.checkpoint_candidates), None)
         if not model_path:
             raise ValueError(
                 "Evaluation requires model.name_or_path or an upstream trained model."
             )
 
-        # Basic evaluation, such as perplexity.
+        cfg = self.config.eval
+        output_path = cfg.output_path or os.path.join(self._output_dir, "eval", "evaluation_results.json")
+        if cfg.regression_suite:
+            return self._run_regression_eval(model_path, output_path)
+        if self._stage_results.get("quantize", {}).get("status") == "planned" and (
+            self.config.training.dry_run or self.config.training.preflight_only
+        ):
+            self._stage_results["eval"] = {
+                "status": "planned", "model": model_path,
+                "output": os.path.abspath(output_path), "task": cfg.task or "legacy",
+            }
+            return
         try:
-            evaluator = Evaluator()
-            results = evaluator.evaluate(
-                model_path=model_path,
-                dataset=self.config.eval.eval_dataset,
-                dataset_config=self.config.eval.eval_dataset_config,
-                metrics=self.config.eval.tasks,
-                max_samples=self.config.eval.max_samples,
-            )
+            if cfg.task in {None, "legacy"}:
+                from ..evaluation.LLModelEvalute import Evaluator
+
+                results = Evaluator().evaluate(
+                    model_path=model_path, dataset=cfg.eval_dataset,
+                    dataset_config=cfg.eval_dataset_config, metrics=cfg.tasks,
+                    max_samples=cfg.max_samples, split=cfg.split,
+                )
+                if not results.get("model_identity") and not results.get("error"):
+                    from ..evaluation.ModelIdentity import compute_model_identity
+
+                    results["model_identity"] = compute_model_identity(model_path)
+                results.setdefault("data_split", cfg.split)
+                results["output"] = os.path.abspath(output_path)
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(output_path, "w", encoding="utf-8") as handle:
+                    json.dump(results, handle, ensure_ascii=False, indent=2)
+            else:
+                from ..evaluation.EvaluationRunner import evaluation_metrics, run_evaluation
+
+                option_names = (
+                    "adapter", "prompt_field", "question_field", "answer_field", "completion_field", "rubric_field", "reference_field", "id_field", "group_field", "case_field", "variant_field", "prompt_variants", "choices", "batch_size", "max_length", "max_new_tokens", "generation_samples", "generation_all", "generation_indices", "device", "dtype", "enable_thinking", "trust_remote_code", "local_files_only", "endpoint", "api_key_env", "pass_threshold", "request_timeout", "repetition_penalty", "no_repeat_ngram_size",
+                )
+                results = run_evaluation(
+                    model_path, cfg.eval_dataset, task=cfg.task, split=cfg.split,
+                    output=output_path, markdown_output=cfg.markdown_output,
+                    limit=cfg.max_samples,
+                    **{name: getattr(cfg, name) for name in option_names},
+                )
+                results["metrics"] = evaluation_metrics(results)
             if results.get("error"):
                 raise RuntimeError(str(results["error"]))
             logger.info(
@@ -3083,7 +3991,11 @@ class TrainingOrchestrator:
             )
         except Exception as e:
             logger.warning(f"Evaluation failed: {e}")
-            self._stage_results["eval"] = {"status": "failed", "error": str(e)}
+            failure = {"status": "failed", "error": str(e), "task": cfg.task or "legacy", "model": model_path, "dataset": cfg.eval_dataset, "data_split": cfg.split}
+            self._stage_results["eval"] = failure
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w", encoding="utf-8") as handle:
+                json.dump(failure, handle, ensure_ascii=False, indent=2)
             if self.config.eval.fail_on_error:
                 raise
             return
@@ -3100,12 +4012,18 @@ class TrainingOrchestrator:
         gate_path = gate_config.output_path or os.path.join(
             self._output_dir, "release_gate.json"
         )
-        gate.save(gate_path)
         gate_payload = gate.to_dict()
+        evaluated_artifact = cfg.adapter or model_path
+        gate_payload["model"] = self._model_source_identity(evaluated_artifact)
+        gate_payload["model_identity"] = results.get("model_identity")
+        Path(gate_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(gate_path, "w", encoding="utf-8") as handle:
+            json.dump(gate_payload, handle, ensure_ascii=False, indent=2)
         stage_status = "completed" if gate.accepted else "rejected"
         self._stage_results["eval"] = {
-            "status": stage_status,
             **results,
+            "status": stage_status,
+            "model": evaluated_artifact,
             "release_gate": gate_payload,
             "release_gate_path": os.path.abspath(gate_path),
         }
@@ -3127,13 +4045,22 @@ class TrainingOrchestrator:
             }
             return
 
+        from ..compression.QuantizationStage import latest_language_model_path
+
+        gate_required = bool(
+            export_config.require_gate
+            or self.config.eval.gate.enabled
+            or self.config.eval.regression_suite
+        )
         model_path = (
             export_config.model_path
-            or self._stage_results.get("rlhf", {}).get("model_path")
-            or self._stage_results.get("preference", {}).get("model_path")
-            or self._stage_results.get("sft", {}).get("model_path")
-            or self._stage_results.get("pretrain", {}).get("model_path")
-            or self.config.model_name_or_path
+            or self._stage_results.get("eval", {}).get("selected_checkpoint")
+            or (
+                self.config.eval.adapter
+                if self.config.eval.regression_suite or self.config.eval.gate.enabled
+                else None
+            )
+            or latest_language_model_path(self)
         )
         if not model_path:
             raise ValueError(
@@ -3144,15 +4071,54 @@ class TrainingOrchestrator:
         gate_payload = (
             eval_result.get("release_gate") if isinstance(eval_result, dict) else None
         )
-        gate_was_accepted = bool(gate_payload and gate_payload.get("accepted"))
-        if self.config.eval.gate.enabled and not gate_was_accepted:
+        from ..evaluation.ReleaseGate import release_gate_accepted
+
+        gate_was_accepted = release_gate_accepted(gate_payload)
+        from ..models.ModelLoader import is_packaged_quantized_checkpoint
+
+        quantized_path = self._stage_results.get("quantize", {}).get("model_path")
+        quantized_source = bool(quantized_path and (
+            self._model_source_identity(quantized_path) == self._model_source_identity(model_path)
+        )) or is_packaged_quantized_checkpoint(model_path)
+        regression_planning = bool(self.config.eval.regression_suite or quantized_source) and (self.config.training.dry_run or self.config.training.preflight_only)
+        if (self.config.eval.gate.enabled or self.config.eval.regression_suite) and not gate_was_accepted and not regression_planning:
             message = "Export blocked because the enabled evaluation release gate was not accepted."
             self._stage_results["export"] = {"status": "blocked", "error": message}
             raise RuntimeError(message)
-        if export_config.require_gate and not gate_was_accepted:
+        if export_config.require_gate and not gate_was_accepted and not regression_planning:
             message = "Export requires an accepted evaluation release gate."
             self._stage_results["export"] = {"status": "blocked", "error": message}
             raise RuntimeError(message)
+
+        if gate_was_accepted:
+            # Older pipeline results keep the model beside the gate payload.
+            evaluated_model = gate_payload.get("model") or eval_result.get("model")
+            matches_model = bool(evaluated_model) and (
+                self._model_source_identity(evaluated_model)
+                == self._model_source_identity(model_path)
+            )
+            if not matches_model:
+                if gate_required:
+                    message = (
+                        "Export blocked because the evaluated model does not match "
+                        "the export source. Run eval on the model being exported."
+                    )
+                    self._stage_results["export"] = {"status": "blocked", "error": message}
+                    raise RuntimeError(message)
+                # Optional exports remain allowed without claiming another model's gate.
+                gate_payload = None
+
+        if gate_required and not regression_planning:
+            from ..evaluation.ModelIdentity import (
+                compute_model_identity,
+                verify_gate_model,
+            )
+
+            try:
+                verify_gate_model(gate_payload, compute_model_identity(model_path), required=True)
+            except ValueError as exc:
+                self._stage_results["export"] = {"status": "blocked", "error": str(exc)}
+                raise
 
         output_dir = export_config.output_dir or os.path.join(
             self._output_dir, "release"
@@ -3166,9 +4132,10 @@ class TrainingOrchestrator:
                 "merge_lora": (
                     export_config.merge_lora
                     if export_config.merge_lora is not None
-                    else self.config.model_backend != "saddle"
+                    else self.config.model_backend != "saddle" and not quantized_source
                 ),
                 "gate": gate_payload,
+                "gate_pending": regression_planning,
             }
             return
 
@@ -3181,7 +4148,7 @@ class TrainingOrchestrator:
             merge_lora=(
                 export_config.merge_lora
                 if export_config.merge_lora is not None
-                else self.config.model_backend != "saddle"
+                else self.config.model_backend != "saddle" and not quantized_source
             ),
             safe_serialization=export_config.safe_serialization,
             trust_remote_code=export_config.trust_remote_code,
@@ -3190,6 +4157,7 @@ class TrainingOrchestrator:
             dtype=export_config.dtype,
             hash_weights=export_config.hash_weights,
             overwrite=export_config.overwrite,
+            require_gate=gate_required,
         )
         try:
             result = ModelExporter.export(request, gate=gate_payload)
@@ -3198,9 +4166,181 @@ class TrainingOrchestrator:
             raise
         self._stage_results["export"] = result.to_dict()
 
+    def _run_regression_eval(self, model_path: str, output_path: str):
+        """Compare the actual trained artifact against a fixed capability baseline."""
+        from ..evaluation.RegressionSuite import (
+            load_regression_suite,
+            run_regression_suite,
+            validate_regression_output,
+        )
+
+        evaluation = self.config.eval
+        baseline = evaluation.regression_baseline or self.config.model_name_or_path
+        if not baseline:
+            raise ValueError(
+                "eval.regression_baseline is required without an original model.name_or_path."
+            )
+        suite = load_regression_suite(evaluation.regression_suite)
+        gate_path, selection_path = self._validate_regression_report_paths(
+            suite, baseline, model_path, output_path
+        )
+
+        if self.config.training.dry_run or self.config.training.preflight_only:
+            self._stage_results["eval"] = {
+                "status": "planned",
+                "baseline": baseline,
+                "model": model_path,
+                "regression_suite": evaluation.regression_suite,
+                "output": os.path.abspath(output_path),
+                "checkpoint_candidates": evaluation.checkpoint_candidates,
+            }
+            return
+
+        try:
+            if evaluation.checkpoint_candidates:
+                from ..evaluation.CheckpointSelection import select_checkpoint
+
+                selection = select_checkpoint(
+                    baseline,
+                    evaluation.checkpoint_candidates,
+                    evaluation.regression_suite,
+                    selection_task=evaluation.selection_task,
+                    selection_metric=evaluation.selection_metric,
+                    higher_is_better=evaluation.selection_higher_is_better,
+                    output=str(selection_path),
+                )
+                model_path = selection["selected_model"]
+                report = selection["selected_report"]
+                validate_regression_output(
+                    suite,
+                    output_path,
+                    baseline_model=baseline,
+                    candidate_model=model_path,
+                    source_suite=evaluation.regression_suite,
+                )
+                report = {
+                    **report,
+                    "output": os.path.abspath(output_path),
+                    "checkpoint_selection": selection["output"],
+                }
+                self._write_evaluation_report(output_path, report)
+            else:
+                report = run_regression_suite(
+                    baseline,
+                    model_path,
+                    suite,
+                    output=output_path,
+                    baseline_adapter=evaluation.regression_baseline_adapter,
+                    candidate_adapter=evaluation.adapter,
+                )
+        except Exception as exc:  # noqa: BLE001 -- A failed evaluation must produce a closed release gate.
+            report = {
+                "accepted": False,
+                "status": "invalid",
+                "error": str(exc),
+                "failures": [str(exc)],
+            }
+            self._write_evaluation_report(output_path, report)
+
+        evaluated_artifact = evaluation.adapter or model_path
+        gate = {
+            **report,
+            "enabled": True,
+            "model": self._model_source_identity(evaluated_artifact),
+            "model_identity": report.get("candidate_model_identity"),
+        }
+        self._write_evaluation_report(gate_path, gate)
+
+        accepted = report.get("accepted") is True
+        result = {
+            **report,
+            "status": "completed" if accepted else "rejected",
+            "model": evaluated_artifact,
+            "release_gate": gate,
+            "release_gate_path": os.path.abspath(gate_path),
+        }
+        if accepted and evaluation.checkpoint_candidates:
+            result["selected_checkpoint"] = model_path
+        self._stage_results["eval"] = result
+
+        if not accepted and evaluation.regression_fail_on_rejection:
+            raise RuntimeError(
+                "Capability regression rejected the model; inspect "
+                + os.path.abspath(output_path)
+            )
+
+    def _validate_regression_report_paths(
+        self, suite, baseline, model_path, output_path
+    ):
+        """Reserve all reports before evaluation so none can overwrite an input."""
+        from ..evaluation.RegressionSuite import validate_regression_output
+
+        evaluation = self.config.eval
+        gate_path = evaluation.gate.output_path or os.path.join(
+            self._output_dir, "release_gate.json"
+        )
+        output = Path(output_path)
+        selection_path = output.with_name(output.stem + ".selection.json")
+        destinations = [output_path, gate_path]
+
+        if evaluation.checkpoint_candidates:
+            selection_directory = selection_path.parent / (
+                selection_path.stem + "_candidates"
+            )
+            destinations.append(selection_path)
+            for index in range(len(evaluation.checkpoint_candidates)):
+                destinations.append(selection_directory / f"candidate-{index:04d}.json")
+
+            resolved = [Path(path).expanduser().resolve() for path in destinations]
+            duplicate_files = len(set(resolved)) != len(resolved)
+            nested_files = any(
+                left in right.parents
+                for left in resolved
+                for right in resolved
+                if left != right
+            )
+            if duplicate_files or nested_files:
+                raise ValueError(
+                    "Checkpoint selection, regression and gate report destinations must be distinct files"
+                )
+
+        candidates = evaluation.checkpoint_candidates or [model_path]
+        for candidate in candidates:
+            for destination in destinations:
+                validate_regression_output(
+                    suite,
+                    destination,
+                    baseline_model=baseline,
+                    candidate_model=candidate,
+                    baseline_adapter=evaluation.regression_baseline_adapter,
+                    candidate_adapter=evaluation.adapter,
+                    source_suite=evaluation.regression_suite,
+                )
+        if os.path.abspath(output_path) == os.path.abspath(gate_path):
+            raise ValueError(
+                "Regression report and release gate must use separate output paths."
+            )
+        return gate_path, selection_path
+
+    @staticmethod
+    def _write_evaluation_report(path, report):
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     # ========================================
     # Utility methods
     # ========================================
+
+    @staticmethod
+    def _model_source_identity(model_path: str) -> str:
+        """Canonicalize local aliases while preserving remote model identifiers."""
+        path = Path(model_path).expanduser()
+        if path.exists():
+            return os.path.normcase(str(path.resolve()))
+        return str(model_path)
 
     def _load_tokenizer(self):
         """Load or reuse a tokenizer."""
@@ -3213,17 +4353,23 @@ class TrainingOrchestrator:
 
         if tok_path:
             self._tokenizer = load_tokenizer_compatible(
-                tok_path, trust_remote_code=True
+                tok_path,
+                trust_remote_code=True,
+                local_files_only=self.config.model_local_files_only,
             )
         elif self.config.tokenizer_training and os.path.exists(
             self.config.tokenizer_training.output_dir
         ):
             self._tokenizer = load_tokenizer_compatible(
-                self.config.tokenizer_training.output_dir, trust_remote_code=True
+                self.config.tokenizer_training.output_dir,
+                trust_remote_code=True,
+                local_files_only=self.config.model_local_files_only,
             )
         elif self.config.model_name_or_path:
             self._tokenizer = load_tokenizer_compatible(
-                self.config.model_name_or_path, trust_remote_code=True
+                self.config.model_name_or_path,
+                trust_remote_code=True,
+                local_files_only=self.config.model_local_files_only,
             )
         else:
             logger.warning(
@@ -3441,6 +4587,18 @@ class TrainingOrchestrator:
         rlhf_raw = raw.get("rlhf", {})
         pref_raw = raw.get("preference", {})
         pref_lora_raw = pref_raw.get("lora", {})
+
+        def post_training_precision(section: Mapping[str, Any]) -> str:
+            if "precision" in section:
+                return str(section["precision"]).strip().lower()
+            if "bf16" in dist_raw or "fp16" in dist_raw:
+                if dist_raw.get("bf16", False):
+                    return "bf16"
+                if dist_raw.get("fp16", False):
+                    return "fp16"
+                return "fp32"
+            return "auto"
+
         multimodal_raw = raw.get("multimodal", {})
         media_cache_raw = raw.get("media_cache", {})
         image_generation_raw = raw.get("image_generation", {})
@@ -3469,6 +4627,9 @@ class TrainingOrchestrator:
         eval_raw = raw.get("eval", {})
         eval_gate_raw = eval_raw.get("gate", {})
         export_raw = raw.get("export", {})
+        quantization_raw = raw.get("quantization", {})
+        if not isinstance(quantization_raw, Mapping):
+            raise TypeError("quantization must be a mapping")
         operator_raw = raw.get("operator", {})
 
         cfg = TrainingConfig(
@@ -3482,21 +4643,34 @@ class TrainingOrchestrator:
                 "tokenizer", raw.get("tokenizer_name_or_path")
             ),
             model_backend=model_backend,
+            model_local_files_only=model_raw.get("local_files_only", False),
             model_blueprint=model_blueprint,
             pretrain_mode=raw.get("pretrain_mode", "scratch"),
             stages=list(stages),
+            quantization=QuantizationStageConfig(**dict(quantization_raw)),
+            backends=RuntimeBackendConfig.from_dict(raw.get("backends", {})),
+            decision=DecisionStageConfig.from_dict(raw.get("decision", {}), backbone_name_or_path=model_raw.get("name_or_path")),
             tokenizer_training=tok_config,
             data=DataConfig(
                 sources=data_sources,
                 source_weights=raw.get("data", {}).get("source_weights"),
                 output_dir=raw.get("data", {}).get("output_dir", "./processed_data"),
+                cache_dir=raw.get("data", {}).get("cache_dir"),
                 max_seq_length=raw.get("data", {}).get("max_seq_length", 2048),
                 min_text_length=raw.get("data", {}).get("min_text_length", 50),
                 dedup_method=raw.get("data", {}).get("dedup_method", "simhash"),
                 dedup_threshold=raw.get("data", {}).get("dedup_threshold", 0.8),
                 lang_filter=raw.get("data", {}).get("lang_filter"),
+                quality_min_score=raw.get("data", {}).get(
+                    "quality_min_score", 0.3
+                ),
                 num_proc=raw.get("data", {}).get("num_proc", 4),
                 pack_sequences=raw.get("data", {}).get("pack_sequences", True),
+                packing_attention=raw.get("data", {}).get("packing_attention", "auto"),
+                append_eos=raw.get("data", {}).get("append_eos", True),
+                validation_split=raw.get("data", {}).get(
+                    "validation_split", 0.01
+                ),
             ),
             training=TrainingHyperparams(
                 max_steps=train_raw.get("max_steps", 100000),
@@ -3508,12 +4682,24 @@ class TrainingOrchestrator:
                 weight_decay=train_raw.get("weight_decay", 0.1),
                 max_grad_norm=train_raw.get("max_grad_norm", 1.0),
                 lr_scheduler=train_raw.get("lr_scheduler", "cosine"),
+                optimizer=train_raw.get("optimizer", "adamw_torch"),
+                gradient_checkpointing=train_raw.get(
+                    "gradient_checkpointing", True
+                ),
                 save_every_steps=train_raw.get("save_every_steps", 5000),
                 eval_every_steps=train_raw.get("eval_every_steps", 1000),
                 log_every_steps=train_raw.get("log_every_steps", 50),
                 keep_last_n_checkpoints=train_raw.get("keep_last_n", 5),
                 resume_from_checkpoint=resume_from_checkpoint,
                 dataloader_num_workers=train_raw.get("dataloader_num_workers", 4),
+                dataloader_pin_memory=train_raw.get("dataloader_pin_memory", True),
+                dataloader_persistent_workers=train_raw.get(
+                    "dataloader_persistent_workers", True
+                ),
+                dataloader_prefetch_factor=train_raw.get(
+                    "dataloader_prefetch_factor", 2
+                ),
+                loss_chunk_size=train_raw.get("loss_chunk_size", 1024),
                 stability_monitor=train_raw.get("stability_monitor", True),
                 stability_loss_window=train_raw.get("stability_loss_window", 50),
                 stability_spike_threshold=train_raw.get(
@@ -3523,6 +4709,9 @@ class TrainingOrchestrator:
                     "stability_stagnation_window", 200
                 ),
                 stability_output_dir=train_raw.get("stability_output_dir", ""),
+                load_best_model_at_end=train_raw.get(
+                    "load_best_model_at_end", True
+                ),
                 dry_run=train_raw.get("dry_run", False),
                 preflight_only=train_raw.get("preflight_only", False),
             ),
@@ -3531,11 +4720,34 @@ class TrainingOrchestrator:
                 num_gpus=dist_raw.get("num_gpus", 1),
                 num_nodes=dist_raw.get("num_nodes", 1),
                 gradient_accumulation_steps=dist_raw.get(
-                    "gradient_accumulation_steps", 1
+                    "gradient_accumulation_steps"
                 ),
                 bf16=dist_raw.get("bf16", True),
                 fp16=dist_raw.get("fp16", False),
+                tf32=dist_raw.get("tf32", False),
                 zero_offload_to_cpu=dist_raw.get("zero_offload_to_cpu", False),
+                zero_offload_to_nvme=dist_raw.get("zero_offload_to_nvme", False),
+                zero_nvme_path=dist_raw.get("zero_nvme_path", "./nvme_offload"),
+                zero_overlap_comm=dist_raw.get("zero_overlap_comm", True),
+                zero_contiguous_gradients=dist_raw.get(
+                    "zero_contiguous_gradients", True
+                ),
+                zero_reduce_scatter=dist_raw.get("zero_reduce_scatter", True),
+                zero_allgather_partitions=dist_raw.get(
+                    "zero_allgather_partitions", True
+                ),
+                zero_offload_pin_memory=dist_raw.get(
+                    "zero_offload_pin_memory", True
+                ),
+                zero_stage3_prefetch_bucket_size=dist_raw.get(
+                    "zero_stage3_prefetch_bucket_size", 50_000_000
+                ),
+                zero_reduce_bucket_size=dist_raw.get(
+                    "zero_reduce_bucket_size", 500_000_000
+                ),
+                zero_allgather_bucket_size=dist_raw.get(
+                    "zero_allgather_bucket_size", 500_000_000
+                ),
                 deepspeed_config_path=dist_raw.get("deepspeed_config_path"),
                 ddp_backend=ddp_backend,
             ),
@@ -3602,6 +4814,11 @@ class TrainingOrchestrator:
                     "logging_steps", train_raw.get("log_every_steps", 10)
                 ),
                 validation_split=sft_raw.get("validation_split", 0.0),
+                validation_data_path=sft_raw.get("validation_data_path"),
+                load_best_model_at_end=sft_raw.get(
+                    "load_best_model_at_end",
+                    train_raw.get("load_best_model_at_end", True),
+                ),
                 response_template=sft_raw.get("response_template", "### Answer:"),
                 local_files_only=sft_raw.get("local_files_only", False),
                 trust_remote_code=sft_raw.get("trust_remote_code", True),
@@ -3610,6 +4827,13 @@ class TrainingOrchestrator:
                     train_raw.get("gradient_checkpointing", True),
                 ),
                 optim=sft_raw.get("optim", train_raw.get("optimizer")),
+                precision=post_training_precision(sft_raw),
+                replay_data_path=sft_raw.get("replay_data_path"),
+                replay_ratio=sft_raw.get("replay_ratio", 0.0),
+                replay_count=sft_raw.get("replay_count"),
+                reference_model_path=sft_raw.get("reference_model_path"),
+                retention_kl_weight=sft_raw.get("retention_kl_weight", 0.0),
+                retention_temperature=sft_raw.get("retention_temperature", 1.0),
             ),
             rlhf=RLHFConfig(
                 enabled=rlhf_raw.get("enabled", False),
@@ -3659,6 +4883,13 @@ class TrainingOrchestrator:
                 lora_dropout=pref_lora_raw.get(
                     "dropout", pref_raw.get("lora_dropout", 0.05)
                 ),
+                lora_target_modules=pref_lora_raw.get(
+                    "target_modules",
+                    pref_raw.get(
+                        "lora_target_modules",
+                        ["q_proj", "k_proj", "v_proj", "o_proj"],
+                    ),
+                ),
                 gradient_accumulation_steps=pref_raw.get(
                     "gradient_accumulation_steps",
                     dist_raw.get("gradient_accumulation_steps", 4),
@@ -3673,6 +4904,11 @@ class TrainingOrchestrator:
                     "logging_steps", train_raw.get("log_every_steps", 10)
                 ),
                 validation_split=pref_raw.get("validation_split", 0.0),
+                validation_data_path=pref_raw.get("validation_data_path"),
+                load_best_model_at_end=pref_raw.get(
+                    "load_best_model_at_end",
+                    train_raw.get("load_best_model_at_end", True),
+                ),
                 eval_steps=pref_raw.get(
                     "eval_steps", train_raw.get("eval_every_steps", 0)
                 ),
@@ -3685,6 +4921,7 @@ class TrainingOrchestrator:
                 report_to=pref_raw.get(
                     "report_to", raw.get("logging", {}).get("backend", "none")
                 ),
+                precision=post_training_precision(pref_raw),
             ),
             multimodal=MultimodalTrainingConfig(
                 enabled=multimodal_raw.get("enabled", False),
@@ -3852,7 +5089,9 @@ class TrainingOrchestrator:
                 max_new_tokens=mopd_raw.get("max_new_tokens", 1024),
                 student_temperature=mopd_raw.get("student_temperature", 0.9),
                 teacher_temperature=mopd_raw.get("teacher_temperature", 0.3),
+                teacher_concurrency=mopd_raw.get("teacher_concurrency", 4),
                 aggregation=mopd_raw.get("aggregation", "best_score"),
+                requires_review=mopd_raw.get("requires_review", False),
                 dry_run=mopd_raw.get("dry_run", True),
             ),
             vla=VLATrainingConfig(
@@ -3913,10 +5152,52 @@ class TrainingOrchestrator:
             eval=EvalConfig(
                 enabled=eval_raw.get("enabled", True),
                 tasks=eval_raw.get("tasks", ["perplexity"]),
-                eval_dataset=eval_raw.get("dataset", "wikitext"),
+                eval_dataset=eval_raw.get("data", eval_raw.get("dataset", "wikitext")),
                 eval_dataset_config=eval_raw.get("dataset_config", "wikitext-2-raw-v1"),
-                max_samples=eval_raw.get("max_samples", 1000),
+                max_samples=eval_raw.get("max_samples", eval_raw.get("limit", 1000)),
                 fail_on_error=eval_raw.get("fail_on_error", True),
+                task=eval_raw.get("task"),
+                split=eval_raw.get("split", "validation"),
+                adapter=eval_raw.get("adapter"),
+                regression_suite=eval_raw.get("regression_suite"),
+                regression_baseline=eval_raw.get("regression_baseline"),
+                regression_baseline_adapter=eval_raw.get("regression_baseline_adapter"),
+                regression_fail_on_rejection=eval_raw.get("regression_fail_on_rejection", True),
+                checkpoint_candidates=eval_raw.get("checkpoint_candidates", []),
+                selection_task=eval_raw.get("selection_task"),
+                selection_metric=eval_raw.get("selection_metric"),
+                selection_higher_is_better=eval_raw.get("selection_higher_is_better", True),
+                prompt_field=eval_raw.get("prompt_field", "instruction"),
+                question_field=eval_raw.get("question_field", "question"),
+                answer_field=eval_raw.get("answer_field", "answer"),
+                completion_field=eval_raw.get("completion_field", "output"),
+                rubric_field=eval_raw.get("rubric_field", "rubric"),
+                reference_field=eval_raw.get("reference_field", "reference"),
+                id_field=eval_raw.get("id_field", "id"),
+                group_field=eval_raw.get("group_field"),
+                case_field=eval_raw.get("case_field"),
+                variant_field=eval_raw.get("variant_field"),
+                prompt_variants=eval_raw.get("prompt_variants"),
+                choices=eval_raw.get("choices", "ABCDE"),
+                batch_size=eval_raw.get("batch_size", 16),
+                max_length=eval_raw.get("max_length", 512),
+                max_new_tokens=eval_raw.get("max_new_tokens", 96),
+                generation_samples=eval_raw.get("generation_samples", 0),
+                generation_all=eval_raw.get("generation_all", False),
+                generation_indices=eval_raw.get("generation_indices", []),
+                device=eval_raw.get("device", "auto"),
+                dtype=eval_raw.get("dtype", "auto"),
+                enable_thinking=eval_raw.get("enable_thinking", False),
+                trust_remote_code=eval_raw.get("trust_remote_code", False),
+                local_files_only=eval_raw.get("local_files_only", False),
+                endpoint=eval_raw.get("endpoint"),
+                api_key_env=eval_raw.get("api_key_env"),
+                pass_threshold=eval_raw.get("pass_threshold", 0.8),
+                request_timeout=eval_raw.get("request_timeout", 120.0),
+                repetition_penalty=eval_raw.get("repetition_penalty", 1.0),
+                no_repeat_ngram_size=eval_raw.get("no_repeat_ngram_size", 0),
+                output_path=eval_raw.get("output_path", eval_raw.get("output")),
+                markdown_output=eval_raw.get("markdown_output"),
                 gate=EvaluationGateConfig(
                     enabled=eval_gate_raw.get("enabled", False),
                     rules=eval_gate_raw.get("rules", {}),

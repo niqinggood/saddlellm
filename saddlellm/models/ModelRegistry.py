@@ -44,7 +44,11 @@ class ModelSpec:
     max_position_embeddings: int
     rope_theta: float = 10000.0
     norm_eps: float = 1e-5
+    qk_norm: bool = False
+    fused_qkv: bool = False
+    fused_gate_up: bool = False
     tie_word_embeddings: bool = False
+    residual_initialization: str = "standard"
     use_sliding_window: bool = False
     sliding_window: int = 0
 
@@ -69,6 +73,15 @@ class ModelSpec:
     flops_per_token: float = 0
 
     def __post_init__(self):
+        for name in ("qk_norm", "fused_qkv", "fused_gate_up"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be boolean")
+        if self.kv_lora_rank > 0 and self.fused_qkv:
+            raise ValueError("fused_qkv is not supported for MLA model specs")
+        if self.residual_initialization not in {"standard", "depth_scaled", "zero"}:
+            raise ValueError(
+                "residual_initialization must be standard, depth_scaled, or zero"
+            )
         if self.estimated_params == 0:
             self.estimated_params = self._estimate_params()
         if self.chinchilla_tokens == 0:
@@ -105,6 +118,8 @@ class ModelSpec:
                 + d * kv * head_dim * 2  # K, V
                 + h_q * head_dim * d  # O
             )
+        if self.qk_norm:
+            attn_params += 2 * head_dim
 
         # FFN
         if self.num_experts > 0:
@@ -154,6 +169,8 @@ class ModelSpec:
             attn_per_layer = (
                 d * h_q * head_dim + d * kv * head_dim * 2 + h_q * head_dim * d
             )
+        if self.qk_norm:
+            attn_per_layer += 2 * head_dim
 
         # MoE FFN: only top-k experts activated
         exp_ff = self.expert_intermediate_size or self.intermediate_size
@@ -192,6 +209,10 @@ class ModelSpec:
             "max_position_embeddings": self.max_position_embeddings,
             "rope_theta": self.rope_theta,
             "norm_eps": self.norm_eps,
+            "qk_norm": self.qk_norm,
+            "fused_qkv": self.fused_qkv,
+            "fused_gate_up": self.fused_gate_up,
+            "tie_word_embeddings": self.tie_word_embeddings,
             "estimated_params": self.estimated_params,
             "estimated_active_params": self.estimated_active_params,
             "chinchilla_tokens": self.chinchilla_tokens,
@@ -266,6 +287,41 @@ MODEL_SPECS: Dict[str, ModelSpec] = {
         vocab_size=32000,
         max_position_embeddings=4096,
         rope_theta=10000.0,
+    ),
+    "saddle-gqa-300m-optimized": ModelSpec(
+        name="saddle-gqa-300m-optimized",
+        architecture="qwen",
+        hidden_size=1024,
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        num_kv_heads=4,
+        intermediate_size=4096,
+        vocab_size=32000,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        qk_norm=True,
+        fused_qkv=True,
+        fused_gate_up=True,
+    ),
+    "saddle-gqa-300m-efficient-v2": ModelSpec(
+        name="saddle-gqa-300m-efficient-v2",
+        architecture="qwen",
+        hidden_size=1024,
+        num_hidden_layers=24,
+        num_attention_heads=16,
+        num_kv_heads=4,
+        # Approximately 8/3 * hidden_size, rounded up to a tensor-core-
+        # friendly multiple of 256.  SwiGLU has three FFN projections, so
+        # this preserves a roughly 4h GeLU-equivalent parameter budget.
+        intermediate_size=2816,
+        vocab_size=32000,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        qk_norm=True,
+        fused_qkv=True,
+        fused_gate_up=True,
+        tie_word_embeddings=True,
+        residual_initialization="depth_scaled",
     ),
     "gpt-neox-350m": ModelSpec(
         name="gpt-neox-350m",

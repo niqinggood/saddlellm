@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from saddlellm.runtime.ModelExporter import ModelExportRequest, ModelExporter
-from saddlellm.training.PostTrainingCompatibility import post_training_runtime_report
+from saddlellm.evaluation.ModelIdentity import compute_model_identity
 from saddlellm.evaluation.ReleaseGate import EvaluationReleaseGate
+from saddlellm.runtime.ModelExporter import ModelExporter, ModelExportRequest
+from saddlellm.training.PostTrainingCompatibility import post_training_runtime_report
 from saddlellm.training.TrainingConfigValidator import TrainingConfigValidator
 
 
@@ -130,10 +131,51 @@ def test_local_checkpoint_export_writes_verified_manifest(tmp_path):
     assert not (destination / "training_args.bin").exists()
     assert not (destination / "checkpoint-1").exists()
     manifest = json.loads((destination / "release_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["gate"]["accepted"] is True
+    assert manifest["gate"]["accepted"] is False
+    assert manifest["gate"]["reported_accepted"] is True
+    assert manifest["gate_binding"]["status"] == "unbound"
     assert manifest["source_type"] == "local_checkpoint"
     assert manifest["source_model"] == "checkpoint"
     assert manifest["release_id"].startswith("saddlellm-")
+
+
+def test_export_cli_accepts_paired_comparison_gate(tmp_path):
+    from saddlellm import cli
+
+    source = tmp_path / "checkpoint"
+    source.mkdir()
+    (source / "config.json").write_text(
+        '{"model_type":"gpt2"}\n', encoding="utf-8"
+    )
+    (source / "model.safetensors").write_bytes(b"tiny-weights")
+    (source / "tokenizer_config.json").write_text("{}\n", encoding="utf-8")
+    gate = tmp_path / "comparison_gate.json"
+    gate.write_text(
+        json.dumps({
+            "decision": "promoted", "criteria": {"set_gate": {}},
+            "candidate_model_identity": compute_model_identity(source),
+        }),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "release"
+
+    exit_code = cli.main(
+        [
+            "export-model",
+            str(source),
+            str(destination),
+            "--gate-result",
+            str(gate),
+            "--require-gate",
+        ]
+    )
+
+    assert exit_code == 0
+    manifest = json.loads(
+        (destination / "release_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["gate"]["accepted"] is True
+    assert manifest["gate"]["decision"] == "promoted"
 
 
 def test_generic_tokenizers_backend_has_a_fast_tokenizer_fallback(tmp_path):
@@ -179,7 +221,9 @@ def test_lora_adapter_export_merges_to_a_loadable_full_model(tmp_path):
         PreTrainedTokenizerFast,
     )
 
-    from saddlellm.training.PostTrainingCompatibility import stabilize_peft_optional_backends
+    from saddlellm.training.PostTrainingCompatibility import (
+        stabilize_peft_optional_backends,
+    )
 
     base = tmp_path / "base"
     GPT2LMHeadModel(
@@ -283,7 +327,8 @@ class _FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 0
 
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        self.template_kwargs = kwargs
         return "\n".join(f"{item['role']}: {item['content']}" for item in messages) + "\nassistant:"
 
     def __call__(self, text, return_tensors="pt", truncation=True, max_length=4096):
@@ -307,19 +352,32 @@ class _FakeModel:
         import torch
 
         generated = torch.tensor([[2, 3, 4]], dtype=torch.long)
+        streamer = kwargs.get("streamer")
+        if streamer is not None:
+            streamer.on_finalized_text("route ", stream_end=False)
+            streamer.on_finalized_text("one", stream_end=True)
         return torch.cat([input_ids, generated], dim=1)
+
+
+class _FailingFakeModel(_FakeModel):
+    def generate(self, *args, **kwargs):
+        raise RuntimeError("synthetic generation failure")
 
 
 def test_openai_compatible_api_health_auth_and_token_slicing():
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
-    from saddlellm.runtime.InferenceServer import InferenceServerSettings, create_inference_app
+    from saddlellm.runtime.InferenceServer import (
+        InferenceServerSettings,
+        create_inference_app,
+    )
 
     app = create_inference_app(
         InferenceServerSettings(
             model_path="fake/release",
             model_name="tiny-release",
+            enable_thinking=False,
             api_key="secret",
             default_max_new_tokens=3,
             max_new_tokens=8,
@@ -329,8 +387,14 @@ def test_openai_compatible_api_health_auth_and_token_slicing():
     )
     client = TestClient(app)
     assert client.get("/health").json()["status"] == "ok"
+    assert client.get("/").status_code == 200
     assert client.get("/v1/models").status_code == 401
     headers = {"Authorization": "Bearer secret"}
+    assert client.post(
+        "/v1/chat/completions",
+        headers=headers,
+        json={"messages": [], "stream": True},
+    ).status_code == 422
     response = client.post(
         "/v1/chat/completions",
         headers=headers,
@@ -357,4 +421,87 @@ def test_openai_compatible_api_health_auth_and_token_slicing():
             "stream": True,
         },
     )
-    assert stream_response.status_code == 400
+    assert stream_response.status_code == 200
+    assert '"content": "route "' in stream_response.text
+    assert '"content": "one"' in stream_response.text
+    assert '"finish_reason": "length"' in stream_response.text
+    assert "data: [DONE]" in stream_response.text
+    assert app.state.engine.tokenizer.template_kwargs["enable_thinking"] is False
+
+    failing = TestClient(
+        create_inference_app(
+            InferenceServerSettings(
+                model_path="fake/release",
+                model_name="failing-release",
+            ),
+            model=_FailingFakeModel(),
+            tokenizer=_FakeTokenizer(),
+        )
+    )
+    failed_stream = failing.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        },
+    )
+    assert '"type": "server_error"' in failed_stream.text
+    assert "data: [DONE]" in failed_stream.text
+
+
+def test_inference_reports_release_gate_without_blocking_serving(tmp_path):
+    pytest.importorskip("fastapi")
+    from saddlellm.runtime.InferenceServer import (
+        InferenceServerSettings,
+        create_inference_app,
+    )
+
+    release = tmp_path / "release"
+    release.mkdir()
+    manifest = release / "release_manifest.json"
+    manifest.write_text(
+        json.dumps({"gate": {"decision": "not_promoted"}}), encoding="utf-8"
+    )
+    settings = InferenceServerSettings(model_path=str(release))
+    app = create_inference_app(
+        settings,
+        model=_FakeModel(),
+        tokenizer=_FakeTokenizer(),
+    )
+    from fastapi.testclient import TestClient
+
+    assert TestClient(app).get("/health").json()["gate_accepted"] is False
+
+    manifest.write_text(
+        json.dumps({"gate": {"decision": "promoted"}}), encoding="utf-8"
+    )
+    app = create_inference_app(
+        settings,
+        model=_FakeModel(),
+        tokenizer=_FakeTokenizer(),
+    )
+    assert TestClient(app).get("/health").json()["gate_accepted"] is True
+
+
+def test_inference_health_reports_requested_quantization():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from saddlellm.runtime.InferenceServer import (
+        InferenceServerSettings,
+        create_inference_app,
+    )
+
+    app = create_inference_app(
+        InferenceServerSettings(model_path="fake", quantization="4bit"),
+        model=_FakeModel(),
+        tokenizer=_FakeTokenizer(),
+    )
+    assert TestClient(app).get("/health").json()["quantization"] == "4bit"
+
+
+def test_inference_settings_reject_unknown_quantization():
+    from saddlellm.runtime.InferenceServer import InferenceServerSettings
+
+    with pytest.raises(ValueError, match="quantization"):
+        InferenceServerSettings(quantization="int3")

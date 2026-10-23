@@ -12,8 +12,7 @@ import logging
 import math
 import os
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -54,14 +53,29 @@ class Evaluator:
             "task_type": task_type,
             "dataset": dataset,
             "dataset_config": dataset_config,
+            "data_split": split,
+            "split_selection": "declared_file" if Path(dataset).is_file() else "dataset_split",
             "metrics": {},
             "error": None,
         }
 
         try:
+            from ..models.ModelLoader import packaged_quantization_kind
+
+            if packaged_quantization_kind(model_path) == "dynamic-int8":
+                device = "cpu"
             records = self._load_records(dataset, dataset_config, split, max_samples)
             if not records:
                 raise ValueError("evaluation dataset is empty")
+
+            from .ModelIdentity import compute_model_identity
+
+            result["model_identity"] = compute_model_identity(model_path)
+            if Path(dataset).is_file() and Path(dataset).suffix.lower() == ".json":
+                payload = json.loads(Path(dataset).read_text(encoding="utf-8"))
+                mapping = payload.get("splits", payload) if isinstance(payload, dict) else {}
+                if isinstance(mapping, dict) and isinstance(mapping.get(split), list):
+                    result["split_selection"] = "named_split"
 
             model, tokenizer = self._load_model(model_path, task_type, device, trust_remote_code)
             text_column = text_column or self._infer_text_column(records[0])
@@ -116,7 +130,14 @@ class Evaluator:
 
     def _load_model(self, model_path: str, task_type: str, device: str, trust_remote_code: bool):
         logger.info("Loading model: %s", model_path)
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        from ..models.ModelLoader import packaged_quantization_kind
+
+        kind = packaged_quantization_kind(model_path)
+        dtype = torch.float32 if kind in {"dynamic-int8", "portable-int8-weight-only"} else (
+            torch.float16 if device == "cuda" else torch.float32
+        )
+        if kind is not None and task_type == "classification":
+            raise ValueError("Packaged causal-LM quantization does not support classification evaluation")
 
         if task_type == "classification":
             tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
@@ -148,16 +169,13 @@ class Evaluator:
     ) -> List[Dict[str, Any]]:
         path = Path(dataset)
         if path.exists():
-            records = self._load_local_records(path)
+            records = self._load_local_records(path, split=split)
         else:
-            try:
-                ds = load_dataset(dataset, dataset_config, split=split)
-            except Exception:
-                ds = load_dataset(dataset, dataset_config, split="test")
+            ds = load_dataset(dataset, dataset_config, split=split)
             records = self._dataset_to_records(ds, max_samples)
         return records[:max_samples]
 
-    def _load_local_records(self, path: Path) -> List[Dict[str, Any]]:
+    def _load_local_records(self, path: Path, split: Optional[str] = None) -> List[Dict[str, Any]]:
         suffix = path.suffix.lower()
         with open(path, "r", encoding="utf-8") as f:
             if suffix == ".jsonl":
@@ -165,9 +183,11 @@ class Evaluator:
             if suffix == ".json":
                 data = json.load(f)
                 if isinstance(data, dict):
-                    for key in ("data", "train", "validation", "test"):
-                        if isinstance(data.get(key), list):
-                            return data[key]
+                    if ("splits" in data or any(key in data for key in ("data", "records", "train", "validation", "test", "calibration"))):
+                        from .MultipleChoiceEvaluator import select_evaluation_json
+
+                        records, _ = select_evaluation_json(data, split)
+                        return records
                     return [data]
                 return data
             if suffix in {".txt", ".md"}:

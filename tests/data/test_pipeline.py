@@ -12,6 +12,7 @@ from saddlellm.DataPipeline import (
     DataPipeline,
     PipelineConfig,
 )
+from saddlellm.data.pipeline import CausalLMDataCollator
 
 
 def _fake_datasets_module(monkeypatch, *, load_dataset=None, from_generator=None):
@@ -49,6 +50,159 @@ def test_source_weight_validation_rejects_mismatch_negative_and_zero_total():
         DataPipeline(PipelineConfig(sources=sources, source_weights=[1, -1]))
     with pytest.raises(ValueError, match="positive total"):
         DataPipeline(PipelineConfig(sources=sources, source_weights=[0, 0]))
+
+
+def test_map_style_stateless_preprocessing_uses_configured_num_proc(monkeypatch):
+    class MapDataset:
+        column_names = ["text"]
+        num_rows = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def map(self, _function, **kwargs):
+            self.calls.append(("map", kwargs))
+            return self
+
+        def filter(self, _predicate, **kwargs):
+            self.calls.append(("filter", kwargs))
+            return self
+
+    class StreamDataset(MapDataset):
+        pass
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = MapDataset
+    datasets_module.IterableDataset = StreamDataset
+
+    dataset = MapDataset()
+    pipeline = DataPipeline(
+        PipelineConfig(
+            num_proc=3,
+            min_text_length=0,
+            quality_min_score=0,
+            pack_sequences=False,
+        )
+    )
+    pipeline._dataset = dataset
+
+    pipeline.clean()
+    assert dataset.calls == [
+        ("map", {"num_proc": 3}),
+        ("filter", {"num_proc": 3}),
+    ]
+
+    dataset.calls.clear()
+    pipeline.filter_quality()
+    assert dataset.calls == [("filter", {"num_proc": 3})]
+
+    dataset.calls.clear()
+    tokenizer = types.SimpleNamespace(eos_token_id=2, pad_token_id=0)
+    pipeline.tokenize_and_pack(tokenizer)
+    assert dataset.calls == [
+        (
+            "map",
+            {
+                "batched": True,
+                "remove_columns": ["text"],
+                "num_proc": 3,
+            },
+        ),
+        ("map", {"num_proc": 3}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dataset_kind", "num_proc"),
+    [("stream", 4), ("double", 4), ("map", 1)],
+)
+def test_num_proc_is_omitted_for_streaming_test_doubles_and_single_worker(
+    monkeypatch, dataset_kind, num_proc
+):
+    class MapDataset:
+        column_names = ["text"]
+        num_rows = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def map(self, _function, **kwargs):
+            self.calls.append(("map", kwargs))
+            return self
+
+        def filter(self, _predicate, **kwargs):
+            self.calls.append(("filter", kwargs))
+            return self
+
+    class StreamDataset(MapDataset):
+        pass
+
+    class TestDouble:
+        column_names = ["text"]
+        num_rows = 1
+
+        def __init__(self):
+            self.calls = []
+
+        def map(self, _function, **kwargs):
+            self.calls.append(("map", kwargs))
+            return self
+
+        def filter(self, _predicate, **kwargs):
+            self.calls.append(("filter", kwargs))
+            return self
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = MapDataset
+    datasets_module.IterableDataset = StreamDataset
+    dataset = {
+        "stream": StreamDataset,
+        "double": TestDouble,
+        "map": MapDataset,
+    }[dataset_kind]()
+    pipeline = DataPipeline(
+        PipelineConfig(num_proc=num_proc, min_text_length=0, quality_min_score=0)
+    )
+    pipeline._dataset = dataset
+
+    pipeline.clean()
+
+    assert dataset.calls == [("map", {}), ("filter", {})]
+
+
+@pytest.mark.parametrize("method", ["exact", "simhash", "minhash"])
+def test_stateful_deduplication_never_receives_num_proc(monkeypatch, method):
+    class MapDataset:
+        num_rows = 1
+
+        def __init__(self):
+            self.filter_kwargs = None
+
+        def filter(self, _predicate, **kwargs):
+            self.filter_kwargs = kwargs
+            return self
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = MapDataset
+    datasets_module.IterableDataset = type("StreamDataset", (), {})
+    simhash_module = types.ModuleType("simhash")
+    simhash_module.Simhash = type("Simhash", (), {"__init__": lambda self, _text: None})
+    monkeypatch.setitem(sys.modules, "simhash", simhash_module)
+    datasketch_module = types.ModuleType("datasketch")
+    datasketch_module.MinHash = type("MinHash", (), {})
+    datasketch_module.MinHashLSH = type(
+        "MinHashLSH",
+        (),
+        {"__init__": lambda self, **_kwargs: None},
+    )
+    monkeypatch.setitem(sys.modules, "datasketch", datasketch_module)
+    dataset = MapDataset()
+    pipeline = DataPipeline(PipelineConfig(num_proc=8))
+    pipeline._dataset = dataset
+
+    pipeline.deduplicate(method=method)
+
+    assert dataset.filter_kwargs == {}
 
 
 def test_wikipedia_source_uses_configured_snapshot_and_cache(monkeypatch):
@@ -132,6 +286,28 @@ def test_explicit_zero_min_length_is_honored():
     assert dataset.kept is True
 
 
+def test_quality_filter_accepts_valid_chinese_without_spaces():
+    class FilterDataset:
+        def __init__(self):
+            self.kept = None
+
+        def filter(self, predicate):
+            self.kept = predicate(
+                {"text": "护士应核对患者身份，评估意识、呼吸和循环情况，并记录生命体征变化。"}
+            )
+            return self
+
+    dataset = FilterDataset()
+    pipeline = DataPipeline(
+        PipelineConfig(min_text_length=20, quality_min_score=0, filter_urls=False)
+    )
+    pipeline._dataset = dataset
+
+    pipeline.filter_quality()
+
+    assert dataset.kept is True
+
+
 def test_split_honors_seed_zero_and_normalizes_override_ratios():
     class SplitDataset:
         def __init__(self):
@@ -176,6 +352,263 @@ def test_pack_generator_is_reentrant(monkeypatch):
 
     assert generated[0] == generated[1]
     assert generated[0][0]["input_ids"] == list(range(10))
+
+
+def test_streaming_pack_stays_iterable(monkeypatch):
+    class StreamDataset(list):
+        @classmethod
+        def from_generator(cls, factory):
+            return cls(factory())
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = types.SimpleNamespace(
+        from_generator=lambda _factory: pytest.fail("stream was materialized")
+    )
+    datasets_module.IterableDataset = StreamDataset
+    pipeline = DataPipeline(PipelineConfig())
+
+    packed = pipeline._pack_sequences(
+        StreamDataset([{"input_ids": list(range(12))}]),
+        max_len=10,
+        pad_token_id=0,
+    )
+
+    assert isinstance(packed, StreamDataset)
+    assert packed[0]["input_ids"] == list(range(10))
+
+
+def test_packed_tokenization_keeps_long_documents_and_adds_eos(monkeypatch):
+    class ListDataset(list):
+        column_names = ["text"]
+
+        def map(self, function, batched=False, **_kwargs):
+            if batched:
+                mapped = function({"text": [row["text"] for row in self]})
+                return ListDataset(
+                    {"input_ids": ids} for ids in mapped["input_ids"]
+                )
+            return ListDataset(function(row) for row in self)
+
+    calls = []
+
+    class Tokenizer:
+        eos_token_id = 99
+        pad_token_id = 0
+
+        def __call__(self, texts, **kwargs):
+            calls.append(kwargs)
+            return {"input_ids": [list(range(1, 24)) for _ in texts]}
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = types.SimpleNamespace(
+        from_generator=lambda factory: list(factory())
+    )
+    pipeline = DataPipeline(
+        PipelineConfig(max_seq_length=10, pack_sequences=True)
+    )
+    pipeline._dataset = ListDataset([{"text": "long document"}])
+
+    pipeline.tokenize_and_pack(Tokenizer())
+
+    assert calls == [
+        {"truncation": False, "padding": False, "return_attention_mask": False}
+    ]
+    packed = pipeline.to_iterable_dataset()
+    assert packed[0]["input_ids"] == list(range(1, 11))
+    assert packed[1]["input_ids"] == list(range(11, 21))
+
+
+def test_packed_tokenization_inserts_eos_between_documents(monkeypatch):
+    class ListDataset(list):
+        column_names = ["text"]
+
+        def map(self, function, batched=False, **_kwargs):
+            mapped = function({"text": [row["text"] for row in self]})
+            return ListDataset({"input_ids": ids} for ids in mapped["input_ids"])
+
+    class Tokenizer:
+        eos_token_id = 99
+        pad_token_id = 0
+
+        def __call__(self, _texts, **_kwargs):
+            return {"input_ids": [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]]}
+
+    datasets_module = _fake_datasets_module(monkeypatch)
+    datasets_module.Dataset = types.SimpleNamespace(
+        from_generator=lambda factory: list(factory())
+    )
+    pipeline = DataPipeline(PipelineConfig(max_seq_length=10))
+    pipeline._dataset = ListDataset([{"text": "a"}, {"text": "b"}])
+
+    pipeline.tokenize_and_pack(Tokenizer())
+
+    assert pipeline.to_iterable_dataset()[0]["input_ids"] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+        99,
+        6,
+        7,
+        8,
+        9,
+    ]
+
+
+def test_packing_tracks_document_boundaries_resets_positions_and_masks_loss(monkeypatch):
+    generated = []
+
+    def from_generator(factory):
+        generated.extend(factory())
+        return generated
+
+    _fake_datasets_module(monkeypatch, from_generator=from_generator)
+    pipeline = DataPipeline(PipelineConfig())
+    pipeline._pack_sequences(
+        [
+            {"input_ids": [1, 2, 99]},
+            {"input_ids": [3, 4, 99]},
+        ],
+        max_len=6,
+        pad_token_id=0,
+    )
+
+    assert generated == [
+        {
+            "input_ids": [1, 2, 99, 3, 4, 99],
+            # The model shifts labels left.  -100 at the new document's first
+            # token prevents token 99 from predicting token 3 across documents.
+            "labels": [1, 2, 99, -100, 4, 99],
+            "attention_mask": [1, 1, 1, 1, 1, 1],
+            "document_ids": [0, 0, 0, 1, 1, 1],
+            "position_ids": [0, 1, 2, 0, 1, 2],
+        }
+    ]
+
+
+def test_long_document_fragments_restart_positions_at_block_boundaries(monkeypatch):
+    _fake_datasets_module(
+        monkeypatch,
+        from_generator=lambda factory: list(factory()),
+    )
+    pipeline = DataPipeline(PipelineConfig())
+
+    packed = pipeline._pack_sequences(
+        [{"input_ids": list(range(24))}],
+        max_len=10,
+        pad_token_id=0,
+    )
+
+    assert len(packed) == 2
+    assert packed[0]["position_ids"] == list(range(10))
+    assert packed[1]["position_ids"] == list(range(10))
+    assert packed[0]["document_ids"] == [0] * 10
+    assert packed[1]["document_ids"] == [0] * 10
+
+
+def test_causal_collator_preserves_real_eos_when_pad_equals_eos():
+    tokenizer = types.SimpleNamespace(
+        eos_token_id=2, pad_token_id=2, padding_side="right"
+    )
+    batch = CausalLMDataCollator(tokenizer)(
+        [{"input_ids": [1, 2]}, {"input_ids": [3]}]
+    )
+
+    assert batch["input_ids"].tolist() == [[1, 2], [3, 2]]
+    assert batch["labels"].tolist() == [[1, 2], [3, -100]]
+    assert batch["attention_mask"].tolist() == [[1, 1], [1, 0]]
+
+
+def test_causal_collator_omits_redundant_full_attention_mask():
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=0,
+        eos_token_id=0,
+        padding_side="right",
+    )
+    features = [
+        {"input_ids": [1, 2, 3], "labels": [1, 2, 3], "attention_mask": [1, 1, 1]},
+        {"input_ids": [4, 5, 6], "labels": [4, 5, 6], "attention_mask": [1, 1, 1]},
+    ]
+
+    optimized = CausalLMDataCollator(tokenizer)(features)
+    explicit = CausalLMDataCollator(
+        tokenizer,
+        omit_all_one_attention_mask=False,
+    )(features)
+
+    assert "attention_mask" not in optimized
+    assert "document_ids" not in optimized
+    assert "position_ids" not in optimized
+    assert explicit["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 1]]
+
+
+def test_causal_collator_pads_packed_document_metadata():
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=0,
+        eos_token_id=2,
+        padding_side="right",
+    )
+    features = [
+        {
+            "input_ids": [1, 2, 3],
+            "labels": [1, 2, -100],
+            "document_ids": [0, 0, 1],
+            "position_ids": [0, 1, 0],
+        },
+        {
+            "input_ids": [4, 5],
+            "document_ids": [0, 0],
+            "position_ids": [0, 1],
+        },
+    ]
+
+    batch = CausalLMDataCollator(tokenizer)(features)
+
+    assert batch["document_ids"].tolist() == [[0, 0, 1], [0, 0, -1]]
+    assert batch["position_ids"].tolist() == [[0, 1, 0], [0, 1, 0]]
+    assert batch["labels"].tolist() == [[1, 2, -100], [4, 5, -100]]
+    assert batch["attention_mask"].tolist() == [[1, 1, 1], [1, 1, 0]]
+
+
+def test_causal_collator_keeps_fast_path_for_single_document_packs():
+    tokenizer = types.SimpleNamespace(
+        pad_token_id=0,
+        eos_token_id=2,
+        padding_side="right",
+    )
+    features = [
+        {
+            "input_ids": [1, 2, 3],
+            "document_ids": [17, 17, 17],
+            "position_ids": [0, 1, 2],
+        }
+    ]
+
+    batch = CausalLMDataCollator(tokenizer)(features)
+
+    assert set(batch) == {"input_ids", "labels"}
+
+
+def test_streaming_split_is_deterministic_and_leakage_free():
+    class StreamDataset(list):
+        def filter(self, predicate):
+            return StreamDataset(row for row in self if predicate(row))
+
+    source = StreamDataset({"text": f"document-{index}"} for index in range(100))
+    pipeline = DataPipeline(PipelineConfig(streaming=True))
+    pipeline._dataset = source
+
+    first = pipeline.split(ratios=[0.8, 0.2], seed=7)
+    second = pipeline.split(ratios=[0.8, 0.2], seed=7)
+    train = {row["text"] for row in first["train"]}
+    validation = {row["text"] for row in first["val"]}
+
+    assert train
+    assert validation
+    assert train.isdisjoint(validation)
+    assert train | validation == {row["text"] for row in source}
+    assert first == second
 
 
 def test_data_mixer_normalizes_copies_without_mutating_callers():

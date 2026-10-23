@@ -45,7 +45,7 @@ def test_quickstart_creates_valid_beginner_project(tmp_path, stages, preference_
         assert config["preference"]["method"] == preference_task
     else:
         assert "preference" not in result.data_files
-    assert "saddle-llm train \"config.yaml\" --dry-run" in result.next_steps
+    assert "saddlellm train \"config.yaml\" --dry-run" in result.next_steps
     assert Path(workspace / "README.md").is_file()
 
 
@@ -85,8 +85,16 @@ def test_quickstart_references_user_data_without_modifying_it(tmp_path):
 def test_cli_without_command_shows_a_short_getting_started_path(capsys):
     assert cli_main([]) == 0
     output = capsys.readouterr().out
-    assert "saddle-llm quickstart" in output
-    assert "saddle-llm --help" in output
+    assert "saddlellm quickstart" in output
+    assert "saddlellm --help" in output
+
+
+def test_cli_reports_package_version(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"saddlellm {saddlellm.__version__}"
 
 
 def test_quickstart_is_available_from_the_top_level_python_api(tmp_path):

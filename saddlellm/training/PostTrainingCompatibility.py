@@ -9,6 +9,8 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import json
+import os
 from importlib import metadata
 from typing import Any, Dict, List, Mapping
 
@@ -95,6 +97,153 @@ def supported_kwargs(callable_obj: Any, values: Mapping[str, Any]) -> Dict[str, 
 def instantiate_supported(config_class: Any, values: Mapping[str, Any]):
     """Instantiate a version-varying config class with supported keywords."""
     return config_class(**supported_kwargs(config_class.__init__, values))
+
+
+def metric_snapshot(metrics: Any) -> Dict[str, object]:
+    """Return a compact JSON-safe copy of trainer metrics."""
+
+    snapshot: Dict[str, object] = {}
+    for key, value in dict(metrics or {}).items():
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except (TypeError, ValueError):
+                pass
+        if not isinstance(value, (str, int, float, bool, type(None))):
+            value = str(value)
+        snapshot[str(key)] = value
+    return snapshot
+
+
+def latest_eval_metrics(log_history: Any) -> Dict[str, object]:
+    """Return the latest evaluation event emitted by a Trainer."""
+
+    for event in reversed(list(log_history or [])):
+        if any(str(key).startswith("eval_") for key in event):
+            return metric_snapshot(
+                {
+                    key: value
+                    for key, value in event.items()
+                    if str(key).startswith("eval_") or key in {"epoch", "step"}
+                }
+            )
+    return {}
+
+
+def latest_train_metrics(log_history: Any) -> Dict[str, object]:
+    """Return the latest per-step training event emitted by a Trainer.
+
+    ``Trainer.train().metrics['train_loss']`` is cumulative and can look
+    artificially small after an exact resume because Transformers divides the
+    newly accumulated loss by the restored global step.  Keep that upstream
+    metric for provenance, but expose the latest logged step separately so a
+    resumed run remains interpretable.
+    """
+
+    for event in reversed(list(log_history or [])):
+        if "loss" in event and not any(
+            str(key).startswith("eval_") for key in event
+        ):
+            return metric_snapshot(event)
+    return {}
+
+
+def resolve_trainer_resume_checkpoint(
+    resume_from_checkpoint: Any,
+    checkpoint_root: str,
+) -> str | None:
+    """Resolve ``True`` to the latest concrete Hugging Face checkpoint path."""
+
+    if not resume_from_checkpoint:
+        return None
+    if resume_from_checkpoint is True:
+        from transformers.trainer_utils import get_last_checkpoint
+
+        root = os.path.abspath(os.path.expanduser(checkpoint_root))
+        checkpoint = get_last_checkpoint(root) if os.path.isdir(root) else None
+        if checkpoint is None:
+            raise FileNotFoundError(
+                "resume_from_checkpoint=true but no checkpoint-* exists in "
+                f"{root}"
+            )
+        return os.path.abspath(checkpoint)
+    if isinstance(resume_from_checkpoint, (str, os.PathLike)):
+        checkpoint = os.path.abspath(
+            os.path.expanduser(os.fspath(resume_from_checkpoint))
+        )
+        if not os.path.isdir(checkpoint):
+            raise FileNotFoundError(
+                f"resume checkpoint directory does not exist: {checkpoint}"
+            )
+        return checkpoint
+    raise TypeError("resume_from_checkpoint must be false, true, or a checkpoint path")
+
+
+def validate_resume_training_args(checkpoint: str | None, training_args: Any) -> None:
+    """Reject a resumed run whose effective train batch size has changed.
+
+    Transformers only warns about this mismatch and continues, but the data
+    cursor then no longer represents an exact continuation.  Other scheduling
+    fields such as ``max_steps`` are intentionally allowed to grow.
+    """
+
+    if not checkpoint:
+        return
+    state_path = os.path.join(checkpoint, "trainer_state.json")
+    if not os.path.isfile(state_path):
+        raise ValueError(
+            "Exact resume requires trainer_state.json in the checkpoint: "
+            f"{checkpoint}"
+        )
+    with open(state_path, "r", encoding="utf-8") as handle:
+        state = json.load(handle)
+    saved_batch_size = state.get("train_batch_size")
+    current_batch_size = getattr(training_args, "train_batch_size", None)
+    if (
+        saved_batch_size is not None
+        and current_batch_size is not None
+        and int(saved_batch_size) != int(current_batch_size)
+    ):
+        raise ValueError(
+            "Exact resume train_batch_size mismatch: checkpoint saved "
+            f"{saved_batch_size}, current configuration resolves to "
+            f"{current_batch_size}. Keep batch size/world size unchanged or "
+            "start a weights-only new run."
+        )
+
+
+def resolve_post_training_precision(precision: str, device: str):
+    """Resolve an explicit SFT/preference precision into torch settings.
+
+    Mixed-precision flags require CUDA. ``auto`` keeps the historical behavior:
+    BF16 where supported, otherwise FP16 on CUDA and FP32 elsewhere.
+    """
+
+    import torch
+
+    normalized = str(precision or "auto").strip().lower()
+    if normalized not in {"auto", "bf16", "fp16", "fp32"}:
+        raise ValueError("precision must be one of: auto, bf16, fp16, fp32")
+    if normalized == "auto":
+        if device == "cuda":
+            normalized = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        else:
+            normalized = "fp32"
+    if normalized in {"bf16", "fp16"} and device != "cuda":
+        raise RuntimeError(
+            f"precision={normalized} requires CUDA for post-training; "
+            "use precision=fp32 on this device"
+        )
+    if normalized == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "precision=bf16 was requested, but the current CUDA device does not support BF16"
+        )
+    dtype = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }[normalized]
+    return normalized, dtype, normalized == "bf16", normalized == "fp16"
 
 
 def stabilize_peft_optional_backends() -> List[str]:

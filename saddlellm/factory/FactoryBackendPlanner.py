@@ -102,7 +102,7 @@ class FactoryBackendPlanner:
             best_for=["large_pretrain", "long_context_pretrain"],
             capabilities=["tensor_parallel", "pipeline_parallel", "context_parallel", "sequence_parallel"],
             required_packages=["megatron-core or colossalai"],
-            notes=["Exported as a plan; SaddleLLM orchestrator currently consumes the data-parallel fallback."],
+            notes=["Planning only; execution fails closed until a matching hybrid runtime adapter exists."],
         ),
         "moe_hybrid_parallel": TrainingBackendSpec(
             name="moe_hybrid_parallel",
@@ -166,7 +166,10 @@ class FactoryBackendPlanner:
                 "Estimated memory is close to or above GPU capacity; lower micro batch, enable checkpointing, or use ZeRO/FSDP/offload."
             )
         if backend in {"hybrid_parallel", "moe_hybrid_parallel"}:
-            warnings.append("Hybrid plan is exported for Megatron/Colossal-style runtimes; HF Trainer fallback ignores TP/PP/CP/EP.")
+            warnings.append(
+                "Hybrid dimensions are planning hints only; SaddleLLM has no executable "
+                "Megatron/Colossal runtime adapter."
+            )
         if cp > 1 and seq_length % (cp * 2) != 0:
             warnings.append("Context parallelism usually requires seq_length divisible by 2 * context_parallel.")
         if total_gpus % used != 0:
@@ -248,7 +251,14 @@ class FactoryBackendPlanner:
         }
         return {
             "strategy": strategy_map.get(plan.backend, "single"),
+            # A ParallelismPlan has only a global total and carries no node
+            # placement. Exporting it as an orchestrator topology is therefore
+            # intentionally single-node; multi-node callers must provide an
+            # explicit per-node AutoParallel topology instead of reinterpreting
+            # total_gpus as GPUs per node.
             "num_gpus": plan.total_gpus,
+            "num_nodes": 1,
+            "topology_scope": "single_node_only",
             "gradient_accumulation_steps": plan.gradient_accumulation_steps,
             "bf16": True,
             "fp16": False,

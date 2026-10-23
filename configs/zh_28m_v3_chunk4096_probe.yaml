@@ -1,0 +1,86 @@
+# Short throughput probe for a wider chunked output-loss kernel.
+project: saddle-zh-28m
+experiment: zh-28m-v3-chunk4096-probe
+seed: 44
+stages: [pretrain]
+pretrain_mode: continue
+
+model:
+  backend: saddle
+  config: zh-en-32k-28m
+  name_or_path: outputs/zh_en_small_pretrain_v2_20260923/run_28m/final_model
+  tokenizer: outputs/zh_en_small_pretrain_v2_20260923/run_28m/final_model
+  local_files_only: true
+  blueprint:
+    name: zh-en-32k-28m
+    family: qwen
+    hidden_size: 384
+    vocab_size: 32768
+    num_layers: 10
+    max_position_embeddings: 512
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 6
+      num_kv_heads: 2
+      rope_theta: 10000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 1024
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+data:
+  sources:
+    - type: local
+      path: E:/ml_data/saddlellm_pretrain/zh_28m_v3_600m/quick_web_25m.jsonl
+      text_column: text
+      streaming: false
+  output_dir: E:/ml_data/saddlellm_pretrain/zh_28m_v3_600m/processed_quick_packed_256
+  max_seq_length: 256
+  min_text_length: 40
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 4
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.01
+
+training:
+  max_steps: 100
+  per_device_batch_size: 64
+  global_batch_size: 64
+  learning_rate: 0.0001
+  min_lr: 0.000008
+  lr_scheduler: cosine
+  warmup_steps: 5
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+  eval_every_steps: 100
+  save_every_steps: 100
+  keep_last_n: 1
+  log_every_steps: 20
+  load_best_model_at_end: false
+  gradient_checkpointing: false
+  loss_chunk_size: 4096
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+  tf32: true
+
+logging:
+  output_dir: outputs/zh_28m_pretrain_v3/chunk4096_probe
+  backend: local

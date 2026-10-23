@@ -8,6 +8,7 @@ protocol and applies network/credential safety checks.
 from __future__ import annotations
 
 import ipaddress
+import errno
 import json
 import os
 import re
@@ -33,6 +34,10 @@ _PRIVATE_PROVIDER_NETWORKS = (
 
 class ModelProviderError(RuntimeError):
     """Raised when a model provider request is invalid or fails safely."""
+
+    def __init__(self, message, *, attempts=()):
+        super().__init__(message)
+        self.provider_attempts = [dict(attempt) for attempt in attempts]
 
 
 _THINK_BLOCK = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
@@ -155,7 +160,24 @@ def _provider_max_retries(provider: Mapping[str, Any]) -> int:
 def _transient_provider_error(error: BaseException) -> bool:
     if isinstance(error, urllib.error.URLError):
         error = error.reason
+        # An actual Windows TLS handshake surfaced a wrapped ENOENT. Keep it
+        # inside the existing bounded transport retry budget. Direct local-file
+        # errors and certificate-validation errors still fail without retry.
+        if isinstance(error, FileNotFoundError) and error.errno == errno.ENOENT:
+            return True
     return isinstance(error, (ConnectionError, TimeoutError))
+
+
+def _reported_usage(raw):
+    """Whitelist provider counts; never propagate arbitrary response fields."""
+    keys = ('prompt_tokens', 'completion_tokens', 'total_tokens')
+    if not isinstance(raw, Mapping) or any(type(raw.get(key)) is not int or raw[key] < 0 for key in keys):
+        return None
+    output = {key: raw[key] for key in keys}
+    details = raw.get('completion_tokens_details')
+    if isinstance(details, Mapping) and type(details.get('reasoning_tokens')) is int and details['reasoning_tokens'] >= 0:
+        output['completion_tokens_details'] = {'reasoning_tokens': details['reasoning_tokens']}
+    return output
 
 
 def chat_completion(
@@ -204,37 +226,44 @@ def chat_completion(
     )
     timeout = int(provider.get("timeoutSeconds", 60))
     max_retries = _provider_max_retries(provider)
+    attempts = []
     for attempt in range(max_retries + 1):
         try:
             with _open_provider_request(request, timeout=timeout) as response:
                 body = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
                 if len(body) > MAX_PROVIDER_RESPONSE_BYTES:
-                    raise ModelProviderError("provider response exceeded the 8 MiB safety limit")
+                    attempts.append({'attempt': attempt + 1, 'status': 'response_oversized', 'usage': None})
+                    raise ModelProviderError("provider response exceeded the 8 MiB safety limit", attempts=attempts)
+            attempts.append({'attempt': attempt + 1, 'status': 'response_received', 'usage': None})
             break
         except urllib.error.HTTPError as exc:
+            attempts.append({'attempt': attempt + 1, 'status': 'http_error', 'http_status': int(exc.code), 'usage': None})
             if 300 <= int(exc.code) < 400:
-                raise ModelProviderError("provider redirect was blocked") from exc
-            raise ModelProviderError("provider HTTP %d" % exc.code) from exc
+                raise ModelProviderError("provider redirect was blocked", attempts=attempts) from exc
+            raise ModelProviderError("provider HTTP %d" % exc.code, attempts=attempts) from exc
         except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+            attempts.append({'attempt': attempt + 1, 'status': 'transport_failed', 'usage': None})
             if attempt < max_retries and _transient_provider_error(exc):
                 time.sleep(PROVIDER_RETRY_DELAY_SECONDS * (attempt + 1))
                 continue
             reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-            raise ModelProviderError("provider request failed: %s" % reason) from exc
+            raise ModelProviderError("provider request failed: %s" % reason, attempts=attempts) from exc
     try:
         result = json.loads(body.decode("utf-8"))
+        attempts[-1]['usage'] = _reported_usage(result.get('usage')) if isinstance(result, Mapping) else None
         choice = result["choices"][0]
         message = choice["message"]
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-        raise ModelProviderError("provider response has no valid choices[0].message") from exc
+        raise ModelProviderError("provider response has no valid choices[0].message", attempts=attempts) from exc
     if not isinstance(message, Mapping):
-        raise ModelProviderError("provider response assistant message is invalid")
+        raise ModelProviderError("provider response assistant message is invalid", attempts=attempts)
     normalized = _separate_inline_reasoning(message)
     finish_reason = str(choice.get("finish_reason") or "").strip().lower()
     if finish_reason:
         # Response metadata is consumed by the Agent runtime but intentionally
         # excluded from the assistant message sent back to the provider.
         normalized["_finish_reason"] = finish_reason
+    normalized['_provider_attempts'] = attempts
     return normalized
 
 

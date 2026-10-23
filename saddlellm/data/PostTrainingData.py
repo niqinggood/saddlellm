@@ -10,8 +10,8 @@ import csv
 import json
 import os
 from dataclasses import asdict, dataclass, field
+from numbers import Real
 from typing import Dict, Iterable, List, Optional, Sequence
-
 
 ROLE_ALIASES = {
     "human": "user",
@@ -24,6 +24,39 @@ ROLE_ALIASES = {
     "model": "assistant",
     "system": "system",
 }
+
+
+def parse_kto_label(record: dict) -> bool:
+    """Parse an explicit binary desirability label without guessing negatives.
+
+    Legacy chosen-only/rejected-only rows remain supported. A generic
+    completion, missing value, or unrecognized label is not negative evidence.
+    """
+    for key in ("label", "score", "accepted"):
+        if key in record:
+            value = record[key]
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, Real) and value in (0, 1):
+                return bool(value)
+            if isinstance(value, str):
+                normalized = value.strip().casefold()
+                if normalized in {"1", "true", "yes", "chosen", "positive", "accepted"}:
+                    return True
+                if normalized in {"0", "false", "no", "rejected", "negative", "unaccepted"}:
+                    return False
+            raise ValueError(
+                f"KTO label in {key!r} must be a boolean, 0/1, or a recognized "
+                f"binary string; got {value!r}"
+            )
+    chosen = PostTrainingDataAdapter._completion_text(record.get("chosen"))
+    rejected = PostTrainingDataAdapter._completion_text(record.get("rejected"))
+    if (chosen is not None) != (rejected is not None):
+        return chosen is not None
+    raise ValueError(
+        "KTO label is missing; supply label/score/accepted, or exactly one "
+        "chosen/rejected completion"
+    )
 
 
 @dataclass
@@ -120,19 +153,15 @@ class PostTrainingDataAdapter:
         source_format: str = "auto",
         keep_metadata: bool = True,
     ) -> Optional[Dict]:
+        label = parse_kto_label(record)
         prompt = cls._prompt_from_record(record)
         completion = cls._completion_text(cls._first_value(record, ["completion", "response", "answer", "output", "chosen", "rejected"]))
         if not prompt or completion is None:
             return None
-        label = record.get("label", record.get("score", record.get("accepted")))
-        if isinstance(label, str):
-            label = label.lower() in {"1", "true", "yes", "chosen", "positive", "accepted"}
-        elif label is None:
-            label = bool(record.get("chosen")) and not bool(record.get("rejected"))
         normalized = {
             "prompt": prompt,
             "completion": completion,
-            "label": bool(label),
+            "label": label,
         }
         return cls._attach_metadata(normalized, record, "kto", source_format, keep_metadata)
 
@@ -168,7 +197,10 @@ class PostTrainingDataAdapter:
             report.total_records += 1
             detected = cls.detect_schema(record)
             report.detected_schemas[detected] = report.detected_schemas.get(detected, 0) + 1
-            item = cls.normalize_record(record, task=task, source_format=source_format, keep_metadata=keep_metadata)
+            try:
+                item = cls.normalize_record(record, task=task, source_format=source_format, keep_metadata=keep_metadata)
+            except ValueError as exc:
+                raise ValueError(f"Record {report.total_records}: {exc}") from exc
             if item is None:
                 report.dropped_records += 1
                 continue
@@ -315,7 +347,7 @@ class PostTrainingDataAdapter:
         normalized["source_format"] = source_format if source_format != "auto" else PostTrainingDataAdapter.detect_schema(record)
         if keep_metadata:
             metadata = dict(record.get("metadata", {})) if isinstance(record.get("metadata"), dict) else {}
-            for key in ("id", "source", "dataset", "category", "domain", "license"):
+            for key in ("id", "source", "dataset", "category", "domain", "license", "group_id", "conversation_id", "case_id"):
                 if key in record:
                     metadata[key] = record[key]
             if metadata:

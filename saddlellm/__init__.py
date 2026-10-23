@@ -10,7 +10,7 @@ from typing import Any
 
 from ._exports import LAZY_IMPORTS as _LAZY_IMPORT_MAP
 
-__version__ = "2.35"
+__version__ = "2.42"
 
 
 __all__ = ["__version__", *_LAZY_IMPORT_MAP]

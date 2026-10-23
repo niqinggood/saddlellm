@@ -3,6 +3,7 @@ from pathlib import Path
 
 import torch
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
@@ -53,6 +54,7 @@ class ModelQuantizer:
         model=None,
         tokenizer=None,
         trust_remote_code: bool = False,
+        local_files_only: bool = False,
     ):
         """
         Initialize quantizer.
@@ -74,6 +76,7 @@ class ModelQuantizer:
         self.device_map = device_map
         self.use_double_quant = use_double_quant
         self.trust_remote_code = bool(trust_remote_code)
+        self.local_files_only = bool(local_files_only)
         self.model = model
         self.tokenizer = tokenizer
 
@@ -98,17 +101,20 @@ class ModelQuantizer:
     def _load_base_model(self):
         if not self.model_name:
             raise ValueError("model_name or an in-memory model is required")
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        cpu_target = str(self.device_map).lower() == "cpu"
+        dtype = torch.float32 if cpu_target or not torch.cuda.is_available() else torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             device_map=self.device_map,
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=self.trust_remote_code,
+            local_files_only=self.local_files_only,
         )
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 trust_remote_code=self.trust_remote_code,
+                local_files_only=self.local_files_only,
             )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -184,11 +190,13 @@ class ModelQuantizer:
                 quantization_config=self.quantization_config,
                 device_map=self.device_map,
                 trust_remote_code=self.trust_remote_code,
+                local_files_only=self.local_files_only,
             )
             if self.tokenizer is None:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     self.model_name,
                     trust_remote_code=self.trust_remote_code,
+                    local_files_only=self.local_files_only,
                 )
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -205,6 +213,12 @@ class ModelQuantizer:
                 raise ValueError(
                     "PyTorch dynamic quantization supports int8 in this wrapper"
                 )
+            move = getattr(self.model, "to", None)
+            if callable(move):
+                self.model = move("cpu")
+            cast = getattr(self.model, "float", None)
+            if callable(cast):
+                self.model = cast()
             self.model = quantize_dynamic(
                 self.model,
                 {torch.nn.Linear},  # 量化所有Linear层
@@ -310,6 +324,9 @@ class ModelQuantizer:
                 },
                 output_dir / QUANTIZED_STATE_FILENAME,
             )
+            model_config = getattr(self.model, "config", None)
+            if model_config is not None and hasattr(model_config, "save_pretrained"):
+                model_config.save_pretrained(output_dir)
         if self.tokenizer is not None:
             self.tokenizer.save_pretrained(output_dir)
         manifest = {
@@ -318,6 +335,8 @@ class ModelQuantizer:
             "precision": self.precision,
             "source_model": self.model_name,
             "state_file": None if self.method == "bnb" else QUANTIZED_STATE_FILENAME,
+            "self_contained": self.method == "bnb"
+            or (output_dir / "config.json").is_file(),
         }
         (output_dir / QUANTIZATION_MANIFEST_FILENAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -357,6 +376,20 @@ class ModelQuantizer:
         checkpoint = torch.load(state_path, map_location="cpu", weights_only=True)
         source_model = kwargs.pop("model_name", None) or checkpoint.get("model_name")
         supplied_model = kwargs.get("model")
+        config_path = output_dir / "config.json"
+        if supplied_model is None and config_path.is_file():
+            trust_remote_code = bool(kwargs.get("trust_remote_code", False))
+            local_files_only = bool(kwargs.get("local_files_only", False))
+            config = AutoConfig.from_pretrained(
+                output_dir,
+                trust_remote_code=trust_remote_code,
+                local_files_only=local_files_only,
+            )
+            kwargs["model"] = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=trust_remote_code,
+            )
+            supplied_model = kwargs["model"]
         if not source_model and supplied_model is None:
             raise ValueError(
                 "dynamic checkpoint does not record a source model; pass model=... to load"

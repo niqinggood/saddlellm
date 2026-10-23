@@ -1,0 +1,33 @@
+name: 使用问题 / Bug report
+description: 安装、训练、评测或部署问题；请先移除密钥和私人数据
+body:
+  - type: markdown
+    attributes:
+      value: "安全漏洞请按 SECURITY.md 私下反馈。不要上传 API key、.env、聊天数据库、模型权重或私人训练数据。"
+  - type: input
+    id: version
+    attributes:
+      label: SaddleLLM 版本和安装方式
+      placeholder: "例如 2.40 wheel / 源码 commit"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境和模型
+      description: "系统、Python、GPU/显存、模型完整名称、后端和精度。"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 最小复现步骤
+      description: "提供脱敏后的命令/代码，预期结果和实际结果；尽量用公开或合成样例。"
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断与错误片段
+      description: "运行 doctor --profile serve/native/vllm/train 中对应的一项，以及 python -m pip check。分享前检查路径等个人信息。"
+      render: text

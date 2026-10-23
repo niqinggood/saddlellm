@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+import json
 
 import saddlellm.compression.quantizer as quantizer_module
 from saddlellm.ModelQuantizer import ModelQuantizer
@@ -44,6 +45,31 @@ def test_empty_quantizer_does_not_download_default_model(monkeypatch):
 
     assert quantizer.model is None
     assert quantizer.model_name is None
+
+
+def test_local_files_only_is_forwarded_to_model_and_tokenizer(monkeypatch):
+    model_calls = []
+    tokenizer_calls = []
+
+    class Tokenizer(DummyTokenizer):
+        pad_token = "<pad>"
+
+    monkeypatch.setattr(
+        quantizer_module.AutoModelForCausalLM,
+        "from_pretrained",
+        lambda *args, **kwargs: model_calls.append((args, kwargs)) or DummyModel(),
+    )
+    monkeypatch.setattr(
+        quantizer_module.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: tokenizer_calls.append((args, kwargs)) or Tokenizer(),
+    )
+
+    ModelQuantizer(model_name="local-model", local_files_only=True, device_map="cpu")
+
+    assert model_calls[0][1]["local_files_only"] is True
+    assert model_calls[0][1]["dtype"] is torch.float32
+    assert tokenizer_calls[0][1]["local_files_only"] is True
 
 
 def test_dynamic_quantization_accepts_an_in_memory_model(monkeypatch):
@@ -155,3 +181,41 @@ def test_static_checkpoint_load_fails_closed(tmp_path):
 
     with pytest.raises(NotImplementedError, match="static/QAT checkpoints"):
         ModelQuantizer.load(str(output_dir))
+
+
+def test_dynamic_checkpoint_can_rebuild_model_from_saved_config(tmp_path, monkeypatch):
+    class Config:
+        @staticmethod
+        def save_pretrained(path):
+            (path / "config.json").write_text(json.dumps({"model_type": "dummy"}))
+
+    source_model = DummyModel()
+    source_model.config = Config()
+    source = ModelQuantizer(model=source_model)
+    output_dir = tmp_path / "self-contained"
+    source.save(str(output_dir))
+    rebuilt = DummyModel()
+    monkeypatch.setattr(
+        quantizer_module.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        quantizer_module.AutoModelForCausalLM,
+        "from_config",
+        lambda *_args, **_kwargs: rebuilt,
+    )
+    monkeypatch.setattr(
+        quantizer_module,
+        "quantize_dynamic",
+        lambda model, _layers, dtype: model,
+    )
+
+    loaded = ModelQuantizer.load(str(output_dir))
+
+    assert loaded.model is rebuilt
+    assert torch.equal(rebuilt.loaded_state["weight"], torch.tensor([1.0]))
+    manifest = json.loads(
+        (output_dir / quantizer_module.QUANTIZATION_MANIFEST_FILENAME).read_text()
+    )
+    assert manifest["self_contained"] is True

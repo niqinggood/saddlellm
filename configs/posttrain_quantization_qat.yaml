@@ -1,0 +1,61 @@
+# Run from repository root after supplying a real local base checkpoint.
+# This sample demonstrates wiring; tiny bundled data does not prove quality.
+project: saddlellm
+experiment: posttrain-qat
+seed: 42
+model:
+  backend: hf
+  name_or_path: outputs/base
+  local_files_only: true
+stages: [sft, quantize, eval, export]
+training:
+  max_steps: 100
+logging:
+  output_dir: outputs/posttrain-qat
+  logging_backend: local
+sft:
+  enabled: true
+  data_path: examples/retention/business.train.jsonl
+  validation_data_path: examples/retention/business.validation.jsonl
+  replay_data_path: examples/retention/replay.train.jsonl
+  replay_ratio: 0.25
+  retention_kl_weight: 0.1
+  use_lora: true
+  use_qlora: false
+  lora_target_modules: all-linear
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 1
+  max_seq_length: 256
+  learning_rate: 0.00002
+  warmup_steps: 0
+  save_steps: 20
+  eval_steps: 20
+  logging_steps: 10
+  local_files_only: true
+  trust_remote_code: false
+quantization:
+  merge_lora: true
+  ptq:
+    enabled: false
+  qat:
+    enabled: true
+    backend: portable-int8-weight-only
+    # For production, supply a business + general/history training mixture.
+    train_data: examples/retention/business.train.jsonl
+    validation_data: examples/retention/business.validation.jsonl
+    validation_split: 0
+    max_steps: 100
+    batch_size: 1
+    learning_rate: 0.00002
+    max_seq_length: 256
+    device: cpu
+    local_files_only: true
+eval:
+  enabled: true
+  regression_suite: examples/retention/suite.yaml
+  regression_baseline: outputs/base
+  regression_fail_on_rejection: true
+export:
+  enabled: true
+  require_gate: true
+  local_files_only: true

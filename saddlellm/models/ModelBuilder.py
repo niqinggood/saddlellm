@@ -219,6 +219,7 @@ class ModelComponentRegistry:
             "mqa": {"kind": "mqa"},
             "gqa": {"kind": "gqa"},
             "mla": {"kind": "mla", "kv_lora_rank": 64},
+            "kda": {"kind": "kda", "backend": "eager"},
         }
         ffn_presets = {
             "swiglu": {"kind": "swiglu"},
@@ -234,6 +235,8 @@ class ModelComponentRegistry:
             "serial": {"topology": "serial"},
             "sequential": {"topology": "serial"},
             "parallel": {"topology": "parallel"},
+            "attnres_full": {"topology": "serial", "attention_mode": "full"},
+            "attnres_block": {"topology": "serial", "attention_mode": "block"},
             "depth_scaled": {
                 "topology": "serial",
                 "initialization": "depth_scaled",

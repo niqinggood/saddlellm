@@ -8,6 +8,18 @@ from importlib import import_module
 from typing import Any
 
 _EXPORTS = {
+    "PTQConfig": (".CalibratedPTQ", "PTQConfig"),
+    "load_calibrated_ptq": (".CalibratedPTQ", "load_calibrated_ptq"),
+    "QATConfig": (".QuantizationAwareTraining", "QATConfig"),
+    "load_qat": (".QuantizationAwareTraining", "load_qat"),
+    "QuantizationConfig": (".QuantizationPipeline", "QuantizationConfig"),
+    "QuantizationStageConfig": (".QuantizationStage", "QuantizationStageConfig"),
+    "QuantizationResult": (".QuantizationPipeline", "QuantizationResult"),
+    "apply_quantization": (".QuantizationPipeline", "apply_quantization"),
+    "plan_quantization": (".QuantizationPipeline", "plan_quantization"),
+    "RecoveryConfig": (".RecoveryTrainer", "RecoveryConfig"),
+    "run_recovery": (".RecoveryTrainer", "run_recovery"),
+    "validate_recovery_config": (".RecoveryTrainer", "validate_recovery_config"),
     "LIGHTWEIGHT_RECIPES": (".lightweight", "LIGHTWEIGHT_RECIPES"),
     "Lightweight": (".lightweight", "Lightweight"),
     "PRUNING_MANIFEST_FILENAME": (".pruner", "PRUNING_MANIFEST_FILENAME"),

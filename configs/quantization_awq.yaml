@@ -1,0 +1,15 @@
+# Configuration passed directly to apply_quantization(..., config=...).
+ptq:
+  enabled: true
+  method: awq  # gptq selects the other calibration algorithm
+  bits: 4
+  group_size: 128
+  calibration_path: data/calibration.jsonl  # supply representative local data
+  max_samples: 128
+  max_seq_length: 512
+  seed: 42
+  device: auto
+  pipeline: basic
+  local_files_only: true
+qat:
+  enabled: false

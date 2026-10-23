@@ -101,7 +101,18 @@ class ModelExperimentPlanner:
                 heads=heads,
                 kv_heads=kv_heads,
                 seq_length=cfg.seq_length,
-            )
+            ),
+            ModelBlueprintLab.optimized_dense_gqa(
+                name=f"{cfg.domain}-dense-gqa-packed",
+                hidden_size=hidden,
+                layers=layers,
+                heads=heads,
+                kv_heads=kv_heads,
+                seq_length=cfg.seq_length,
+                # Keep this arm focused on projection layout.  QK-Norm can
+                # then be measured as a separate architecture-quality change.
+                qk_norm=False,
+            ),
         ]
         if cfg.include_mla:
             blueprints.append(ModelBlueprint(

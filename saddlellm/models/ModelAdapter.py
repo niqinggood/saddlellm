@@ -98,7 +98,7 @@ class SaddleModelAdapter(ModelAdapter):
         preference_methods=frozenset({"dpo"}),
         lora=False,
         qlora=False,
-        distributed_post_training=False,
+        distributed_post_training=True,
     )
 
     def load_model(self, path: str, **kwargs: Any) -> Any:
@@ -142,7 +142,7 @@ class HuggingFaceModelAdapter(ModelAdapter):
         preference_methods=frozenset({"dpo", "orpo", "kto"}),
         lora=True,
         qlora=True,
-        distributed_post_training=False,
+        distributed_post_training=True,
     )
 
 

@@ -1,0 +1,73 @@
+# Nursing-domain scratch-pretraining baseline.
+# This demonstrates SaddleLLM-owned architecture training. For a competition
+# model with a limited corpus, continued pretraining of a mature Base model is
+# usually the stronger primary route.
+project: nursing-foundation
+experiment: nursing-dense-300m-scratch
+stages: [pretrain]
+pretrain_mode: scratch
+
+model:
+  backend: saddle
+  config: qwen-300m
+  tokenizer: Qwen/Qwen2.5-0.5B
+  local_files_only: false
+  blueprint:
+    name: nursing-dense-300m
+    family: qwen
+    max_position_embeddings: 8192
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 16
+      num_kv_heads: 4
+      rope_theta: 1000000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 2816
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+data:
+  sources:
+    - type: local
+      path: data/nursing_corpus.jsonl
+      text_column: text
+      streaming: false
+  max_seq_length: 2048
+  min_text_length: 50
+  dedup_method: minhash
+  quality_min_score: 0.3
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.01
+
+training:
+  max_steps: 100000
+  per_device_batch_size: 2
+  global_batch_size: 32
+  learning_rate: 0.0003
+  min_lr: 0.00003
+  warmup_steps: 2000
+  eval_every_steps: 500
+  save_every_steps: 1000
+  log_every_steps: 10
+  load_best_model_at_end: true
+  gradient_checkpointing: true
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+
+logging:
+  output_dir: outputs/nursing-dense-300m-scratch
+  backend: local

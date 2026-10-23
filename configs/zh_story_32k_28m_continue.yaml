@@ -1,0 +1,85 @@
+# Low-learning-rate Chinese story continuation for the bilingual 28.3M base.
+project: saddle-zh-en-small
+experiment: zh-story-32k-28m-continue
+seed: 43
+stages: [pretrain]
+pretrain_mode: continue
+
+model:
+  backend: saddle
+  config: zh-en-32k-28m
+  name_or_path: outputs/zh_en_small_pretrain_v2_20260923/run_28m/final_model
+  tokenizer: outputs/zh_en_small_pretrain_v2_20260923/run_28m/final_model
+  local_files_only: true
+  blueprint:
+    name: zh-en-32k-28m
+    family: qwen
+    hidden_size: 384
+    vocab_size: 32768
+    num_layers: 10
+    max_position_embeddings: 512
+    tie_word_embeddings: true
+    attention:
+      kind: gqa
+      backend: sdpa
+      num_heads: 6
+      num_kv_heads: 2
+      rope_theta: 10000.0
+    ffn:
+      kind: swiglu
+      intermediate_size: 1024
+    residual:
+      topology: serial
+      initialization: depth_scaled
+      dropout: 0.0
+    objective:
+      causal_lm: true
+      multi_token_prediction: false
+
+data:
+  sources:
+    - type: local
+      path: outputs/zh_en_small_pretrain_v2_20260923/assets/zh_story.jsonl
+      text_column: text
+      streaming: false
+  output_dir: outputs/zh_en_small_pretrain_v2_20260923/processed_zh_story_32k_256
+  max_seq_length: 256
+  min_text_length: 40
+  dedup_method: exact
+  quality_min_score: 0.0
+  num_proc: 4
+  pack_sequences: true
+  append_eos: true
+  validation_split: 0.01
+
+training:
+  max_steps: 4000
+  per_device_batch_size: 16
+  global_batch_size: 16
+  learning_rate: 0.00005
+  min_lr: 0.000005
+  lr_scheduler: cosine
+  warmup_steps: 100
+  weight_decay: 0.05
+  max_grad_norm: 1.0
+  optimizer: adamw_torch
+  eval_every_steps: 500
+  save_every_steps: 1000
+  keep_last_n: 3
+  log_every_steps: 50
+  load_best_model_at_end: true
+  gradient_checkpointing: false
+  loss_chunk_size: 512
+  dataloader_num_workers: 0
+  stability_monitor: true
+
+distributed:
+  strategy: single
+  num_gpus: 1
+  num_nodes: 1
+  bf16: true
+  fp16: false
+
+logging:
+  output_dir: outputs/zh_en_small_pretrain_v2_20260923/zh_story_tune_28m
+  backend: local

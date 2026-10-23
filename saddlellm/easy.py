@@ -475,7 +475,10 @@ def evaluate(model, tokenizer=None, tasks=None):
 
     results = runner.run()
     for r in results:
-        print(f"  {r.task}: {r.score:.4f} ({r.metric})")
+        if r.score is None:
+            print(f"  {r.task}: {getattr(r, 'status', 'failed')} ({getattr(r, 'error', '')})")
+        else:
+            print(f"  {r.task}: {r.score:.4f} ({r.metric}, {getattr(r, 'status', 'completed')})")
     return results
 
 

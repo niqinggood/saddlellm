@@ -90,10 +90,14 @@ def test_dynamic_sampling_discards_flat_group_and_uses_replacement_prompt():
         0.0,
     )
 
+    metrics_seen = []
+    rollouts_seen = []
     metrics = trainer.train(
         ["flat", "mixed"],
         lambda prompt, response: float(response == "right"),
         num_steps=1,
+        metrics_callback=metrics_seen.append,
+        rollout_callback=rollouts_seen.append,
     )
 
     assert metrics[-1]["sampled_groups"] == 2
@@ -101,3 +105,10 @@ def test_dynamic_sampling_discards_flat_group_and_uses_replacement_prompt():
     assert metrics[-1]["discarded_groups"] == 1
     assert metrics[-1]["sampling_attempts"] == 2
     assert metrics[-1]["optimizer_step"] == 1
+    assert metrics_seen == metrics
+    assert [item["prompts"] for item in rollouts_seen] == [
+        ["flat", "flat"],
+        ["mixed", "mixed"],
+    ]
+    assert rollouts_seen[0]["rewards"] == [0.0, 0.0]
+    assert rollouts_seen[1]["rewards"] == [1.0, 0.0]

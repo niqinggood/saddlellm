@@ -1,6 +1,6 @@
 # SaddleLLM 架构与调用链
 
-> 基于当前 `2.33` 源码整理。本文描述的是仓库中的一方实现，而不是 README 中的愿景，也不把 `external_research/`、`reference/`、`node_modules/`、`build/`、`dist/`、`outputs/` 当作框架源码。
+> 基于当前 `2.36` 源码整理。本文描述的是仓库中的一方实现，而不是 README 中的愿景，也不把 `external_research/`、`reference/`、`node_modules/`、`build/`、`dist/`、`outputs/` 当作框架源码。平台产品边界和能力成熟度见 [GENERAL_LLM_PLATFORM.md](GENERAL_LLM_PLATFORM.md)。
 >
 > 本文负责“为什么这样分层、各部分如何协作、主调用顺序是什么”；全部具名函数和方法的源码位置、签名、职责与静态直调对象见 [FUNCTION_REFERENCE.md](FUNCTION_REFERENCE.md)。
 
@@ -167,7 +167,7 @@ CLI 命令按职责分为：
 | 训练/检查 | `train`、`doctor`、`smoke-test`、`inspect-data`、`inspect-vla` |
 | 世界模型 | `train-world-model`、`world-model-backends`、`infer-world-model` |
 | 空间智能 | `build-spatial-world-data`、`evaluate-spatial-world-model`、`plan-spatial-route`、`spatial-studio`、`world-agent-run`、`world-agent-api` |
-| 发布/服务 | `report`、`export-model`、`serve-model` |
+| 发布/服务 | `report`、`export`、`dashboard`（`webui`）、`serve` |
 
 ### 4.2 配置、工厂与规划
 
@@ -251,7 +251,7 @@ flowchart TD
 | `pretrain` | 执行 scratch、续训或精确 resume；可走 HF 或原生 Saddle 模型 | HF `Trainer` / `SaddleTrainer` |
 | `sft` | 执行 Full/LoRA/QLoRA SFT；先做数据 preflight | `PeftSFTTrainer.train_model` |
 | `preference` | 执行 DPO/ORPO/KTO | `Preference.train_preference` |
-| `rlhf` | DPO 可执行；PPO 返回 `planned_unsupported` | `Preference`（DPO） |
+| `rlhf` | DPO 可执行；PPO dry-run可规划，实际训练fail fast | `Preference`（DPO） |
 | `mopd` | 默认 dry-run；关闭 dry-run 且有 prompts/teacher 时收集 on-policy 数据 | `MultiTeacherOnPolicyDistiller` |
 | `vla_sft` | 总会规划/规范化；`vla.train=true` 且数据存在时执行行为克隆 | `VLATrainer` |
 | `mllm_sft` | 当前只规范化数据并物化训练计划 | `MultimodalDataAdapter` |
@@ -338,9 +338,9 @@ flowchart LR
 
 ### 4.7 评测、发布和推理
 
-核心文件：`evaluation/LLModelEvalute.py`、`evaluation/BenchmarkRunner.py`、`evaluation/ReleaseGate.py`、`runtime/ModelExporter.py`、`runtime/InferenceServer.py`、`models/ModelLoader.py`、`models/TokenizerLoader.py`。
+核心文件：`evaluation/LLModelEvalute.py`、`evaluation/BenchmarkRunner.py`、`evaluation/MultipleChoiceEvaluator.py`、`evaluation/CompletionEvaluator.py`、`evaluation/EvaluationComparison.py`、`evaluation/ReleaseGate.py`、`runtime/ModelExporter.py`、`runtime/InferenceServer.py`、`runtime/WebUI.py`、`training/TrainingProgress.py`、`models/ModelLoader.py`、`models/TokenizerLoader.py`。
 
-发布链遵守“评测决定能否发布，导出负责形成可复现目录，服务只加载完整 release”的职责分离：
+发布链遵守“评测产生质量证据，导出形成可复现目录，服务加载指定模型”的职责分离；发布流水线可要求门禁，推理本身不重复评估：
 
 ```text
 上游 model_path
@@ -351,19 +351,32 @@ flowchart LR
   → 文件清单/可选哈希/加载校验/发布说明
   → load_inference_model()
   → LocalGenerationEngine
-  → /v1/models、/v1/chat/completions、/v1/completions
+  → 内置对话页、/v1/models、流式 /v1/chat/completions、/v1/completions
 ```
 
 - gate 启用且未接受时，export fail closed。
+- validation-only 配对比较只产生 checkpoint 选择资格并保持 `accepted=false`；发布晋级必须同时有配对封存 test 证据。
+- multiple-choice evaluator 可由领域项目提供声明式提示模板，通用层计算分模板准确率、最差模板、预测翻转率和所有模板均正确率。
 - 原生 Saddle checkpoint 保持原生格式，不伪装成 Hugging Face release；LoRA adapter 可按配置合并。
-- `InferenceServer` 是 OpenAI 兼容、当前非流式的本地服务；API key 从指定环境变量读取，CLI 不接收明文密钥。
-- `LocalGenerationEngine` 负责 chat template、输入长度限制、生成参数、stop 截断和输出 token 统计。
+- `InferenceServer` 是 OpenAI 兼容的本地服务；聊天接口支持 SSE 流式输出，API key 从指定环境变量读取，CLI 不接收明文密钥。
+- `serve` 可以加载完整模型、checkpoint 或 adapter；release manifest 存在时只展示已有门禁状态，不把评估审批耦合进推理运行时。
+- `LocalGenerationEngine` 负责 chat template、输入长度限制、生成参数、stop 截断和输出 token 统计；对支持该参数的 tokenizer 默认关闭显式 thinking，避免隐藏推理耗尽回答预算。
+- `TrainingProgress.LocalProgressCallback` 将训练状态原子写入 JSON，并把指标追加到 JSONL；`WebUI` 只消费这些标准产物，不介入训练器。
+- `dashboard` 和 `serve --open` 都由 SaddleLLM 自身提供页面，不引入独立前端工程；对话页与 API 共用同一模型实例。
 
 ### 4.8 蒸馏、压缩、安全和观测
 
-- 蒸馏：`UniversalDistiller`、`RapidDistill`、`DistillationTrainer`、`distill`。
+- 稳定 CLI 蒸馏入口为 `saddlellm distill`。`--mode logits` 调用经过实际训练验证的
+  teacher/student causal KL 算子并输出较小 HF 学生；`--mode data` 使用
+  `OnPolicyDistillation` 从 OpenAI 兼容教师收集数据，在线结果默认要求人工审核，审核后的
+  `--teacher-data` 再复用统一 SFT 执行器。`UniversalDistiller`、`RapidDistill` 和旧
+  `DistillationTrainer` 保留为实验 API，不能仅因类存在就视为稳定 CLI。
 - 模型压缩的规范实现集中在 `saddlellm/compression/`：`quantizer`、`pruner`、`lightweight` 分别负责量化、剪枝和组合门面。
 - 顶层 `ModelQuantizer.py`、`ModelPruner.py`、`Lightweight.py` 仅作为旧导入路径的兼容层；旧 CLI 实现 `quantize.py`、`prune.py` 也归入 `compression/`。
+- `saddlellm quantize`（别名 `lightweight`）当前只公开完成自包含保存、重载和生成验证的
+  CPU dynamic INT8；`InferenceServer` 按 `quantization_manifest.json` 重建结构并加载INT8
+  state。GPU 4/8bit 继续由 `serve --quantization` 在加载时完成。`saddlellm prune`保存可加载
+  稀疏权重并报告实际稀疏率，但不对dense后端承诺体积或速度收益。
 - 部署门面由 `runtime/Deploy.py` 提供，并直接依赖压缩子包。
 - 安全生成：`SafeGenerate` 处理反重复和输出过滤，但不等于完整内容安全系统。
 - 观测与实验：`ExperimentTracker`、`TrainingMonitor`、`monitordashbord`、`TrainerUtils`、`SmokeTestRunner`、`CurriculumScheduler`、`ScalingLawAnalyzer`。
@@ -696,10 +709,16 @@ sequenceDiagram
     Engine->>Engine: apply_chat_template / prompt
     Engine->>Engine: tokenize + 输入/输出长度约束
     Engine->>Model: generate(**generation_args)
-    Model-->>Engine: token ids
-    Engine->>Engine: 只切新 token、decode、apply_stop
-    Engine-->>API: OpenAI-style completion JSON
-    API-->>C: response
+    alt stream=true
+        Model-->>Engine: incremental token text
+        Engine-->>API: SSE chunks
+        API-->>C: data chunks + [DONE]
+    else stream=false
+        Model-->>Engine: token ids
+        Engine->>Engine: 只切新 token、decode、apply_stop
+        Engine-->>API: OpenAI-style completion JSON
+        API-->>C: response
+    end
 ```
 
 ## 6. 模块地图
@@ -740,11 +759,11 @@ sequenceDiagram
 
 ## 8. 重要设计约束和风险边界
 
-1. **规划不等于执行。** `planning_only`、`planned`、`planned_unsupported` 必须原样展示，不能在上层 UI 中包装成“训练完成”。
+1. **规划不等于执行。** `planning_only`、`planned`、`planned_unsupported` 必须原样展示，不能在上层 UI 中包装成“训练完成”；线性流水线遇到不支持阶段必须停止，不能继续消费更早的模型产物。
 2. **只有 pretrain 声明为分布式安全。** 其他 stage 应拆成单进程流水线，直到各 trainer 明确接入分布式语义。
 3. **原生与 HF checkpoint 不同。** 原生模型以 `saddle_config.json + pytorch_model.bin` 识别；不完整目录会直接报错，不能回退成 HF 模型。
 4. **多模态主线仍有边界。** VLA 可在显式开关下训练；通用 `mllm_sft` 当前是数据规范化与计划物化。
-5. **PPO 尚未接线。** `rlhf.method=ppo` 只产生不支持状态；稳定离线 RLHF 路径是 DPO/preference。
+5. **PPO 尚未接线。** dry-run 可以展示其顺序和依赖；实际执行在任何训练开始前 fail fast。稳定离线对齐路径是 DPO/ORPO/KTO。
 6. **世界模型分数不是安全证明。** learned return/collision 未校准；空间系统仍保留几何可通行性和 limitation/warning。
 7. **真实反馈与模型想象严格区分。** 只有真实 `actual_path` 进入 replay，预测路径不能当训练真值。
 8. **单张透视图信息不足。** 默认拒绝把透视图静默当作完整俯视导航图。

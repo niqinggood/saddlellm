@@ -273,6 +273,9 @@ class LLMTrainingFactory:
 
         blueprints = [
             ModelBlueprintLab.dense_gqa(name=f"{self.config.domain}-dense-gqa-300m"),
+            ModelBlueprintLab.optimized_dense_gqa(
+                name=f"{self.config.domain}-optimized-dense-gqa-300m"
+            ),
             ModelBlueprintLab.deepseek_style_moe(name=f"{self.config.domain}-deepseek-style-moe"),
             ModelBlueprintLab.minimax_style_long_context(name=f"{self.config.domain}-long-context"),
             ModelBlueprintLab.glm_style_reasoning(name=f"{self.config.domain}-reasoning"),
