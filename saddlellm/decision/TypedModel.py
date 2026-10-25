@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -317,7 +318,20 @@ class TypedDecisionModel(nn.Module):
             (staging / "manifest.json").write_text(
                 json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
             )
-            staging.rename(destination)
+            for attempt in range(5):
+                try:
+                    staging.rename(destination)
+                    break
+                except PermissionError as exc:
+                    # Windows can briefly lock a newly written directory.
+                    # Never retry over a destination created by another writer.
+                    if (
+                        getattr(exc, "winerror", None) != 5
+                        or destination.exists()
+                        or attempt == 4
+                    ):
+                        raise
+                    time.sleep(0.05 * 2**attempt)
 
     @classmethod
     def from_pretrained(cls, directory, *, device="cpu"):

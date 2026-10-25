@@ -92,7 +92,10 @@ def test_score_value_order_with_arbitrary_ids_tie_matches_api_mae_and_within_one
     assert result["score"]["mae_expected_score"] == pytest.approx(abs(8 / 3 - truth_value))
     assert evaluated["score"]["mae_argmax_value"] == mae
     assert evaluated["score"]["within_one_level_accuracy"] == within_one
-    assert evaluated["score"]["mae_expected_score"] == result["score"]["mae_expected_score"]
+    # Equivalent floating-point reductions can differ in their final bits.
+    assert evaluated["score"]["mae_expected_score"] == pytest.approx(
+        result["score"]["mae_expected_score"], rel=1e-12, abs=1e-12
+    )
     diagnostic = result["class_diagnostics"][scope_key(row)]
     assert diagnostic["prediction_counts"] == {"a": 1, "m": 0, "z": 0}
     assert diagnostic["confusion"]["matrix"] == evaluated["confusion"]["matrix"]

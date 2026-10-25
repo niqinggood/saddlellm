@@ -1,5 +1,6 @@
 import copy
 import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -48,6 +49,58 @@ def rows():
 
 def cfg(**kw):
     return TypedDecisionConfig(hidden_size=16, num_layers=1, num_heads=2, **kw)
+
+
+def test_save_recovers_from_windows_directory_lock_and_preserves_weights(tmp_path, monkeypatch):
+    model = TypedDecisionModel(cfg()).eval()
+    destination = tmp_path / "saved"
+    original_rename = Path.rename
+    locked = False
+
+    def briefly_locked(path, target):
+        nonlocal locked
+        if Path(target) == destination and not locked:
+            locked = True
+            error = PermissionError(13, "temporary Windows directory lock")
+            error.winerror = 5
+            raise error
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", briefly_locked)
+    model.save_pretrained(destination)
+    restored = TypedDecisionModel.from_pretrained(destination)
+    assert locked
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+    assert not list(tmp_path.glob(".typed-save-*"))
+    with pytest.raises(FileExistsError):
+        model.save_pretrained(destination)
+
+
+@pytest.mark.parametrize("winerror", [5, None])
+def test_save_preserves_directory_permission_errors_without_partial_output(
+    tmp_path, monkeypatch, winerror
+):
+    model = TypedDecisionModel(cfg())
+    destination = tmp_path / "saved"
+    attempts = []
+
+    def denied(path, target):
+        attempts.append(target)
+        error = PermissionError(13, "directory access denied")
+        if winerror is not None:
+            error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(Path, "rename", denied)
+    monkeypatch.setattr("saddlellm.decision.TypedModel.time.sleep", lambda _: None)
+    with pytest.raises(PermissionError, match="directory access denied"):
+        model.save_pretrained(destination)
+    assert 1 <= len(attempts) <= 5
+    if winerror is None:
+        assert len(attempts) == 1
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".typed-save-*"))
 
 
 def test_shared_state_and_question_isolation_and_choice_permutation():
